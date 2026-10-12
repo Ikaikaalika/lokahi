@@ -34,5 +34,6 @@ inline float rsqrt(float v) { return 1.0f / std::sqrt(v); }
 inline float tanh(float v) { return std::tanh(v); }
 inline float cos(float v) { return std::cos(v); }
 inline float sin(float v) { return std::sin(v); }
+inline float exp(float v) { return std::exp(v); }
 }  // namespace precise
 }  // namespace metal

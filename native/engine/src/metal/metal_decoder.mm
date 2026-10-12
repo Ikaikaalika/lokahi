@@ -1,4 +1,4 @@
-// Metal backend for the Gemma 3 decoder.
+// Metal backend for dense decoders.
 //
 // One serial compute encoder per command buffer runs a whole prefill (all
 // chunks) or one decode step: embedding, every layer, the last-row
@@ -8,7 +8,7 @@
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
-#include "metal/metal_gemma3.h"
+#include "metal/metal_decoder.h"
 
 #include <algorithm>
 #include <array>
@@ -20,7 +20,7 @@
 #include <vector>
 
 #include "common.h"
-#include "gemma3_kernels_source.h"
+#include "decoder_kernels_source.h"
 
 namespace lokahi {
 namespace {
@@ -49,7 +49,9 @@ struct GpuLinear {
 
 struct GpuLayer {
   GpuLinear q, k, v, o, gate, up, down;
-  BufRef input_norm, post_attn_norm, pre_ff_norm, post_ff_norm, q_norm, k_norm;
+  // Norms and biases a family does not have are bound to a placeholder and
+  // never read.
+  BufRef attn_norm, attn_post_norm, mlp_norm, mlp_post_norm, q_norm, k_norm, q_bias, k_bias, v_bias;
   id<MTLBuffer> k_cache = nil;
   id<MTLBuffer> v_cache = nil;
   int capacity = 0;
@@ -109,15 +111,20 @@ class WeightArena {
   size_t bytes_ = 0;
 };
 
-// Parameter blocks; layouts match the structs in gemma3_kernels.metal.
+// Parameter blocks; layouts match the structs in decoder_kernels.metal.
 struct EmbedParams { int cols; int n; float scale; };
-struct NormParams { int cols; float eps; };
-struct ResidualNormParams { int cols; float eps; int has_next; };
+struct NormParams { int cols; float eps; float offset; };
+struct ResidualNormParams { int cols; float eps; float offset; int post_norm; int has_next; };
 struct QmvParams { int rows; int cols; };
+struct GluParams { int rows; int cols; int silu; };
 struct QkvParams { int q_rows; int kv_rows; int cols; };
 struct QmmParams { int n; int rows; int cols; };
 struct ElementwiseParams { int count; };
-struct RopeParams { int heads; int kv_heads; int head_dim; int start_pos; int capacity; float eps; };
+struct GluMulParams { int count; int silu; };
+struct RopeParams {
+  int heads; int kv_heads; int head_dim; int start_pos; int capacity; float eps; float offset; int qk_norm;
+  int qkv_bias;
+};
 struct AttnParams {
   int heads; int kv_heads; int head_dim; int start_pos; int window; int capacity; int block; int n_blocks;
   float scale; float softcap;
@@ -129,9 +136,9 @@ constexpr int kDecodeMaxBlocks = 64;
 constexpr int kPrefillMaxBlocks = 8;
 constexpr int kInflightSteps = 2;
 
-class Gemma3Metal final : public Model {
+class DecoderMetal final : public Model {
  public:
-  Gemma3Metal(std::shared_ptr<Gemma3Weights> weights, const LoadOptions& options)
+  DecoderMetal(std::shared_ptr<DecoderWeights> weights, const LoadOptions& options)
       : w_(std::move(weights)), c_(w_->config), max_context_(options.max_context),
         chunk_(std::max(1, std::min(options.prefill_chunk, options.max_context))) {
     @autoreleasepool {
@@ -141,7 +148,7 @@ class Gemma3Metal final : public Model {
       MTLCompileOptions* compile = [MTLCompileOptions new];
       compile.languageVersion = MTLLanguageVersion3_0;
       NSError* error = nil;
-      library_ = [device_ newLibraryWithSource:@(kGemma3KernelSource) options:compile error:&error];
+      library_ = [device_ newLibraryWithSource:@(kDecoderKernelSource) options:compile error:&error];
       LK_CHECK(library_ != nil, "metal: kernel compilation failed: " + ns_error(error));
       validate();
       upload();
@@ -149,10 +156,10 @@ class Gemma3Metal final : public Model {
     }
   }
 
-  ~Gemma3Metal() override { drain(); }
+  ~DecoderMetal() override { drain(); }
 
   const char* backend() const override { return "metal"; }
-  const char* architecture() const override { return "gemma3"; }
+  const char* architecture() const override { return c_.architecture.c_str(); }
   int vocab_size() const override { return c_.vocab_size; }
   int max_context() const override { return max_context_; }
   int position() const override { return position_; }
@@ -256,8 +263,7 @@ class Gemma3Metal final : public Model {
     LK_CHECK(c_.head_dim % 32 == 0 && (dpl == 2 || dpl == 4 || dpl == 8),
              "metal: head_dim must be 64, 128 or 256");
     const int group = c_.num_heads / c_.num_kv_heads;
-    LK_CHECK(group == 1 || group == 2 || group == 4 || group == 8,
-             "metal: heads per kv head must be 1, 2, 4 or 8");
+    LK_CHECK(group >= 1 && group <= 8, "metal: heads per kv head must be between 1 and 8");
   }
 
   GpuLinear add_linear(WeightArena& arena, const Linear& l, std::vector<std::pair<GpuLinear*, std::array<size_t, 3>>>& fix,
@@ -289,22 +295,25 @@ class Gemma3Metal final : public Model {
       lm_head_ = add_linear(arena, w_->lm_head, linear_fix, &lm_head_);
     }
     add_vector(w_->final_norm, &final_norm_);
+    // Bound in place of norms a family does not have; kernels never read it.
+    placeholder_data_.assign(static_cast<size_t>(
+                                 std::max({c_.hidden_size, c_.head_dim, c_.num_heads * c_.head_dim})),
+                             0.0f);
+    add_vector(placeholder_data_, &placeholder_);
 
-    const int half = c_.head_dim / 2;
-    inv_freq_local_.resize(static_cast<size_t>(half));
-    inv_freq_global_.resize(static_cast<size_t>(half));
-    for (int i = 0; i < half; ++i) {
-      const double exponent = static_cast<double>(2 * i) / c_.head_dim;
-      inv_freq_local_[static_cast<size_t>(i)] = static_cast<float>(1.0 / std::pow(c_.rope_local_base_freq, exponent));
-      inv_freq_global_[static_cast<size_t>(i)] =
-          static_cast<float>(1.0 / std::pow(c_.rope_theta, exponent) / c_.rope_linear_factor);
-    }
+    for (const double f : c_.rope_inv_freq(true)) inv_freq_local_.push_back(static_cast<float>(f));
+    for (const double f : c_.rope_inv_freq(false)) inv_freq_global_.push_back(static_cast<float>(f));
     add_vector(inv_freq_local_, &inv_freq_local_buf_);
     add_vector(inv_freq_global_, &inv_freq_global_buf_);
 
+    std::vector<std::pair<BufRef*, BufRef*>> placeholders;
+    auto add_optional = [&](const std::vector<float>& v, BufRef* target) {
+      if (v.empty()) placeholders.push_back({target, &placeholder_});
+      else add_vector(v, target);
+    };
     layers_.resize(w_->layers.size());
     for (size_t i = 0; i < w_->layers.size(); ++i) {
-      const Gemma3Layer& L = w_->layers[i];
+      const DecoderLayer& L = w_->layers[i];
       GpuLayer& G = layers_[i];
       G.q = add_linear(arena, L.q_proj, linear_fix, &G.q);
       G.k = add_linear(arena, L.k_proj, linear_fix, &G.k);
@@ -313,12 +322,15 @@ class Gemma3Metal final : public Model {
       G.gate = add_linear(arena, L.gate_proj, linear_fix, &G.gate);
       G.up = add_linear(arena, L.up_proj, linear_fix, &G.up);
       G.down = add_linear(arena, L.down_proj, linear_fix, &G.down);
-      add_vector(L.input_norm, &G.input_norm);
-      add_vector(L.post_attn_norm, &G.post_attn_norm);
-      add_vector(L.pre_ff_norm, &G.pre_ff_norm);
-      add_vector(L.post_ff_norm, &G.post_ff_norm);
-      add_vector(L.q_norm, &G.q_norm);
-      add_vector(L.k_norm, &G.k_norm);
+      add_vector(L.attn_norm, &G.attn_norm);
+      add_vector(L.mlp_norm, &G.mlp_norm);
+      add_optional(L.attn_post_norm, &G.attn_post_norm);
+      add_optional(L.mlp_post_norm, &G.mlp_post_norm);
+      add_optional(L.q_norm, &G.q_norm);
+      add_optional(L.k_norm, &G.k_norm);
+      add_optional(L.q_bias, &G.q_bias);
+      add_optional(L.k_bias, &G.k_bias);
+      add_optional(L.v_bias, &G.v_bias);
     }
     arena.finalize();
     for (auto& [target, ids] : linear_fix) {
@@ -327,6 +339,7 @@ class Gemma3Metal final : public Model {
       target->biases = arena.get(ids[2]);
     }
     for (auto& [target, id] : vector_fix) *target = arena.get(id);
+    for (auto& [target, source] : placeholders) *target = *source;
     if (tied_) lm_head_ = embed_;
     device_weight_bytes_ = arena.bytes();
   }
@@ -472,7 +485,7 @@ class Gemma3Metal final : public Model {
     bind(enc, in, 0, 0);
     bind(enc, weight, 1);
     bind(enc, out, 0, 2);
-    bytes(enc, NormParams{c_.hidden_size, c_.rms_norm_eps}, 3);
+    bytes(enc, NormParams{c_.hidden_size, c_.rms_norm_eps, c_.norm_offset}, 3);
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(n), 1, 1)
         threadsPerThreadgroup:MTLSizeMake(norm_threads(pso), 1, 1)];
   }
@@ -485,7 +498,9 @@ class Gemma3Metal final : public Model {
     bind(enc, w_post, 2);
     bind(enc, w_next ? *w_next : w_post, 3);
     bind(enc, h_, 0, 4);
-    bytes(enc, ResidualNormParams{c_.hidden_size, c_.rms_norm_eps, w_next ? 1 : 0}, 5);
+    bytes(enc, ResidualNormParams{c_.hidden_size, c_.rms_norm_eps, c_.norm_offset, c_.sandwich_norms ? 1 : 0,
+                                  w_next ? 1 : 0},
+          5);
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(n), 1, 1)
         threadsPerThreadgroup:MTLSizeMake(norm_threads(pso), 1, 1)];
   }
@@ -520,7 +535,12 @@ class Gemma3Metal final : public Model {
     bind(enc, G.q_norm, 5);
     bind(enc, G.k_norm, 6);
     bind(enc, G.sliding ? inv_freq_local_buf_ : inv_freq_global_buf_, 7);
-    bytes(enc, RopeParams{c_.num_heads, c_.num_kv_heads, c_.head_dim, start, G.capacity, c_.rms_norm_eps}, 8);
+    bytes(enc, RopeParams{c_.num_heads, c_.num_kv_heads, c_.head_dim, start, G.capacity, c_.rms_norm_eps,
+                          c_.norm_offset, c_.qk_norm ? 1 : 0, c_.qkv_bias ? 1 : 0},
+          8);
+    bind(enc, G.q_bias, 9);
+    bind(enc, G.k_bias, 10);
+    bind(enc, G.v_bias, 11);
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(c_.num_heads + c_.num_kv_heads),
                                           static_cast<NSUInteger>(n), 1)
         threadsPerThreadgroup:MTLSizeMake(static_cast<NSUInteger>(c_.head_dim / 2), 1, 1)];
@@ -543,7 +563,7 @@ class Gemma3Metal final : public Model {
     bind(enc, part_ml_, 0, 4);
     bytes(enc,
           AttnParams{c_.num_heads, c_.num_kv_heads, c_.head_dim, start, window, G.capacity, block, n_blocks,
-                     1.0f / std::sqrt(c_.query_pre_attn_scalar), c_.attn_logit_softcapping},
+                     c_.attn_scale, c_.attn_logit_softcapping},
           5);
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(n_blocks),
                                           static_cast<NSUInteger>(c_.num_kv_heads), static_cast<NSUInteger>(n))
@@ -558,23 +578,24 @@ class Gemma3Metal final : public Model {
   }
 
   void encode_mlp(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n) {
+    const int silu = c_.activation == Activation::Silu ? 1 : 0;
     if (n == 1 && G.gate.same_format(G.up)) {
-      [enc setComputePipelineState:quant_pipeline("qmv_geglu", G.gate)];
+      [enc setComputePipelineState:quant_pipeline("qmv_glu", G.gate)];
       bind_weights(enc, G.gate, 0);
       bind_weights(enc, G.up, 3);
       bind(enc, h_, 0, 6);
       bind(enc, gate_, 0, 7);
-      bytes(enc, QmvParams{G.gate.rows, G.gate.cols}, 8);
+      bytes(enc, GluParams{G.gate.rows, G.gate.cols, silu}, 8);
       [enc dispatchThreadgroups:MTLSizeMake(qmv_groups(G.gate.rows), 1, 1)
           threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
     } else {
       encode_qmm(enc, G.gate, h_, n, gate_);
       encode_qmm(enc, G.up, h_, n, up_);
-      [enc setComputePipelineState:pipeline("gelu_mul")];
+      [enc setComputePipelineState:pipeline("glu_mul")];
       bind(enc, gate_, 0, 0);
       bind(enc, up_, 0, 1);
       const int count = n * c_.intermediate_size;
-      bytes(enc, ElementwiseParams{count}, 2);
+      bytes(enc, GluMulParams{count, silu}, 2);
       encode_elementwise(enc, count);
     }
     encode_qmm(enc, G.down, gate_, n, r_);
@@ -588,10 +609,10 @@ class Gemma3Metal final : public Model {
     bind_weights(enc, embed_, 0);
     bind(enc, tokens, tokens_offset, 3);
     bind(enc, x_, 0, 4);
-    bytes(enc, EmbedParams{c_.hidden_size, n, c_.embed_scale()}, 5);
+    bytes(enc, EmbedParams{c_.hidden_size, n, c_.embed_scale}, 5);
     [enc dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(c_.hidden_size), static_cast<NSUInteger>(n), 1)
         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-    encode_rms_norm(enc, x_, layers_[0].input_norm, h_, n);
+    encode_rms_norm(enc, x_, layers_[0].attn_norm, h_, n);
 
     for (size_t l = 0; l < layers_.size(); ++l) {
       const GpuLayer& G = layers_[l];
@@ -599,10 +620,10 @@ class Gemma3Metal final : public Model {
       encode_rope(enc, G, n, start);
       encode_attention(enc, G, n, start);
       encode_qmm(enc, G.o, attn_, n, r_);
-      encode_residual_norm(enc, G.post_attn_norm, &G.pre_ff_norm, n);
+      encode_residual_norm(enc, G.attn_post_norm, &G.mlp_norm, n);
       encode_mlp(enc, G, n);
-      const BufRef* next = l + 1 < layers_.size() ? &layers_[l + 1].input_norm : &final_norm_;
-      encode_residual_norm(enc, G.post_ff_norm, next, n);
+      const BufRef* next = l + 1 < layers_.size() ? &layers_[l + 1].attn_norm : &final_norm_;
+      encode_residual_norm(enc, G.mlp_post_norm, next, n);
     }
     if (!last) return;
     const size_t last_row = static_cast<size_t>(n - 1) * c_.hidden_size * sizeof(float);
@@ -663,8 +684,8 @@ class Gemma3Metal final : public Model {
     for (id<MTLCommandBuffer> cb : pending) [cb waitUntilCompleted];
   }
 
-  std::shared_ptr<Gemma3Weights> w_;
-  const Gemma3Config& c_;
+  std::shared_ptr<DecoderWeights> w_;
+  const DecoderConfig& c_;
   int max_context_;
   int chunk_;
   int position_ = 0;
@@ -676,8 +697,8 @@ class Gemma3Metal final : public Model {
 
   GpuLinear embed_, lm_head_;
   bool tied_ = false;
-  BufRef final_norm_, inv_freq_local_buf_, inv_freq_global_buf_;
-  std::vector<float> inv_freq_local_, inv_freq_global_;
+  BufRef final_norm_, placeholder_, inv_freq_local_buf_, inv_freq_global_buf_;
+  std::vector<float> inv_freq_local_, inv_freq_global_, placeholder_data_;
   std::vector<GpuLayer> layers_;
   size_t device_weight_bytes_ = 0;
 
@@ -702,8 +723,8 @@ std::string metal_device_name() {
   }
 }
 
-std::unique_ptr<Model> make_gemma3_metal(std::shared_ptr<Gemma3Weights> weights, const LoadOptions& options) {
-  return std::make_unique<Gemma3Metal>(std::move(weights), options);
+std::unique_ptr<Model> make_decoder_metal(std::shared_ptr<DecoderWeights> weights, const LoadOptions& options) {
+  return std::make_unique<DecoderMetal>(std::move(weights), options);
 }
 
 }  // namespace lokahi

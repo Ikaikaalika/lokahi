@@ -3,12 +3,10 @@
 #include <algorithm>
 
 #include "common.h"
-#include "gemma3.h"
-#include "json.h"
-#include "safetensors.h"
+#include "decoder.h"
 
 #if defined(LOKAHI_WITH_METAL)
-#include "metal/metal_gemma3.h"
+#include "metal/metal_decoder.h"
 #endif
 
 namespace lokahi {
@@ -48,21 +46,17 @@ std::vector<int32_t> Model::generate_greedy(const std::vector<int32_t>& prompt, 
 }
 
 std::unique_ptr<Model> load_model(const std::string& directory, const LoadOptions& options) {
-  Json config = Json::parse(read_text_file(directory + "/config.json"));
-  LK_CHECK(is_gemma3_config(config),
-           "unsupported architecture '" + config.string_or("model_type", "?") +
-               "'; this build supports Gemma 3 text models");
-  auto weights = Gemma3Weights::load(directory);
+  auto weights = DecoderWeights::load(directory);
   std::string backend = options.backend;
 #if defined(LOKAHI_WITH_METAL)
   if (backend == "auto") backend = metal_available() ? "metal" : "cpu";
-  if (backend == "metal") return make_gemma3_metal(std::move(weights), options);
+  if (backend == "metal") return make_decoder_metal(std::move(weights), options);
 #else
   if (backend == "auto") backend = "cpu";
   LK_CHECK(backend != "metal", "this build has no Metal backend");
 #endif
   LK_CHECK(backend == "cpu", "unknown backend '" + backend + "'");
-  return make_gemma3_cpu(std::move(weights), options);
+  return make_decoder_cpu(std::move(weights), options);
 }
 
 }  // namespace lokahi

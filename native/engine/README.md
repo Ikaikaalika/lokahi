@@ -20,8 +20,9 @@ cmake --build build/engine -j
 
 | Area | State | Evidence |
 |---|---|---|
-| Gemma 3 text decoder, CPU backend | Implemented | Correctness: matches the NumPy oracle within 2e-4 relative; greedy tokens exact (`tests/test_native_engine.py`) |
-| Gemma 3 text decoder, Metal backend | Implemented, awaiting first hardware run | Builds on hosted macOS CI; execution and parity run on the self-hosted runner |
+| Dense decoders on CPU: Gemma 3, Llama 3.x, Mistral, Qwen 2/2.5, Qwen 3 | Implemented | Correctness: matches the NumPy oracles (`oracles/gemma3.py`, `oracles/llama.py`) within 2e-4 relative; greedy tokens exact (`tests/test_native_engine.py`) |
+| Dense decoders on Metal (same families) | Implemented, awaiting first hardware run | Builds on hosted macOS CI; execution and parity run on the self-hosted runner |
+| Oracles vs MLX-LM (`gemma3_text`, `llama`, `qwen2`, `qwen3`) | Written | Runs on the self-hosted Mac (`tests/test_mlx_crosscheck.py`) |
 | MLX affine 2/4/8-bit weights, BF16/F16 scales, per-module bit overrides | Implemented | Unit tests; MLX cross-check on Apple Silicon |
 | Tokenizer: SentencePiece-style BPE (Gemma, Llama 2, Mistral) from `tokenizer.json` | Implemented | Correctness: identical ids and text to Hugging Face `tokenizers` on trained fixtures (byte fallback, unknown fusion, added tokens, Metaspace) and a 262k-entry synthetic vocabulary (`tests/test_tokenizer.py`) |
 | Tokenizer: byte-level BPE (Llama 3, Qwen, GPT-OSS, DeepSeek, GLM) | Implemented | Correctness: identical words, ids and text to Hugging Face `tokenizers` for the Qwen 3, Llama 3, GLM, GPT-OSS o200k, DeepSeek V3 and GPT-2 configurations on text from every Unicode plane (`tests/test_tokenizer_bytelevel.py`); regex engine fuzzed against the reference's Oniguruma |
@@ -31,6 +32,22 @@ No throughput claim is made until the self-hosted runner records hardware
 evidence against a fresh MLX-LM control.
 
 ## Design
+
+**Model families.** `DecoderConfig` describes how the supported families
+differ, and both backends implement every option:
+
+| Option | Gemma 3 | Llama 3.x | Mistral | Qwen 2/2.5 | Qwen 3 |
+|---|---|---|---|---|---|
+| RMSNorm scale | `1 + w` | `w` | `w` | `w` | `w` |
+| Norms after each sublayer | yes | no | no | no | no |
+| Per-head Q/K norm | yes | no | no | no | yes |
+| q/k/v biases | no | no | no | yes | no |
+| Gated MLP | GELU (tanh) | SiLU | SiLU | SiLU | SiLU |
+| RoPE | local and global bases, linear scaling | `llama3` or linear scaling | linear scaling | default | default |
+| Sliding window | 5 of every 6 layers | no | every layer, when set | no | no |
+
+A family is a config parser in `decoder.cpp`. Options outside this table
+(o_proj or MLP biases, YaRN, partial rotary, other activations) fail at load.
 
 **Loading.** Checkpoints are memory-mapped safetensors (single file or
 shards) in MLX layout. The Metal backend copies every matrix once into a few
@@ -45,7 +62,7 @@ because they are read-only.
 4. Split-K online-softmax attention, plus a reduce pass.
 5. Output projection.
 6. Fused residual and RMSNorm.
-7. Fused gate/up/GELU (`qmv_geglu`).
+7. Fused gate/up and gated activation (`qmv_glu`; GELU for Gemma, SiLU for the Llama family).
 8. Down projection.
 9. Fused residual and RMSNorm.
 
