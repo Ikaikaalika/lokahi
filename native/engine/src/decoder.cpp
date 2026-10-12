@@ -17,9 +17,23 @@ static const Json& text_config(const Json& raw) {
 
 namespace {
 
+std::string model_type(const Json& raw) {
+  return text_config(raw).string_or("model_type", raw.string_or("model_type", ""));
+}
+
 bool is_gemma3(const Json& raw) {
-  std::string type = text_config(raw).string_or("model_type", raw.string_or("model_type", ""));
+  const std::string type = model_type(raw);
   return type == "gemma3_text" || type == "gemma3";
+}
+
+bool is_llama_family(const Json& raw) {
+  const std::string type = model_type(raw);
+  return type == "llama" || type == "mistral" || type == "qwen2" || type == "qwen3";
+}
+
+bool flag(const Json& cfg, const char* key) {
+  const Json* value = cfg.find(key);
+  return value != nullptr && value->is_bool() && value->as_bool();
 }
 
 std::vector<int32_t> eos_ids(const Json& raw, const Json& cfg) {
@@ -59,7 +73,8 @@ DecoderConfig gemma3_config(const Json& raw) {
   if (const Json* scaling = cfg.find("rope_scaling"); scaling != nullptr && scaling->is_object()) {
     std::string kind = scaling->string_or("rope_type", scaling->string_or("type", "default"));
     if (kind == "linear") {
-      c.rope_linear_factor = static_cast<float>(scaling->at("factor").as_number());
+      c.rope_scaling.kind = RopeScaling::Kind::Linear;
+      c.rope_scaling.factor = scaling->at("factor").as_number();
     } else {
       LK_CHECK(kind == "default", "gemma3: rope_scaling type '" + kind + "' is not supported");
     }
@@ -85,29 +100,113 @@ DecoderConfig gemma3_config(const Json& raw) {
   return c;
 }
 
+// Llama 3.x, Mistral, Qwen 2/2.5 and Qwen 3: pre-norm blocks with plain
+// RMSNorm, SiLU-gated MLPs and rotate-half RoPE. Qwen 3 adds per-head Q/K
+// norm, Qwen 2 adds q/k/v biases, Mistral may use a sliding window on every
+// layer. Options these checkpoints do not use fail closed.
+DecoderConfig llama_family_config(const Json& cfg) {
+  DecoderConfig c;
+  c.architecture = model_type(cfg);
+  const std::string& arch = c.architecture;
+  c.vocab_size = static_cast<int>(cfg.at("vocab_size").as_int());
+  c.hidden_size = static_cast<int>(cfg.at("hidden_size").as_int());
+  c.intermediate_size = static_cast<int>(cfg.at("intermediate_size").as_int());
+  c.num_layers = static_cast<int>(cfg.at("num_hidden_layers").as_int());
+  c.num_heads = static_cast<int>(cfg.at("num_attention_heads").as_int());
+  c.num_kv_heads = static_cast<int>(cfg.int_or("num_key_value_heads", c.num_heads));
+  const Json* head_dim = cfg.find("head_dim");
+  c.head_dim = head_dim != nullptr && head_dim->is_number() ? static_cast<int>(head_dim->as_int())
+                                                             : c.hidden_size / c.num_heads;
+  c.rms_norm_eps = static_cast<float>(cfg.number_or("rms_norm_eps", 1e-6));
+  c.qk_norm = arch == "qwen3";
+  c.qkv_bias = arch == "qwen2";
+  c.attn_scale = 1.0f / std::sqrt(static_cast<float>(c.head_dim));
+  c.rope_theta = static_cast<float>(cfg.number_or("rope_theta", 1e4));
+
+  const std::string activation = cfg.string_or("hidden_act", "silu");
+  LK_CHECK(activation == "silu", arch + ": unsupported activation " + activation);
+  // These add o_proj or MLP biases, which no supported checkpoint uses.
+  LK_CHECK(!flag(cfg, "attention_bias"), arch + ": attention_bias is not supported");
+  LK_CHECK(!flag(cfg, "mlp_bias"), arch + ": mlp_bias is not supported");
+  const double rotary = cfg.number_or("partial_rotary_factor", 1.0);
+  LK_CHECK(rotary == 1.0, arch + ": partial_rotary_factor is not supported");
+
+  if (const Json* scaling = cfg.find("rope_scaling"); scaling != nullptr && scaling->is_object()) {
+    const std::string kind = scaling->string_or("rope_type", scaling->string_or("type", "default"));
+    if (kind == "llama3") {
+      c.rope_scaling.kind = RopeScaling::Kind::Llama3;
+      c.rope_scaling.factor = scaling->at("factor").as_number();
+      c.rope_scaling.low_freq_factor = scaling->number_or("low_freq_factor", 1.0);
+      c.rope_scaling.high_freq_factor = scaling->number_or("high_freq_factor", 4.0);
+      c.rope_scaling.original_max_positions = scaling->number_or("original_max_position_embeddings", 8192.0);
+      LK_CHECK(c.rope_scaling.high_freq_factor > c.rope_scaling.low_freq_factor,
+               arch + ": llama3 rope_scaling needs high_freq_factor > low_freq_factor");
+    } else if (kind == "linear") {
+      c.rope_scaling.kind = RopeScaling::Kind::Linear;
+      c.rope_scaling.factor = scaling->at("factor").as_number();
+    } else {
+      LK_CHECK(kind == "default", arch + ": rope_scaling type '" + kind + "' is not supported");
+    }
+  }
+
+  // Mistral applies its window to every layer; Qwen's optional per-layer
+  // windows (use_sliding_window) are not supported.
+  LK_CHECK(!flag(cfg, "use_sliding_window"), arch + ": use_sliding_window is not supported");
+  const Json* window = cfg.find("sliding_window");
+  const bool sliding = arch == "mistral" && window != nullptr && window->is_number();
+  if (sliding) c.sliding_window = static_cast<int>(window->as_int());
+  c.layer_is_sliding.assign(static_cast<size_t>(c.num_layers), sliding);
+  c.eos_token_ids = eos_ids(cfg, cfg);
+  return c;
+}
+
 }  // namespace
 
-bool is_supported_decoder(const Json& raw) { return is_gemma3(raw); }
+bool is_supported_decoder(const Json& raw) { return is_gemma3(raw) || is_llama_family(raw); }
 
 DecoderConfig DecoderConfig::from_json(const Json& raw) {
-  LK_CHECK(is_supported_decoder(raw), "unsupported architecture '" + raw.string_or("model_type", "?") +
-                                          "'; this build supports Gemma 3 text models");
-  DecoderConfig c = gemma3_config(raw);
+  LK_CHECK(is_supported_decoder(raw),
+           "unsupported architecture '" + model_type(raw) +
+               "'; this build supports gemma3, llama, mistral, qwen2 and qwen3 text models");
+  DecoderConfig c = is_gemma3(raw) ? gemma3_config(raw) : llama_family_config(raw);
   LK_CHECK(static_cast<int>(c.layer_is_sliding.size()) == c.num_layers,
            c.architecture + ": layer_types length mismatch");
   LK_CHECK(c.num_heads > 0 && c.num_kv_heads > 0 && c.num_heads % c.num_kv_heads == 0,
            c.architecture + ": heads must be a multiple of kv heads");
   LK_CHECK(c.head_dim > 0 && c.head_dim % 2 == 0, c.architecture + ": head_dim must be even");
+  LK_CHECK(c.sliding_window > 0 ||
+               std::none_of(c.layer_is_sliding.begin(), c.layer_is_sliding.end(), [](bool s) { return s; }),
+           c.architecture + ": sliding layers need a positive sliding_window");
   return c;
 }
 
 std::vector<double> DecoderConfig::rope_inv_freq(bool sliding) const {
   const bool local = sliding && local_rope;
   const double base = local ? rope_local_theta : rope_theta;
-  const double factor = local ? 1.0 : rope_linear_factor;
+  const RopeScaling none;
+  const RopeScaling& scaling = local ? none : rope_scaling;
+  constexpr double kPi = 3.14159265358979323846;
   std::vector<double> inv_freq(static_cast<size_t>(head_dim / 2));
   for (size_t i = 0; i < inv_freq.size(); ++i) {
-    inv_freq[i] = 1.0 / std::pow(base, static_cast<double>(2 * i) / head_dim) / factor;
+    double f = 1.0 / std::pow(base, static_cast<double>(2 * i) / head_dim);
+    if (scaling.kind == RopeScaling::Kind::Linear) {
+      f /= scaling.factor;
+    } else if (scaling.kind == RopeScaling::Kind::Llama3) {
+      // Hugging Face's _compute_llama3_parameters: long wavelengths are
+      // divided by the factor, short ones kept, and the band between them
+      // interpolated.
+      const double low_wavelen = scaling.original_max_positions / scaling.low_freq_factor;
+      const double high_wavelen = scaling.original_max_positions / scaling.high_freq_factor;
+      const double wavelen = 2.0 * kPi / f;
+      if (wavelen > low_wavelen) {
+        f /= scaling.factor;
+      } else if (wavelen >= high_wavelen) {
+        const double smooth = (scaling.original_max_positions / wavelen - scaling.low_freq_factor) /
+                              (scaling.high_freq_factor - scaling.low_freq_factor);
+        f = (1.0 - smooth) * f / scaling.factor + smooth * f;
+      }
+    }
+    inv_freq[i] = f;
   }
   return inv_freq;
 }
@@ -136,6 +235,11 @@ std::shared_ptr<DecoderWeights> DecoderWeights::load(const std::string& director
     load_vector(ck, p + name + ".weight", size, out.data());
     return out;
   };
+  auto bias = [&](const std::string& module, int64_t size) {
+    std::vector<float> out(static_cast<size_t>(size));
+    load_vector(ck, p + module + ".bias", size, out.data());
+    return out;
+  };
 
   w->embed = linear("model.embed_tokens");
   LK_CHECK(w->embed.rows == c.vocab_size && w->embed.cols == c.hidden_size, arch + ": embed_tokens shape mismatch");
@@ -144,6 +248,10 @@ std::shared_ptr<DecoderWeights> DecoderWeights::load(const std::string& director
   } else if (ck.contains("lm_head.weight")) {
     w->lm_head = bind_linear(ck, w->raw_config, "lm_head", "lm_head");
   } else {
+    const Json& cfg = text_config(w->raw_config);
+    const Json* tie = cfg.find("tie_word_embeddings");
+    LK_CHECK(tie == nullptr || !tie->is_bool() || tie->as_bool(),
+             arch + ": tie_word_embeddings is false but the checkpoint has no lm_head");
     w->lm_head = w->embed;
     w->tied_lm_head = true;
   }
@@ -165,6 +273,19 @@ std::shared_ptr<DecoderWeights> DecoderWeights::load(const std::string& director
     if (c.qk_norm) {
       layer.q_norm = vec(base + ".self_attn.q_norm", c.head_dim);
       layer.k_norm = vec(base + ".self_attn.k_norm", c.head_dim);
+    }
+    if (c.qkv_bias) {
+      layer.q_bias = bias(base + ".self_attn.q_proj", q_out);
+      layer.k_bias = bias(base + ".self_attn.k_proj", kv_out);
+      layer.v_bias = bias(base + ".self_attn.v_proj", kv_out);
+    }
+    // A bias the family does not define means a different model: refuse it
+    // rather than silently ignoring it.
+    for (const char* module : {".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj"}) {
+      LK_CHECK(c.qkv_bias || !ck.contains(p + base + module + ".bias"), base + module + ": unexpected bias for " + arch);
+    }
+    for (const char* module : {".self_attn.o_proj", ".mlp.gate_proj", ".mlp.up_proj", ".mlp.down_proj"}) {
+      LK_CHECK(!ck.contains(p + base + module + ".bias"), base + module + ": unexpected bias for " + arch);
     }
     layer.q_proj = linear(base + ".self_attn.q_proj");
     layer.k_proj = linear(base + ".self_attn.k_proj");
@@ -304,6 +425,10 @@ class DecoderCpu final : public Model {
     rms_norm(x, weight.data(), size, c_.rms_norm_eps, c_.norm_offset, out);
   }
 
+  static void add_bias(float* row, const std::vector<float>& bias) {
+    for (size_t i = 0; i < bias.size(); ++i) row[i] += bias[i];
+  }
+
   // x += sublayer output r, normalized first when the family uses sandwich norms.
   void add_residual(int n, const std::vector<float>& post_norm) {
     const int64_t hidden = c_.hidden_size;
@@ -348,6 +473,13 @@ class DecoderCpu final : public Model {
       matmul(L.q_proj, h_.data(), n, q_.data(), pool_);
       matmul(L.k_proj, h_.data(), n, k_.data(), pool_);
       matmul(L.v_proj, h_.data(), n, v_.data(), pool_);
+      if (c_.qkv_bias) {
+        for (int t = 0; t < n; ++t) {
+          add_bias(q_.data() + static_cast<size_t>(t) * H * D, L.q_bias);
+          add_bias(k_.data() + static_cast<size_t>(t) * KV * D, L.k_bias);
+          add_bias(v_.data() + static_cast<size_t>(t) * KV * D, L.v_bias);
+        }
+      }
       const auto& inv_freq = sliding ? inv_freq_local_ : inv_freq_global_;
       for (int t = 0; t < n; ++t) {
         for (int hh = 0; hh < H; ++hh) {

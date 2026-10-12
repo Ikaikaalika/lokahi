@@ -15,8 +15,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from lokahi.fixtures import TinyGemma3Spec, write_tiny_gemma3
-from lokahi.oracles import Gemma3Reference
+from lokahi.fixtures import TinyDenseSpec, TinyGemma3Spec, write_tiny_dense, write_tiny_gemma3
+from lokahi.oracles import Gemma3Reference, LlamaFamilyReference
 
 TOKENS = [2, 5, 9, 33, 100, 7, 7, 7, 400, 3, 2, 11, 90, 91, 92, 93, 17, 18, 19, 20, 21, 22]
 
@@ -31,9 +31,18 @@ def _run(cli: Path, *args: str) -> dict:
     return json.loads(result.stdout.strip().splitlines()[-1])
 
 
-VARIANTS = {
-    "untied-hd64-mixed-bits": TinyGemma3Spec(),
-    "tied-hd256-rope-scaled": TinyGemma3Spec(
+LLAMA3_SCALING = {
+    "rope_type": "llama3",
+    "factor": 32.0,
+    "low_freq_factor": 1.0,
+    "high_freq_factor": 4.0,
+    # Small enough that the fixture's head_dim spans all three frequency bands.
+    "original_max_position_embeddings": 64,
+}
+
+GEMMA3_VARIANTS = {
+    "gemma3-untied-hd64-mixed-bits": TinyGemma3Spec(),
+    "gemma3-tied-hd256-rope-scaled": TinyGemma3Spec(
         hidden_size=256,
         num_attention_heads=4,
         num_key_value_heads=1,
@@ -44,15 +53,34 @@ VARIANTS = {
         eight_bit_mlp_layers=(),
         seed=1,
     ),
-    "language-model-prefix": TinyGemma3Spec(prefix="language_model.", seed=2),
+    "gemma3-language-model-prefix": TinyGemma3Spec(prefix="language_model.", seed=2),
 }
+DENSE_VARIANTS = {
+    # Llama 3.2: llama3 RoPE scaling, tied embeddings, 4 query heads per kv head.
+    "llama3-tied-rope-llama3": TinyDenseSpec(num_attention_heads=8, num_key_value_heads=2, head_dim=64,
+                                             hidden_size=256, rope_scaling=LLAMA3_SCALING, seed=3),
+    # Qwen 3: per-head q/k norm and head_dim * heads != hidden_size.
+    "qwen3-qk-norm-hd128": TinyDenseSpec(model_type="qwen3", num_attention_heads=4, num_key_value_heads=2,
+                                         head_dim=128, rope_theta=1e6, seed=4),
+    # Qwen 2.5 0.5B shape: q/k/v biases and 7 query heads per kv head.
+    "qwen2-bias-group7": TinyDenseSpec(model_type="qwen2", hidden_size=448, num_attention_heads=7,
+                                       num_key_value_heads=1, group_size=64, rope_theta=1e6, seed=5),
+    # Mistral: untied head and a sliding window on every layer.
+    "mistral-sliding-untied": TinyDenseSpec(model_type="mistral", sliding_window=8, tie_word_embeddings=False,
+                                            rope_theta=1e6, rope_scaling={"rope_type": "linear", "factor": 2.0},
+                                            seed=6),
+}
+VARIANTS = sorted(GEMMA3_VARIANTS) + sorted(DENSE_VARIANTS)
 
 
-@pytest.fixture(scope="module", params=sorted(VARIANTS))
+@pytest.fixture(scope="module", params=VARIANTS)
 def fixture_model(request, tmp_path_factory):
     directory = tmp_path_factory.mktemp(request.param)
-    write_tiny_gemma3(directory, VARIANTS[request.param])
-    return directory, Gemma3Reference.load(directory)
+    if request.param in GEMMA3_VARIANTS:
+        write_tiny_gemma3(directory, GEMMA3_VARIANTS[request.param])
+        return directory, Gemma3Reference.load(directory)
+    write_tiny_dense(directory, DENSE_VARIANTS[request.param])
+    return directory, LlamaFamilyReference.load(directory)
 
 
 @pytest.mark.parametrize("backend", _backends())
@@ -109,10 +137,52 @@ def test_context_overflow_fails_closed(native_cli, tmp_path):
     assert "context length exceeded" in result.stderr
 
 
-def test_rejects_unsupported_architecture(native_cli, tmp_path):
-    directory = write_tiny_gemma3(tmp_path / "model", replace(TinyGemma3Spec(), extra={"model_type": "llama"}))
+def test_reports_the_architecture(native_cli, tmp_path):
+    directory = write_tiny_dense(tmp_path / "model", TinyDenseSpec(model_type="qwen3"))
+    assert _run(native_cli, "info", "--model", str(directory), "--backend", "cpu")["architecture"] == "qwen3"
+
+
+def test_llama3_scaling_changes_the_fixture_output():
+    # Guards the fixture: the llama3 variant must exercise scaled frequencies.
+    from lokahi.oracles import LlamaFamilyConfig
+
+    spec = DENSE_VARIANTS["llama3-tied-rope-llama3"]
+    scaled = LlamaFamilyConfig.from_dict(spec.config()).inv_freq()
+    plain = LlamaFamilyConfig.from_dict(replace(spec, rope_scaling=None).config()).inv_freq()
+    assert (scaled < plain).any() and (scaled == plain).any()
+    assert ((scaled < plain) & (scaled > plain / 32.0)).any()  # the interpolated band
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"model_type": "phi3"}, "unsupported architecture 'phi3'"),
+        ({"attention_bias": True}, "attention_bias is not supported"),
+        ({"mlp_bias": True}, "mlp_bias is not supported"),
+        ({"hidden_act": "gelu"}, "unsupported activation gelu"),
+        ({"use_sliding_window": True}, "use_sliding_window is not supported"),
+        ({"rope_scaling": {"rope_type": "yarn", "factor": 4.0}}, "rope_scaling type 'yarn' is not supported"),
+        ({"partial_rotary_factor": 0.5}, "partial_rotary_factor is not supported"),
+        ({"tie_word_embeddings": False}, "tie_word_embeddings is false but the checkpoint has no lm_head"),
+    ],
+)
+def test_unsupported_configurations_fail_closed(native_cli, tmp_path, change, message):
+    directory = write_tiny_dense(tmp_path / "model", TinyDenseSpec(extra=change))
     result = subprocess.run(
-        [str(native_cli), "info", "--model", str(directory)], capture_output=True, text=True
+        [str(native_cli), "info", "--model", str(directory), "--backend", "cpu"], capture_output=True, text=True
     )
     assert result.returncode != 0
-    assert "unsupported architecture" in result.stderr
+    assert message in result.stderr
+
+
+def test_unexpected_bias_fails_closed(native_cli, tmp_path):
+    # A Qwen 2 checkpoint relabeled as Llama carries biases Llama does not have.
+    directory = write_tiny_dense(tmp_path / "model", TinyDenseSpec(model_type="qwen2"))
+    config = json.loads((directory / "config.json").read_text())
+    config["model_type"] = "llama"
+    (directory / "config.json").write_text(json.dumps(config))
+    result = subprocess.run(
+        [str(native_cli), "info", "--model", str(directory), "--backend", "cpu"], capture_output=True, text=True
+    )
+    assert result.returncode != 0
+    assert "self_attn.q_proj: unexpected bias for llama" in result.stderr

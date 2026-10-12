@@ -1,6 +1,7 @@
-// Dense decoder-only transformers: configuration, weight binding, and the CPU
-// backend. One configuration describes how model families differ (norm
-// style and placement, activation, per-head Q/K norm, RoPE bases and
+// Dense decoder-only transformers (Gemma 3, Llama 3.x, Mistral, Qwen 2/2.5,
+// Qwen 3): configuration, weight binding, and the CPU backend. One
+// configuration describes how the families differ (norm style and
+// placement, activation, per-head Q/K norm, q/k/v biases, RoPE bases and
 // scaling, sliding windows, logit soft-capping), and every backend
 // implements all of it, so a family is a config parser rather than a fork.
 #pragma once
@@ -18,8 +19,17 @@ namespace lokahi {
 
 enum class Activation { GeluTanh, Silu };
 
+// RoPE frequency scaling from `rope_scaling` (Hugging Face semantics).
+struct RopeScaling {
+  enum class Kind { None, Linear, Llama3 } kind = Kind::None;
+  double factor = 1.0;
+  double low_freq_factor = 1.0;      // llama3
+  double high_freq_factor = 4.0;     // llama3
+  double original_max_positions = 8192.0;  // llama3
+};
+
 struct DecoderConfig {
-  std::string architecture;  // reported name, e.g. "gemma3"
+  std::string architecture;  // model_type family, e.g. "gemma3" or "qwen3"
   int vocab_size = 0;
   int hidden_size = 0;
   int intermediate_size = 0;
@@ -33,12 +43,13 @@ struct DecoderConfig {
   float norm_offset = 0.0f;
   // Gemma also normalizes each sublayer's output before the residual add.
   bool sandwich_norms = false;
-  bool qk_norm = false;  // per-head RMSNorm on q and k before RoPE
+  bool qk_norm = false;   // per-head RMSNorm on q and k before RoPE
+  bool qkv_bias = false;  // biases on the q, k and v projections (Qwen 2)
   Activation activation = Activation::Silu;
   float embed_scale = 1.0f;
   float attn_scale = 0.0f;
   float rope_theta = 1e4f;
-  float rope_linear_factor = 1.0f;
+  RopeScaling rope_scaling;
   // Gemma 3's sliding layers use their own unscaled RoPE base.
   bool local_rope = false;
   float rope_local_theta = 1e4f;
@@ -61,6 +72,7 @@ struct DecoderLayer {
   // attn_post_norm and mlp_post_norm exist only with sandwich norms;
   // q_norm and k_norm only with qk_norm.
   std::vector<float> attn_norm, attn_post_norm, mlp_norm, mlp_post_norm, q_norm, k_norm;
+  std::vector<float> q_bias, k_bias, v_bias;  // only with qkv_bias
   Linear q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj;
 };
 

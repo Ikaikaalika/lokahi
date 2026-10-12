@@ -49,8 +49,9 @@ struct GpuLinear {
 
 struct GpuLayer {
   GpuLinear q, k, v, o, gate, up, down;
-  // Norms a family does not have are bound to a placeholder and never read.
-  BufRef attn_norm, attn_post_norm, mlp_norm, mlp_post_norm, q_norm, k_norm;
+  // Norms and biases a family does not have are bound to a placeholder and
+  // never read.
+  BufRef attn_norm, attn_post_norm, mlp_norm, mlp_post_norm, q_norm, k_norm, q_bias, k_bias, v_bias;
   id<MTLBuffer> k_cache = nil;
   id<MTLBuffer> v_cache = nil;
   int capacity = 0;
@@ -122,6 +123,7 @@ struct ElementwiseParams { int count; };
 struct GluMulParams { int count; int silu; };
 struct RopeParams {
   int heads; int kv_heads; int head_dim; int start_pos; int capacity; float eps; float offset; int qk_norm;
+  int qkv_bias;
 };
 struct AttnParams {
   int heads; int kv_heads; int head_dim; int start_pos; int window; int capacity; int block; int n_blocks;
@@ -261,8 +263,7 @@ class DecoderMetal final : public Model {
     LK_CHECK(c_.head_dim % 32 == 0 && (dpl == 2 || dpl == 4 || dpl == 8),
              "metal: head_dim must be 64, 128 or 256");
     const int group = c_.num_heads / c_.num_kv_heads;
-    LK_CHECK(group == 1 || group == 2 || group == 4 || group == 8,
-             "metal: heads per kv head must be 1, 2, 4 or 8");
+    LK_CHECK(group >= 1 && group <= 8, "metal: heads per kv head must be between 1 and 8");
   }
 
   GpuLinear add_linear(WeightArena& arena, const Linear& l, std::vector<std::pair<GpuLinear*, std::array<size_t, 3>>>& fix,
@@ -295,7 +296,9 @@ class DecoderMetal final : public Model {
     }
     add_vector(w_->final_norm, &final_norm_);
     // Bound in place of norms a family does not have; kernels never read it.
-    placeholder_data_.assign(static_cast<size_t>(std::max(c_.hidden_size, c_.head_dim)), 0.0f);
+    placeholder_data_.assign(static_cast<size_t>(
+                                 std::max({c_.hidden_size, c_.head_dim, c_.num_heads * c_.head_dim})),
+                             0.0f);
     add_vector(placeholder_data_, &placeholder_);
 
     for (const double f : c_.rope_inv_freq(true)) inv_freq_local_.push_back(static_cast<float>(f));
@@ -325,6 +328,9 @@ class DecoderMetal final : public Model {
       add_optional(L.mlp_post_norm, &G.mlp_post_norm);
       add_optional(L.q_norm, &G.q_norm);
       add_optional(L.k_norm, &G.k_norm);
+      add_optional(L.q_bias, &G.q_bias);
+      add_optional(L.k_bias, &G.k_bias);
+      add_optional(L.v_bias, &G.v_bias);
     }
     arena.finalize();
     for (auto& [target, ids] : linear_fix) {
@@ -530,8 +536,11 @@ class DecoderMetal final : public Model {
     bind(enc, G.k_norm, 6);
     bind(enc, G.sliding ? inv_freq_local_buf_ : inv_freq_global_buf_, 7);
     bytes(enc, RopeParams{c_.num_heads, c_.num_kv_heads, c_.head_dim, start, G.capacity, c_.rms_norm_eps,
-                          c_.norm_offset, c_.qk_norm ? 1 : 0},
+                          c_.norm_offset, c_.qk_norm ? 1 : 0, c_.qkv_bias ? 1 : 0},
           8);
+    bind(enc, G.q_bias, 9);
+    bind(enc, G.k_bias, 10);
+    bind(enc, G.v_bias, 11);
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(c_.num_heads + c_.num_kv_heads),
                                           static_cast<NSUInteger>(n), 1)
         threadsPerThreadgroup:MTLSizeMake(static_cast<NSUInteger>(c_.head_dim / 2), 1, 1)];

@@ -108,7 +108,8 @@ def load_dense_weights(model_dir: Path) -> tuple[dict[str, Any], dict[str, np.nd
     """Load ``config.json`` and every safetensors shard as float32 matrices.
 
     Returned names have the ``language_model.`` prefix and the quantization
-    triple suffixes removed, e.g. ``model.layers.0.mlp.up_proj``.
+    triple suffixes removed, e.g. ``model.layers.0.mlp.up_proj``. Linear
+    biases keep their suffix, e.g. ``model.layers.0.self_attn.q_proj.bias``.
     """
 
     model_dir = Path(model_dir)
@@ -124,6 +125,9 @@ def load_dense_weights(model_dir: Path) -> tuple[dict[str, Any], dict[str, np.nd
     dense: dict[str, np.ndarray] = {}
     for name, (dtype, array) in tensors.items():
         if name.endswith(".scales") or name.endswith(".biases"):
+            continue
+        if name.endswith(".bias"):
+            dense[strip(name)] = _tensor_f32(dtype, array)
             continue
         if not name.endswith(".weight"):
             continue

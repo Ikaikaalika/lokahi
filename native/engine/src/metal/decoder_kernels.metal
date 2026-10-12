@@ -442,9 +442,9 @@ kernel void softcap(device float* values [[buffer(0)]],
 }
 
 // ---------------------------------------------------------------------------
-// Optional per-head RMSNorm + rotate-half RoPE for q and k, and KV-cache
-// writes. Grid: threadgroups (heads + kv_heads, n_tokens); head_dim / 2
-// threads each.
+// Optional q/k/v biases, optional per-head RMSNorm, rotate-half RoPE for q
+// and k, and KV-cache writes. Grid: threadgroups (heads + kv_heads,
+// n_tokens); head_dim / 2 threads each.
 // ---------------------------------------------------------------------------
 
 struct RopeParams {
@@ -456,6 +456,7 @@ struct RopeParams {
   float eps;
   float offset;
   int qk_norm;
+  int qkv_bias;
 };
 
 kernel void qk_norm_rope_store(device float* q [[buffer(0)]],
@@ -467,6 +468,9 @@ kernel void qk_norm_rope_store(device float* q [[buffer(0)]],
                                const device float* k_norm [[buffer(6)]],
                                const device float* inv_freq [[buffer(7)]],
                                constant RopeParams& p [[buffer(8)]],
+                               const device float* q_bias [[buffer(9)]],
+                               const device float* k_bias [[buffer(10)]],
+                               const device float* v_bias [[buffer(11)]],
                                uint2 tgp [[threadgroup_position_in_grid]],
                                uint2 tid2 [[thread_position_in_threadgroup]],
                                uint2 tpg2 [[threads_per_threadgroup]],
@@ -485,8 +489,13 @@ kernel void qk_norm_rope_store(device float* q [[buffer(0)]],
   const device float* src = is_q ? q + (t * p.heads + head) * p.head_dim
                                  : k_in + (t * p.kv_heads + kvh) * p.head_dim;
   const int i = int(tid);
-  const float a = src[i];
-  const float b = src[i + half_dim];
+  float a = src[i];
+  float b = src[i + half_dim];
+  if (p.qkv_bias != 0) {
+    const device float* bias = is_q ? q_bias + head * p.head_dim : k_bias + kvh * p.head_dim;
+    a += bias[i];
+    b += bias[i + half_dim];
+  }
   float na = a;
   float nb = b;
   if (p.qk_norm != 0) {  // Uniform across the threadgroup.
@@ -513,8 +522,9 @@ kernel void qk_norm_rope_store(device float* q [[buffer(0)]],
   kd[i + half_dim] = rb;
   const device float* vs = v_in + (t * p.kv_heads + kvh) * p.head_dim;
   device float* vd = v_cache + (kvh * p.capacity + slot) * p.head_dim;
-  vd[i] = vs[i];
-  vd[i + half_dim] = vs[i + half_dim];
+  const device float* vb = v_bias + kvh * p.head_dim;
+  vd[i] = vs[i] + (p.qkv_bias != 0 ? vb[i] : 0.0f);
+  vd[i + half_dim] = vs[i + half_dim] + (p.qkv_bias != 0 ? vb[i + half_dim] : 0.0f);
 }
 
 // ---------------------------------------------------------------------------
@@ -649,18 +659,17 @@ template <int G, int DPL>
   template LOKAHI_INSTANCE_ATTRS("attn_partial_g" #G "_d" #DPL)             \
   decltype(attn_partial<G, DPL>) attn_partial<G, DPL>;
 
-LOKAHI_ATTN(1, 2)
-LOKAHI_ATTN(1, 4)
-LOKAHI_ATTN(1, 8)
-LOKAHI_ATTN(2, 2)
-LOKAHI_ATTN(2, 4)
-LOKAHI_ATTN(2, 8)
-LOKAHI_ATTN(4, 2)
-LOKAHI_ATTN(4, 4)
-LOKAHI_ATTN(4, 8)
-LOKAHI_ATTN(8, 2)
-LOKAHI_ATTN(8, 4)
-LOKAHI_ATTN(8, 8)
+// Query heads per kv head (G) seen in supported checkpoints run from 1 to 8
+// (Qwen 2.5 uses 6 and 7, Qwen 3 14B uses 5); head_dim is 32 * DPL.
+#define LOKAHI_ATTN_ALL_DPL(G) LOKAHI_ATTN(G, 2) LOKAHI_ATTN(G, 4) LOKAHI_ATTN(G, 8)
+LOKAHI_ATTN_ALL_DPL(1)
+LOKAHI_ATTN_ALL_DPL(2)
+LOKAHI_ATTN_ALL_DPL(3)
+LOKAHI_ATTN_ALL_DPL(4)
+LOKAHI_ATTN_ALL_DPL(5)
+LOKAHI_ATTN_ALL_DPL(6)
+LOKAHI_ATTN_ALL_DPL(7)
+LOKAHI_ATTN_ALL_DPL(8)
 
 struct ReduceParams {
   int heads;
