@@ -58,8 +58,8 @@ jobs:
           if ! xcrun -sdk macosx metal --version >/dev/null 2>&1; then
             xcodebuild -downloadComponent MetalToolchain || true
           fi
-          xcrun -sdk macosx metal -std=metal3.0 -Werror -c native/engine/src/metal/gemma3_kernels.metal -o build/gemma3_kernels.air
-          xcrun -sdk macosx metallib build/gemma3_kernels.air -o build/gemma3_kernels.metallib
+          xcrun -sdk macosx metal -std=metal3.0 -Werror -c native/engine/src/metal/decoder_kernels.metal -o build/decoder_kernels.air
+          xcrun -sdk macosx metallib build/decoder_kernels.air -o build/decoder_kernels.metallib
       - name: Build ANE probe
         run: make -C native/ane
       - name: CPU engine, tokenizer and C ABI vs oracles

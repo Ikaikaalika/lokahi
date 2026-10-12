@@ -1,4 +1,4 @@
-// Lokahi Metal kernels for Gemma-family decoders.
+// Lokahi Metal kernels for dense decoders (Gemma 3 and the Llama family).
 //
 // Activations are float32. Linear weights are MLX affine-quantized codes with
 // BF16 or F16 per-group scales and biases. Quantization parameters are
@@ -40,6 +40,13 @@ inline float dot16(const device uint* w, thread const float* x) {
 inline float gelu_tanh(float x) {
   const float k = 0.7978845608028654f;
   return 0.5f * x * (1.0f + precise::tanh(k * (x + 0.044715f * x * x * x)));
+}
+
+inline float silu(float x) { return x / (1.0f + precise::exp(-x)); }
+
+// The gated MLP's activation: SiLU when `use_silu`, else tanh GELU.
+inline float glu(float gate, float up, int use_silu) {
+  return (use_silu != 0 ? silu(gate) : gelu_tanh(gate)) * up;
 }
 
 // Threadgroup-wide sum. `scratch` holds one float per simdgroup.
@@ -85,12 +92,14 @@ kernel void embed_rows(const device uint* w [[buffer(0)]],
 }
 
 // ---------------------------------------------------------------------------
-// RMSNorm with Gemma's (1 + w) scaling, one threadgroup per row.
+// RMSNorm scaled by (offset + w): Gemma's offset is 1, most families use 0.
+// One threadgroup per row.
 // ---------------------------------------------------------------------------
 
 struct NormParams {
   int cols;
   float eps;
+  float offset;
 };
 
 kernel void rms_norm_rows(const device float* in [[buffer(0)]],
@@ -109,13 +118,16 @@ kernel void rms_norm_rows(const device float* in [[buffer(0)]],
   const float total = threadgroup_sum(ss, scratch, sg, lane, (tpg + 31) / 32);
   const float inv = precise::rsqrt(total / float(p.cols) + p.eps);
   device float* y = out + row * p.cols;
-  for (int i = int(tid); i < p.cols; i += int(tpg)) y[i] = x[i] * inv * (1.0f + weight[i]);
+  for (int i = int(tid); i < p.cols; i += int(tpg)) y[i] = x[i] * inv * (p.offset + weight[i]);
 }
 
-// x += norm(r) * (1 + w_post); then, if has_next, h = norm(x) * (1 + w_next).
+// x += r, with r first normalized by w_post when post_norm (sandwich norms);
+// then, if has_next, h = norm(x) * (offset + w_next).
 struct ResidualNormParams {
   int cols;
   float eps;
+  float offset;
+  int post_norm;
   int has_next;
 };
 
@@ -134,19 +146,27 @@ kernel void residual_norm_rows(device float* x_rows [[buffer(0)]],
   const uint simdgroups = (tpg + 31) / 32;
   device float* x = x_rows + row * p.cols;
   const device float* r = r_rows + row * p.cols;
-  float ss = 0.0f;
-  for (int i = int(tid); i < p.cols; i += int(tpg)) ss += r[i] * r[i];
-  const float inv_r = precise::rsqrt(threadgroup_sum(ss, scratch, sg, lane, simdgroups) / float(p.cols) + p.eps);
   float xs = 0.0f;
-  for (int i = int(tid); i < p.cols; i += int(tpg)) {
-    const float v = x[i] + r[i] * inv_r * (1.0f + w_post[i]);
-    x[i] = v;
-    xs += v * v;
+  if (p.post_norm != 0) {  // Uniform across the threadgroup.
+    float ss = 0.0f;
+    for (int i = int(tid); i < p.cols; i += int(tpg)) ss += r[i] * r[i];
+    const float inv_r = precise::rsqrt(threadgroup_sum(ss, scratch, sg, lane, simdgroups) / float(p.cols) + p.eps);
+    for (int i = int(tid); i < p.cols; i += int(tpg)) {
+      const float v = x[i] + r[i] * inv_r * (p.offset + w_post[i]);
+      x[i] = v;
+      xs += v * v;
+    }
+  } else {
+    for (int i = int(tid); i < p.cols; i += int(tpg)) {
+      const float v = x[i] + r[i];
+      x[i] = v;
+      xs += v * v;
+    }
   }
   if (p.has_next == 0) return;  // Uniform across the threadgroup.
   const float inv_x = precise::rsqrt(threadgroup_sum(xs, scratch, sg, lane, simdgroups) / float(p.cols) + p.eps);
   device float* h = h_rows + row * p.cols;
-  for (int i = int(tid); i < p.cols; i += int(tpg)) h[i] = x[i] * inv_x * (1.0f + w_next[i]);
+  for (int i = int(tid); i < p.cols; i += int(tpg)) h[i] = x[i] * inv_x * (p.offset + w_next[i]);
 }
 
 // ---------------------------------------------------------------------------
@@ -261,8 +281,14 @@ kernel void qmv_qkv(const device uint* wq [[buffer(0)]],
   }
 }
 
-// out = gelu(gate(x)) * up(x) for one token.
-kernel void qmv_geglu(const device uint* wg [[buffer(0)]],
+// out = act(gate(x)) * up(x) for one token.
+struct GluParams {
+  int rows;
+  int cols;
+  int silu;
+};
+
+kernel void qmv_glu(const device uint* wg [[buffer(0)]],
                       const device ushort* sg_scales [[buffer(1)]],
                       const device ushort* bg [[buffer(2)]],
                       const device uint* wu [[buffer(3)]],
@@ -270,7 +296,7 @@ kernel void qmv_geglu(const device uint* wg [[buffer(0)]],
                       const device ushort* bu [[buffer(5)]],
                       const device float* x [[buffer(6)]],
                       device float* y [[buffer(7)]],
-                      constant QmvParams& p [[buffer(8)]],
+                      constant GluParams& p [[buffer(8)]],
                       uint tg [[threadgroup_position_in_grid]],
                       uint sg [[simdgroup_index_in_threadgroup]],
                       uint lane [[thread_index_in_simdgroup]]) {
@@ -283,7 +309,7 @@ kernel void qmv_geglu(const device uint* wg [[buffer(0)]],
   for (int r = 0; r < QMV_ROWS; ++r) {
     const float g = simd_sum(gate[r]);
     const float u = simd_sum(up[r]);
-    if (lane == 0 && row0 + r < p.rows) y[row0 + r] = gelu_tanh(g) * u;
+    if (lane == 0 && row0 + r < p.rows) y[row0 + r] = glu(g, u, p.silu);
   }
 }
 
@@ -396,11 +422,16 @@ struct ElementwiseParams {
   int count;
 };
 
-kernel void gelu_mul(device float* gate [[buffer(0)]],
-                     const device float* up [[buffer(1)]],
-                     constant ElementwiseParams& p [[buffer(2)]],
-                     uint gid [[thread_position_in_grid]]) {
-  if (int(gid) < p.count) gate[gid] = gelu_tanh(gate[gid]) * up[gid];
+struct GluMulParams {
+  int count;
+  int silu;
+};
+
+kernel void glu_mul(device float* gate [[buffer(0)]],
+                    const device float* up [[buffer(1)]],
+                    constant GluMulParams& p [[buffer(2)]],
+                    uint gid [[thread_position_in_grid]]) {
+  if (int(gid) < p.count) gate[gid] = glu(gate[gid], up[gid], p.silu);
 }
 
 kernel void softcap(device float* values [[buffer(0)]],
@@ -411,8 +442,9 @@ kernel void softcap(device float* values [[buffer(0)]],
 }
 
 // ---------------------------------------------------------------------------
-// Per-head RMSNorm + rotate-half RoPE for q and k, and KV-cache writes.
-// Grid: threadgroups (heads + kv_heads, n_tokens); head_dim / 2 threads each.
+// Optional per-head RMSNorm + rotate-half RoPE for q and k, and KV-cache
+// writes. Grid: threadgroups (heads + kv_heads, n_tokens); head_dim / 2
+// threads each.
 // ---------------------------------------------------------------------------
 
 struct RopeParams {
@@ -422,6 +454,8 @@ struct RopeParams {
   int start_pos;
   int capacity;
   float eps;
+  float offset;
+  int qk_norm;
 };
 
 kernel void qk_norm_rope_store(device float* q [[buffer(0)]],
@@ -453,11 +487,15 @@ kernel void qk_norm_rope_store(device float* q [[buffer(0)]],
   const int i = int(tid);
   const float a = src[i];
   const float b = src[i + half_dim];
-  const float ss = threadgroup_sum(a * a + b * b, scratch, sg, lane, (tpg + 31) / 32);
-  const float inv = precise::rsqrt(ss / float(p.head_dim) + p.eps);
-  const device float* nw = is_q ? q_norm : k_norm;
-  const float na = a * inv * (1.0f + nw[i]);
-  const float nb = b * inv * (1.0f + nw[i + half_dim]);
+  float na = a;
+  float nb = b;
+  if (p.qk_norm != 0) {  // Uniform across the threadgroup.
+    const float ss = threadgroup_sum(a * a + b * b, scratch, sg, lane, (tpg + 31) / 32);
+    const float inv = precise::rsqrt(ss / float(p.head_dim) + p.eps);
+    const device float* nw = is_q ? q_norm : k_norm;
+    na = a * inv * (p.offset + nw[i]);
+    nb = b * inv * (p.offset + nw[i + half_dim]);
+  }
   const float angle = float(pos) * inv_freq[i];
   const float cs = precise::cos(angle);
   const float sn = precise::sin(angle);

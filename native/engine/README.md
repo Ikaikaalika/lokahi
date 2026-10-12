@@ -45,7 +45,7 @@ because they are read-only.
 4. Split-K online-softmax attention, plus a reduce pass.
 5. Output projection.
 6. Fused residual and RMSNorm.
-7. Fused gate/up/GELU (`qmv_geglu`).
+7. Fused gate/up and gated activation (`qmv_glu`; GELU for Gemma, SiLU for the Llama family).
 8. Down projection.
 9. Fused residual and RMSNorm.
 

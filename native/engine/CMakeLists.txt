@@ -20,7 +20,7 @@ add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 
 set(LOKAHI_CORE_SOURCES
   src/c_api.cpp
-  src/gemma3.cpp
+  src/decoder.cpp
   src/json.cpp
   src/model.cpp
   src/quant.cpp
@@ -38,19 +38,19 @@ if(LOKAHI_METAL)
   enable_language(OBJCXX)
   # Embed the Metal source so the library has no build-time dependency on the
   # Metal toolchain; pipelines are compiled once at model load.
-  set(LOKAHI_SHADER ${CMAKE_CURRENT_SOURCE_DIR}/src/metal/gemma3_kernels.metal)
-  set(LOKAHI_SHADER_HEADER ${CMAKE_CURRENT_BINARY_DIR}/generated/gemma3_kernels_source.h)
+  set(LOKAHI_SHADER ${CMAKE_CURRENT_SOURCE_DIR}/src/metal/decoder_kernels.metal)
+  set(LOKAHI_SHADER_HEADER ${CMAKE_CURRENT_BINARY_DIR}/generated/decoder_kernels_source.h)
   add_custom_command(
     OUTPUT ${LOKAHI_SHADER_HEADER}
     COMMAND ${CMAKE_COMMAND} -DINPUT=${LOKAHI_SHADER} -DOUTPUT=${LOKAHI_SHADER_HEADER}
-            -DSYMBOL=kGemma3KernelSource -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_text.cmake
+            -DSYMBOL=kDecoderKernelSource -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_text.cmake
     DEPENDS ${LOKAHI_SHADER} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_text.cmake
     COMMENT "Embedding Metal kernels")
-  list(APPEND LOKAHI_CORE_SOURCES src/metal/metal_gemma3.mm ${LOKAHI_SHADER_HEADER})
+  list(APPEND LOKAHI_CORE_SOURCES src/metal/metal_decoder.mm ${LOKAHI_SHADER_HEADER})
   if(LOKAHI_CHECK_METAL_SHADERS)
     add_custom_target(lokahi_shader_check ALL
       COMMAND xcrun -sdk macosx metal -std=metal3.0 -Werror -c ${LOKAHI_SHADER}
-              -o ${CMAKE_CURRENT_BINARY_DIR}/gemma3_kernels.air
+              -o ${CMAKE_CURRENT_BINARY_DIR}/decoder_kernels.air
       DEPENDS ${LOKAHI_SHADER}
       COMMENT "Checking Metal kernels with xcrun metal")
   endif()
@@ -64,7 +64,7 @@ find_package(Threads REQUIRED)
 target_link_libraries(lokahi_core PUBLIC Threads::Threads)
 if(LOKAHI_METAL)
   target_compile_definitions(lokahi_core PUBLIC LOKAHI_WITH_METAL=1)
-  set_source_files_properties(src/metal/metal_gemma3.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
+  set_source_files_properties(src/metal/metal_decoder.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
   target_link_libraries(lokahi_core PUBLIC "-framework Foundation" "-framework Metal")
 endif()
 
