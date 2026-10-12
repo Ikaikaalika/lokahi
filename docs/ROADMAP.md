@@ -7,13 +7,14 @@ the combined plan wins. This page is the build order. Claims follow
 promoted until correctness and hardware evidence exist for the exact model,
 chip, OS build, and workload.
 
-## Where things stand (2026-10-09)
+## Where things stand (2026-10-12)
 
 | Piece | State | Evidence |
 |---|---|---|
-| Native C++ engine, C ABI, CLI | Done for Gemma 3 text | Correctness: CPU matches NumPy oracle (2e-4 rel), exact greedy tokens |
-| Metal Gemma 3 backend | Written; compiles on hosted macOS CI | Awaiting first self-hosted run |
-| Oracle vs MLX-LM cross-check | Written | Runs on the self-hosted Mac |
+| Native C++ engine, C ABI, CLI | Done for Gemma 3, Llama 3.x, Mistral, Qwen 2/2.5 and Qwen 3 text | Correctness: CPU matches the NumPy oracles (2e-4 rel), exact greedy tokens |
+| Native tokenizer | Done for SentencePiece-style and byte-level BPE | Correctness: identical to Hugging Face `tokenizers` |
+| Metal backend (same families) | Written; compiles on hosted macOS CI | Awaiting first self-hosted run |
+| Oracles vs MLX-LM cross-check | Written | Runs on the self-hosted Mac |
 | Self-hosted Apple Silicon CI | Written | Needs the runner registered ([setup](APPLE_SILICON_RUNNER.md)) |
 | Common Compute fleet benchmarks | Spec below | Needs access to the provider app repository |
 | MLX-LM M1 baselines | Recorded (Qwen3 0.6B, Llama 3.2 1B, Gemma 3 1B) | Hardware, Aug 2026 |
@@ -46,7 +47,7 @@ levers, in measured-priority order:
 
 | Step | Work | Exit gate |
 |---|---|---|
-| G1 | Verify the Gemma 3 Metal path on M1 | `LOKAHI_TEST_BACKENDS=cpu,metal` parity green; benchmark vs fresh MLX-LM control recorded |
+| G1 | Verify the Metal path on M1 | `LOKAHI_TEST_BACKENDS=cpu,metal` parity green; Gemma 3 1B, Llama 3.2 1B and Qwen3 0.6B benchmarked against fresh MLX-LM controls (the three recorded baselines) |
 | G2 | Decode tuning | ≥10% decode win on Gemma 3 1B with exact tokens: qmv rows per SIMD group, vectorized unpack, indirect command buffers or Metal 4 command allocators, residency sets |
 | G3 | Prefill attention | Online-softmax tiled attention with 8×8 SIMD-group matrices, head_dim 256 and 512, causal and sliding-block skipping |
 | G4 | KV precision | FP16/BF16 KV (then 8-bit) with parity budget; halves long-context attention traffic |
@@ -94,13 +95,14 @@ cross-check, then a pinned real model on the runner.
 | Wave | Models | New mechanics |
 |---|---|---|
 | 1 | Gemma 3 (270M–27B) | Done in code; verify on hardware |
-| 2 | Gemma 4 dense (12B) | `global_head_dim` 512 with one global KV head, `attention_k_eq_v`, partial "proportional" RoPE on global layers, final logit softcap 30, 5:1 sliding pattern with a 1024 window |
-| 3 | Dense GQA family: Qwen3, Llama 3.x, Mistral, SmolLM3, Phi, DeepSeek-R1 distills, GLM dense | SwiGLU, Q/K norm variants, biases, rope scaling (YaRN, llama3) |
-| 4 | Gemma 4 E2B/E4B | Per-layer input embeddings, KV sharing across layers |
-| 5 | MoE: Qwen3-30B-A3B, GPT-OSS 20B/120B, Gemma 4 26B-A4B, GLM-4.5/4.6-Air | Routers, expert deduplication across the batch, MXFP4 (GPT-OSS), attention sinks, alternating window 128 |
-| 6 | Large MoE: DeepSeek V3.x, Kimi K2, GLM-4.6 | MLA attention; needs a 256–512 GB Mac or SSD expert paging |
-| 7 | Hybrid attention: Qwen3-Next | Gated DeltaNet linear attention state alongside full attention |
-| 8 | VLMs: Gemma 3/4 vision, Qwen2.5/3-VL, GLM-4.5V | Vision encoders (ANE candidate), M-RoPE, image token packing |
+| 2 | Dense GQA family: Llama 3.x, Mistral, Qwen 2/2.5, Qwen 3 (and the DeepSeek-R1 distills built on them) | Done in code; verify on hardware. Pulled ahead of Gemma 4 because MLX-LM baselines exist for Llama 3.2 1B and Qwen3 0.6B |
+| 3 | More dense: SmolLM3, Phi, GLM dense, long-context Qwen | YaRN and partial rotary RoPE, NoPE layers, other norm placements |
+| 4 | Gemma 4 dense (12B) | `global_head_dim` 512 with one global KV head, `attention_k_eq_v`, partial "proportional" RoPE on global layers, final logit softcap 30, 5:1 sliding pattern with a 1024 window |
+| 5 | Gemma 4 E2B/E4B | Per-layer input embeddings, KV sharing across layers |
+| 6 | MoE: Qwen3-30B-A3B, GPT-OSS 20B/120B, Gemma 4 26B-A4B, GLM-4.5/4.6-Air | Routers, expert deduplication across the batch, MXFP4 (GPT-OSS), attention sinks, alternating window 128 |
+| 7 | Large MoE: DeepSeek V3.x, Kimi K2, GLM-4.6 | MLA attention; needs a 256–512 GB Mac or SSD expert paging |
+| 8 | Hybrid attention: Qwen3-Next | Gated DeltaNet linear attention state alongside full attention |
+| 9 | VLMs: Gemma 3/4 vision, Qwen2.5/3-VL, GLM-4.5V | Vision encoders (ANE candidate), M-RoPE, image token packing |
 
 Inputs stay portable: MLX safetensors first, then GGUF and plain safetensors.
 
