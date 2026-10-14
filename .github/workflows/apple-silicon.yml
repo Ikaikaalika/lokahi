@@ -3,18 +3,20 @@ name: apple-silicon
 # Hardware evidence on a self-hosted Apple Silicon Mac. Setup and the
 # security settings this public repository needs are in
 # docs/APPLE_SILICON_RUNNER.md. Nothing here is triggered by pull requests,
-# and every run is serialized so GPU/ANE measurements never overlap.
+# and every run is serialized so GPU/ANE measurements never overlap. The
+# scoreboard closes the improvement loop (docs/IMPROVEMENT_LOOP.md): it is
+# posted on the branch's pull request, and a regression fails the run.
 on:
   workflow_dispatch:
     inputs:
       suite:
-        description: correctness runs the oracle-parity suites; benchmark also times a pinned model
+        description: correctness runs the oracle-parity suites; benchmark also runs the scoreboard
         type: choice
         options: [correctness, benchmark]
         default: correctness
-      model_id:
-        description: Ladder model id for the benchmark suite
-        default: gemma-3-1b
+      models:
+        description: Comma-separated ladder model ids for the scoreboard
+        default: qwen3-0.6b,llama-3.2-1b,gemma-3-1b
   push:
     branches: ["claude/**"]
 
@@ -32,6 +34,8 @@ jobs:
     if: vars.LOKAHI_HW_RUNNER == 'enabled'
     runs-on: [self-hosted, macOS, ARM64, lokahi]
     timeout-minutes: 90
+    outputs:
+      scoreboard: ${{ steps.scoreboard.outputs.posted }}
     env:
       PYTHON: ${{ vars.LOKAHI_PYTHON || '/usr/bin/python3' }}
       HF_HUB_OFFLINE: "1"
@@ -75,11 +79,13 @@ jobs:
           make -C native/ane
           native/ane/build/lokahi-ane-probe | tee results/ane_probe.json
 
-      - name: Benchmark a pinned model against a fresh MLX-LM control
-        if: inputs.suite == 'benchmark'
+      - name: Scoreboard against the recorded best and a fresh MLX-LM control
+        id: scoreboard
+        # Manual benchmark runs always; pushes only when the repository opts in.
+        if: inputs.suite == 'benchmark' || (github.event_name == 'push' && vars.LOKAHI_SCOREBOARD_ON_PUSH == 'enabled')
         env:
           MODEL_ROOT: ${{ vars.LOKAHI_MODEL_ROOT }}
-          MODEL_ID: ${{ inputs.model_id }}
+          MODELS: ${{ inputs.models || 'qwen3-0.6b,llama-3.2-1b,gemma-3-1b' }}
         run: |
           if [ -z "$MODEL_ROOT" ]; then
             echo "Set the repository variable LOKAHI_MODEL_ROOT to an approved SSD directory." >&2
@@ -88,26 +94,15 @@ jobs:
           case "$MODEL_ROOT" in
             "/Volumes/Tyler HDD"*) echo "The checkout HDD is forbidden for model storage." >&2; exit 1 ;;
           esac
-          ENTRY='import json, sys; m = [e for e in json.load(open("benchmarks/targets/commoncompute_m1_model_ladder_v1.json"))["local_priority"] if e["model_id"] == sys.argv[1]][0]; print(m[sys.argv[2]])'
-          REPO=$("$PYTHON" -c "$ENTRY" "$MODEL_ID" repo)
-          REV=$("$PYTHON" -c "$ENTRY" "$MODEL_ID" revision)
-          SNAPSHOT="$MODEL_ROOT/models--$(echo "$REPO" | sed 's|/|--|g')/snapshots/$REV"
-          # Fresh MLX-LM control on this exact OS build and thermal context.
-          if PYTHONPATH=src:. "$PYTHON" benchmarks/benchmark_mlx_lm.py --model-id "$MODEL_ID" \
-              --model-path "$SNAPSHOT" --approved-ssd-root "$MODEL_ROOT" \
-              --output "results/mlx_lm_${MODEL_ID}.json" > /dev/null; then
-            HAVE_CONTROL=1
-          else
-            HAVE_CONTROL=0
-            echo "MLX-LM control did not run (see above); comparison will be skipped." >&2
-          fi
-          PYTHONPATH=src:. "$PYTHON" benchmarks/benchmark_lokahi_native.py \
-            --model-id "$MODEL_ID" --model-path "$SNAPSHOT" --approved-ssd-root "$MODEL_ROOT" \
-            --native-cli build/engine/lokahi --backend metal \
-            --output "results/lokahi_native_metal_${MODEL_ID}.json" > /dev/null
-          if [ "$HAVE_CONTROL" = 1 ]; then
-            PYTHONPATH=. "$PYTHON" benchmarks/compare_mlx_baseline.py "results/mlx_lm_${MODEL_ID}.json" \
-              "results/lokahi_native_metal_${MODEL_ID}.json" | tee "results/comparison_${MODEL_ID}.json" || true
+          set +e
+          PYTHONPATH=src:. "$PYTHON" benchmarks/scoreboard.py --models "$MODELS" --model-root "$MODEL_ROOT" \
+            --native-cli build/engine/lokahi --backend metal --output-dir results/scoreboard > /dev/null
+          status=$?
+          set -e
+          echo "exit_status=$status" >> "$GITHUB_OUTPUT"
+          if [ -f results/scoreboard/scoreboard.md ]; then
+            echo "posted=1" >> "$GITHUB_OUTPUT"
+            cat results/scoreboard/scoreboard.md >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Upload evidence
@@ -116,3 +111,54 @@ jobs:
         with:
           name: apple-silicon-evidence-${{ github.run_id }}
           path: results/
+
+      # After the upload, so a regressed run still leaves its evidence.
+      - name: Fail on a regression or a model that did not run
+        if: steps.scoreboard.outputs.exit_status != '' && steps.scoreboard.outputs.exit_status != '0'
+        run: |
+          echo "Scoreboard exit status ${{ steps.scoreboard.outputs.exit_status }}; see the job summary." >&2
+          exit 1
+
+  # Posts the scoreboard as one sticky comment on the branch's open pull
+  # request. It runs on a GitHub-hosted runner and only reads the uploaded
+  # Markdown, so the self-hosted Mac never holds a token that can write.
+  scoreboard-comment:
+    needs: hardware
+    if: always() && needs.hardware.outputs.scoreboard == '1'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: apple-silicon-evidence-${{ github.run_id }}
+          path: evidence
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- lokahi-scoreboard -->';
+            const body = fs.readFileSync('evidence/scoreboard/scoreboard.md', 'utf8');
+            if (!body.startsWith(marker)) throw new Error('scoreboard.md lacks the marker');
+            const branch = context.ref.replace(/^refs\/heads\//, '');
+            const { data: pulls } = await github.rest.pulls.list({
+              ...context.repo, state: 'open', head: `${context.repo.owner}:${branch}`,
+            });
+            if (pulls.length === 0) {
+              core.info(`No open pull request for ${branch}; the scoreboard is in the job summary.`);
+              return;
+            }
+            for (const pull of pulls) {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                ...context.repo, issue_number: pull.number, per_page: 100,
+              });
+              const previous = comments.find(
+                (c) => c.user.login === 'github-actions[bot]' && c.body.startsWith(marker));
+              if (previous) {
+                await github.rest.issues.updateComment({ ...context.repo, comment_id: previous.id, body });
+              } else {
+                await github.rest.issues.createComment({ ...context.repo, issue_number: pull.number, body });
+              }
+              core.info(`Scoreboard posted on #${pull.number}`);
+            }
