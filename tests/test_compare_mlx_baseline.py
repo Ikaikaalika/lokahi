@@ -73,3 +73,32 @@ def test_incomparable_artifact_is_rejected() -> None:
 
     with pytest.raises(BaselineComparisonError, match="artifact"):
         compare_mlx_baseline(_report("mlx-lm-baseline"), candidate)
+
+
+def test_native_flat_token_layout_matches_mlx_batch_layout() -> None:
+    # The native engine reports one sequence flat; MLX-LM reports a batch.
+    candidate = _report("lokahi-native-metal", factor=1.10)
+    candidate["repetitions"][0]["token_ids"] = [1, 2, 3]
+
+    report = compare_mlx_baseline(_report("mlx-lm-baseline"), candidate)
+
+    assert report["exact_greedy_token_parity"] is True
+
+
+def test_thermal_state_is_reported_not_compared() -> None:
+    baseline = _report("mlx-lm-baseline")
+    baseline["hardware"]["thermal_state_after_run"] = "nominal"
+    candidate = _report("lokahi-native-metal", factor=1.10)
+    candidate["hardware"]["thermal_state_after_run"] = "fair"
+
+    report = compare_mlx_baseline(baseline, candidate)
+
+    assert report["thermal_state_after_run"] == {"mlx_lm": "nominal", "lokahi": "fair"}
+
+
+def test_different_os_build_is_rejected() -> None:
+    candidate = _report("lokahi-native-metal")
+    candidate["hardware"]["macos_build"] = "other"
+
+    with pytest.raises(BaselineComparisonError, match="hardware"):
+        compare_mlx_baseline(_report("mlx-lm-baseline"), candidate)

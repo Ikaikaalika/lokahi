@@ -45,7 +45,13 @@ def _identity(report: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _reference_tokens(report: Mapping[str, Any]) -> Any:
+def _reference_tokens(report: Mapping[str, Any]) -> list[list[int]]:
+    """The first repetition's greedy tokens, one list per sequence.
+
+    MLX-LM reports a batch (``[[...]]``); the native engine reports its single
+    sequence flat (``[...]``).
+    """
+
     repetitions = report.get("repetitions")
     if not isinstance(repetitions, list) or not repetitions:
         raise BaselineComparisonError("repetitions must be non-empty")
@@ -53,7 +59,18 @@ def _reference_tokens(report: Mapping[str, Any]) -> Any:
     tokens = first.get("token_ids")
     if not isinstance(tokens, list) or not tokens:
         raise BaselineComparisonError("repetitions[0].token_ids must be non-empty")
-    return tokens
+    return tokens if isinstance(tokens[0], list) else [tokens]
+
+
+# Hardware fields that identify the machine and OS. The thermal state after a
+# run is context, not identity: the control and the candidate run back to
+# back and may end in different states.
+_HARDWARE_IDENTITY = ("chip", "unified_memory_bytes", "architecture", "macos_version", "macos_build")
+
+
+def _hardware_identity(report: Mapping[str, Any]) -> dict[str, Any]:
+    hardware = _object(report.get("hardware"), "hardware")
+    return {key: hardware.get(key) for key in _HARDWARE_IDENTITY}
 
 
 def _mean(report: Mapping[str, Any], metric: str) -> float:
@@ -71,9 +88,10 @@ def compare_mlx_baseline(
         raise BaselineComparisonError("baseline runner must be mlx-lm-baseline")
     if candidate.get("runner") == "mlx-lm-baseline":
         raise BaselineComparisonError("candidate must be a Lokahi runtime")
-    for field in ("hardware", "workload"):
-        if candidate.get(field) != baseline.get(field):
-            raise BaselineComparisonError(f"candidate {field} does not match baseline")
+    if _hardware_identity(candidate) != _hardware_identity(baseline):
+        raise BaselineComparisonError("candidate hardware does not match baseline")
+    if candidate.get("workload") != baseline.get("workload"):
+        raise BaselineComparisonError("candidate workload does not match baseline")
     if _identity(candidate) != _identity(baseline):
         raise BaselineComparisonError("candidate artifact identity does not match baseline")
 
@@ -124,6 +142,10 @@ def compare_mlx_baseline(
         "model": _identity(baseline),
         "correctness_passed": correctness_passed,
         "exact_greedy_token_parity": exact_tokens,
+        "thermal_state_after_run": {
+            "mlx_lm": _object(baseline.get("hardware"), "hardware").get("thermal_state_after_run"),
+            "lokahi": _object(candidate.get("hardware"), "hardware").get("thermal_state_after_run"),
+        },
         "within_five_percent_ttft": within_ttft,
         "within_five_percent_decode": within_decode,
         "has_ten_percent_win": ten_percent_win,
