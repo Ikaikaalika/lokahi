@@ -11,6 +11,18 @@
 
 namespace lokahi {
 
+void Profiler::add(const std::string& name, double seconds, double bytes) {
+  for (ProfileSection& section : sections_) {
+    if (section.name == name) {
+      section.seconds += seconds;
+      section.calls += 1;
+      section.bytes += bytes;
+      return;
+    }
+  }
+  sections_.push_back({name, seconds, 1, bytes});
+}
+
 int32_t argmax(const float* values, int count) {
   int32_t best = 0;
   for (int i = 1; i < count; ++i) {

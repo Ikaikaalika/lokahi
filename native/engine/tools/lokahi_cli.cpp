@@ -5,6 +5,8 @@
 //   lokahi generate   --model DIR (--tokens 2,5,9 | --prompt TEXT) --max-new N [--no-eos-stop]
 //   lokahi bench      --model DIR (--tokens ... | --tokens-file F) --max-new N
 //                     [--warmups W] [--repetitions R]
+//   lokahi profile    --model DIR (--tokens ... | --tokens-file F | --prompt TEXT)
+//                     [--max-new N] [--warmups W]
 //   lokahi tokenize   --model DIR (--text TEXT | --texts-file F.json) [--no-special]
 //   lokahi detokenize --model DIR (--tokens 1,2 | --ids-file F.json) [--keep-special]
 //   lokahi pretokenize --model DIR (--text TEXT | --texts-file F.json)
@@ -51,7 +53,8 @@ struct Args {
 
 Args parse_args(int argc, char** argv) {
   Args args;
-  LK_CHECK(argc >= 2, "usage: lokahi <info|logits|generate|bench|tokenize|detokenize|pretokenize|run> --model DIR ...");
+  LK_CHECK(argc >= 2,
+           "usage: lokahi <info|logits|generate|bench|profile|tokenize|detokenize|pretokenize|run> --model DIR ...");
   args.command = argv[1];
   for (int i = 2; i < argc; ++i) {
     std::string key = argv[i];
@@ -338,6 +341,64 @@ int cmd_bench(const Args& args) {
   return invariant ? 0 : 1;
 }
 
+std::string json_sections(const Profiler& profiler) {
+  std::ostringstream out;
+  out << "[";
+  bool first = true;
+  for (const ProfileSection& section : profiler.sections()) {
+    out << (first ? "" : ",") << "{\"name\":" << json_string(section.name) << ",\"seconds\":" << section.seconds
+        << ",\"calls\":" << section.calls << ",\"bytes\":" << section.bytes << "}";
+    first = false;
+  }
+  out << "]";
+  return out.str();
+}
+
+// Attribution for the improvement loop: the time and memory traffic of every
+// section of one prefill and of the decode steps after it. Sections run one
+// command buffer at a time on Metal, so wall times here are not fast-path
+// latencies; benchmark those with `bench`.
+int cmd_profile(const Args& args) {
+  auto model = load_model(args.get("model"), load_options(args));
+  const std::vector<int32_t> prompt = prompt_tokens(args);
+  const int steps = args.get_int("max-new", 32);
+  const int warmups = args.get_int("warmups", 1);
+  LK_CHECK(!prompt.empty() && steps >= 1 && warmups >= 0, "profile needs a prompt, --max-new >= 1, --warmups >= 0");
+  for (int run = 0; run < warmups; ++run) {
+    model->reset();
+    model->generate_greedy(prompt, steps + 1, false, nullptr);
+  }
+  model->reset();
+
+  Profiler prefill, decode;
+  model->set_profiler(&prefill);
+  double start = now_seconds();
+  int32_t token = argmax(model->prefill(prompt.data(), static_cast<int>(prompt.size())), model->vocab_size());
+  const double prefill_seconds = now_seconds() - start;
+  std::vector<int32_t> tokens = {token};
+  model->set_profiler(&decode);
+  start = now_seconds();
+  for (int i = 0; i < steps; ++i) {
+    token = argmax(model->decode(token), model->vocab_size());
+    tokens.push_back(token);
+  }
+  const double decode_seconds = now_seconds() - start;
+  model->set_profiler(nullptr);
+
+  std::ostringstream out;
+  out.precision(9);
+  out << "{\"backend\":\"" << model->backend() << "\",\"architecture\":\"" << model->architecture()
+      << "\",\"weight_bytes\":" << model->weight_bytes() << ",\"prompt_tokens\":" << prompt.size()
+      << ",\"decode_steps\":" << steps
+      << ",\"timing_boundary\":\"section seconds are GPU time per command buffer on Metal and host time on the "
+         "CPU; wall seconds include per-section synchronization\""
+      << ",\"prefill\":{\"wall_seconds\":" << prefill_seconds << ",\"sections\":" << json_sections(prefill) << "}"
+      << ",\"decode\":{\"wall_seconds\":" << decode_seconds << ",\"sections\":" << json_sections(decode) << "}"
+      << ",\"tokens\":" << json_tokens(tokens) << "}";
+  std::printf("%s\n", out.str().c_str());
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -352,6 +413,7 @@ int main(int argc, char** argv) {
     if (args.command == "logits") return cmd_logits(args);
     if (args.command == "generate") return cmd_generate(args);
     if (args.command == "bench") return cmd_bench(args);
+    if (args.command == "profile") return cmd_profile(args);
     fail("unknown command " + args.command);
   } catch (const std::exception& error) {
     std::fprintf(stderr, "%s\n", error.what());

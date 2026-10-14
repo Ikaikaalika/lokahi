@@ -33,6 +33,8 @@ enum { MTLCommandBufferStatusCompleted = 4 };
 - (void)waitUntilCompleted;
 - (MTLCommandBufferStatus)status;
 - (NSError*)error;
+- (double)GPUStartTime;  // CFTimeInterval
+- (double)GPUEndTime;
 @end
 @protocol MTLCommandQueue
 - (id<MTLCommandBuffer>)commandBuffer;

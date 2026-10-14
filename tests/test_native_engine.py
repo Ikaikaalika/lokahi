@@ -186,3 +186,31 @@ def test_unexpected_bias_fails_closed(native_cli, tmp_path):
     )
     assert result.returncode != 0
     assert "self_attn.q_proj: unexpected bias for llama" in result.stderr
+
+
+@pytest.mark.parametrize("backend", _backends())
+def test_profile_attributes_every_section_without_changing_tokens(native_cli, fixture_model, backend):
+    directory, oracle = fixture_model
+    prompt, steps = TOKENS[:9], 6
+    report = _run(native_cli, "profile", "--model", str(directory), "--backend", backend,
+                  "--tokens", ",".join(map(str, prompt)), "--max-new", str(steps))
+    # Profiling serializes work per section but must not change the result.
+    assert report["tokens"] == oracle.greedy(prompt, steps + 1)
+    layers = oracle.config.num_hidden_layers
+    per_layer = {"qkv", "rope_kv", "attention", "o_proj"}
+    for phase, passes in (("prefill", 1), ("decode", steps)):
+        sections = {section["name"]: section for section in report[phase]["sections"]}
+        assert per_layer <= sections.keys() and {"embed", "norm", "lm_head"} <= sections.keys()
+        for name in per_layer:
+            assert sections[name]["calls"] == passes * layers, (phase, name)
+        assert sections["lm_head"]["calls"] == passes
+        assert all(s["seconds"] >= 0 and s["bytes"] > 0 for s in sections.values())
+        total = sum(s["seconds"] for s in sections.values())
+        assert total <= report[phase]["wall_seconds"] * 1.05 + 1e-3
+    # Every decode step reads every layer weight and the vocabulary projection;
+    # with tied embeddings that is all of weight_bytes.
+    decode = {section["name"]: section for section in report["decode"]["sections"]}
+    linear = ("qkv", "o_proj", "mlp_up", "down_proj", "mlp")  # CPU splits the MLP; Metal fuses it
+    linear_bytes = sum(decode[name]["bytes"] for name in linear if name in decode) + decode["lm_head"]["bytes"]
+    tied = oracle.w["lm_head"] is oracle.w["model.embed_tokens"]
+    assert linear_bytes / steps >= report["weight_bytes"] * (1.0 if tied else 0.5)
