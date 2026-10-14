@@ -6,9 +6,10 @@ therefore comes from a Mac you control, registered as a self-hosted GitHub
 Actions runner. The `apple-silicon` workflow
 ([`.github/workflows/apple-silicon.yml`](../.github/workflows/apple-silicon.yml))
 then builds Lōkahi, checks the Metal engine against the NumPy oracle, runs
-the native probes, and optionally benchmarks a pinned model against a fresh
-MLX-LM control. Every run is serialized so GPU, ANE, and storage measurements
-never overlap.
+the native probes, and optionally runs the scoreboard: the pinned models
+against a fresh MLX-LM control and the recorded best, posted on the branch's
+pull request ([improvement loop](IMPROVEMENT_LOOP.md)). Every run is
+serialized so GPU, ANE, and storage measurements never overlap.
 
 ## 1. Lock down the repository first
 
@@ -22,7 +23,10 @@ workflow that targets `self-hosted`, so before registering the runner:
    read-only `GITHUB_TOKEN`.
 
 The `apple-silicon` workflow itself only runs on manual dispatch and on pushes
-to `claude/**` branches, which require write access.
+to `claude/**` branches, which require write access. The self-hosted job's
+token is read-only. The scoreboard comment is posted by a separate job on a
+GitHub-hosted runner. That job holds `pull-requests: write` and only reads
+the uploaded Markdown.
 
 ## 2. Prepare the Mac
 
@@ -69,12 +73,13 @@ Actions → Variables**):
 |---|---|---|
 | `LOKAHI_HW_RUNNER` | `enabled` | Turns the hardware job on; without it the job is skipped |
 | `LOKAHI_PYTHON` | optional interpreter path | Defaults to `/usr/bin/python3` |
-| `LOKAHI_MODEL_ROOT` | approved SSD directory | Benchmark suite only; Hugging Face cache layout |
+| `LOKAHI_MODEL_ROOT` | approved SSD directory | Scoreboard only; Hugging Face cache layout |
+| `LOKAHI_SCOREBOARD_ON_PUSH` | `enabled` | Optional: run the scoreboard on every push to `claude/**`, not only on manual benchmark runs |
 
 `LOKAHI_MODEL_ROOT` must be on an SSD you have approved for model storage. It
 must never be `/Volumes/Tyler HDD`; the workflow refuses that path.
 
-## 5. Stage models (benchmark suite only)
+## 5. Stage models (scoreboard only)
 
 The workflow never downloads. Stage pinned snapshots yourself, into the
 approved directory, using the Hugging Face cache layout:
@@ -85,16 +90,29 @@ huggingface-cli download mlx-community/gemma-3-1b-it-qat-4bit \
   --revision 15fed4eafb456c6fcb2a1165f19ac609670ed14b
 ```
 
-The pinned repositories and revisions are in
+The scoreboard matrix is `qwen3-0.6b`, `llama-3.2-1b` and `gemma-3-1b`; a
+model that is not staged is reported as "not staged" rather than failing the
+run. The pinned repositories and revisions are in
 [`benchmarks/targets/commoncompute_m1_model_ladder_v1.json`](../benchmarks/targets/commoncompute_m1_model_ladder_v1.json).
 
 ## 6. Run it
 
 **Actions → apple-silicon → Run workflow**, choose `correctness` or
-`benchmark`. Results (environment record, probe JSON, benchmark and comparison
-reports) are uploaded as the run's `apple-silicon-evidence-*` artifact. Keep
-the Mac idle and on power during benchmark runs; record anything unusual in
-the evidence notes.
+`benchmark` (optionally narrowing the model list). Results are uploaded as the
+run's `apple-silicon-evidence-*` artifact:
+
+- the environment record and probe JSON;
+- under `scoreboard/`, each model's benchmark, MLX-LM control and profile,
+  plus `scoreboard.json`, `scoreboard.md` and `promote/`.
+
+The scoreboard also appears in the job summary and as a comment on the
+branch's open pull request. A regression, nondeterministic tokens, or a model
+whose benchmark failed makes the run fail after the evidence is uploaded.
+Promote a new best by committing its record from `promote/`
+([how](../benchmarks/results/scoreboard/README.md)).
+
+Keep the Mac idle and on power during benchmark runs. Record anything unusual
+in the evidence notes.
 
 ## Evidence labels
 
@@ -103,7 +121,8 @@ the evidence notes.
 | `tests/test_native_engine.py` with `LOKAHI_TEST_BACKENDS=cpu,metal` | Correctness (generated fixtures vs NumPy oracle) |
 | `tests/test_mlx_crosscheck.py` | Correctness (oracle vs MLX and MLX-LM) |
 | Native Metal and ANE probes | Hardware qualification of single operators |
-| Benchmark suite | Hardware evidence for one pinned model, chip, OS build, and workload |
+| Scoreboard benchmarks and MLX-LM controls | Hardware evidence for each pinned model, chip, OS build, and workload |
+| Scoreboard attribution (`lokahi profile`) | Attribution only: per-section time with synchronization between sections |
 
 Common Compute fleet runs (other chips) use the same evidence format; see
 [`ROADMAP.md`](ROADMAP.md).
