@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "source": "Apple's published unified memory bandwidth for each chip configuration (product technical specifications)",
+  "recorded": "2026-10-14",
+  "use": "Diagnostic ceiling for attribution only. A section's bandwidth fraction ranks optimization work; it is not a performance claim.",
+  "chips": [
+    {"chip": "Apple M1", "gb_per_second": 68.25},
+    {"chip": "Apple M1 Pro", "gb_per_second": 200},
+    {"chip": "Apple M1 Max", "gb_per_second": 400},
+    {"chip": "Apple M1 Ultra", "gb_per_second": 800},
+    {"chip": "Apple M2", "gb_per_second": 100},
+    {"chip": "Apple M2 Pro", "gb_per_second": 200},
+    {"chip": "Apple M2 Max", "gb_per_second": 400},
+    {"chip": "Apple M2 Ultra", "gb_per_second": 800},
+    {"chip": "Apple M3", "gb_per_second": 100},
+    {"chip": "Apple M3 Pro", "gb_per_second": 150},
+    {"chip": "Apple M3 Max", "gpu_cores": 30, "gb_per_second": 300},
+    {"chip": "Apple M3 Max", "gpu_cores": 40, "gb_per_second": 400},
+    {"chip": "Apple M3 Ultra", "gb_per_second": 819},
+    {"chip": "Apple M4", "gb_per_second": 120},
+    {"chip": "Apple M4 Pro", "gb_per_second": 273},
+    {"chip": "Apple M4 Max", "gpu_cores": 32, "gb_per_second": 410},
+    {"chip": "Apple M4 Max", "gpu_cores": 40, "gb_per_second": 546},
+    {"chip": "Apple M5", "gb_per_second": 153}
+  ]
+}

@@ -93,4 +93,16 @@ struct DecoderWeights {
 
 std::unique_ptr<Model> make_decoder_cpu(std::shared_ptr<DecoderWeights> weights, const LoadOptions& options);
 
+// Minimum memory traffic, in bytes, of forward-pass sections over n tokens,
+// shared by every backend's profiler so attributions are comparable.
+// Activations are float32; weights count once per call.
+namespace traffic {
+double linear(const Linear& weights, int n);           // weights, inputs, outputs
+double embed(const Linear& embed, int n);              // n gathered rows, outputs
+double rows(int64_t width, int n, int arrays);         // `arrays` [n, width] tensors
+// q reads, output writes, and every visible key and value read once per kv
+// head for tokens at positions [start, start + n).
+double attention(const DecoderConfig& config, int layer, int start, int n);
+}  // namespace traffic
+
 }  // namespace lokahi

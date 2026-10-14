@@ -315,6 +315,34 @@ size_t DecoderWeights::matrix_bytes() const {
   return total;
 }
 
+namespace traffic {
+
+double linear(const Linear& weights, int n) {
+  return static_cast<double>(weights.weight_bytes()) + 4.0 * n * static_cast<double>(weights.cols + weights.rows);
+}
+
+double embed(const Linear& embed, int n) {
+  const double row = embed.quant.quantized()
+                         ? 4.0 * static_cast<double>(embed.words_per_row() + embed.groups_per_row())
+                         : static_cast<double>(embed.cols) * static_cast<double>(dtype_size(embed.dense_dtype));
+  return n * (row + 4.0 * static_cast<double>(embed.cols));
+}
+
+double rows(int64_t width, int n, int arrays) { return 4.0 * static_cast<double>(width) * n * arrays; }
+
+double attention(const DecoderConfig& c, int layer, int start, int n) {
+  const bool sliding = c.layer_is_sliding[static_cast<size_t>(layer)];
+  double keys = 0.0;
+  for (int t = 0; t < n; ++t) {
+    const int pos = start + t;
+    keys += sliding ? std::min(pos + 1, c.sliding_window) : pos + 1;
+  }
+  const double head_bytes = 4.0 * c.head_dim;
+  return head_bytes * (2.0 * n * c.num_heads + 2.0 * keys * c.num_kv_heads);
+}
+
+}  // namespace traffic
+
 // ---------------------------------------------------------------------------
 // CPU backend
 // ---------------------------------------------------------------------------
@@ -334,6 +362,24 @@ float gelu_tanh(float x) {
 }
 
 float silu(float x) { return x / (1.0f + std::exp(-x)); }
+
+// Times the enclosing block into `profiler` as `name` (no-op without one).
+class Section {
+ public:
+  Section(Profiler* profiler, const char* name, double bytes)
+      : profiler_(profiler), name_(name), bytes_(bytes), start_(profiler ? now_seconds() : 0.0) {}
+  ~Section() {
+    if (profiler_) profiler_->add(name_, now_seconds() - start_, bytes_);
+  }
+  Section(const Section&) = delete;
+  Section& operator=(const Section&) = delete;
+
+ private:
+  Profiler* profiler_;
+  const char* name_;
+  double bytes_;
+  double start_;
+};
 
 class DecoderCpu final : public Model {
  public:
@@ -457,110 +503,121 @@ class DecoderCpu final : public Model {
 
     for (int t = 0; t < n; ++t) {
       LK_CHECK(tokens[t] >= 0 && tokens[t] < c_.vocab_size, "token id out of range");
-      float* row = x_.data() + t * hidden;
-      dequantize_row(w_->embed, tokens[t], row);
-      if (c_.embed_scale != 1.0f) {
-        for (int64_t i = 0; i < hidden; ++i) row[i] *= c_.embed_scale;
+    }
+    {
+      Section section(profiler_, "embed", profiler_ ? traffic::embed(w_->embed, n) : 0.0);
+      for (int t = 0; t < n; ++t) {
+        float* row = x_.data() + t * hidden;
+        dequantize_row(w_->embed, tokens[t], row);
+        if (c_.embed_scale != 1.0f) {
+          for (int64_t i = 0; i < hidden; ++i) row[i] *= c_.embed_scale;
+        }
       }
     }
 
     const int start = position_;
     const int group = H / KV;
+    // Section traffic is computed only while profiling.
+    const bool profiling = profiler_ != nullptr;
+    const double norm_bytes = profiling ? traffic::rows(hidden, n, 2) + 4.0 * hidden : 0.0;
+    const double residual_bytes = profiling ? traffic::rows(hidden, n, 3) + (c_.sandwich_norms ? 4.0 * hidden : 0.0) : 0.0;
     for (int l = 0; l < c_.num_layers; ++l) {
       const DecoderLayer& L = w_->layers[static_cast<size_t>(l)];
       const bool sliding = c_.layer_is_sliding[static_cast<size_t>(l)];
-      for (int t = 0; t < n; ++t) norm(x_.data() + t * hidden, L.attn_norm, hidden, h_.data() + t * hidden);
-      matmul(L.q_proj, h_.data(), n, q_.data(), pool_);
-      matmul(L.k_proj, h_.data(), n, k_.data(), pool_);
-      matmul(L.v_proj, h_.data(), n, v_.data(), pool_);
-      if (c_.qkv_bias) {
+      {
+        Section section(profiler_, "norm", norm_bytes);
+        for (int t = 0; t < n; ++t) norm(x_.data() + t * hidden, L.attn_norm, hidden, h_.data() + t * hidden);
+      }
+      {
+        Section section(profiler_, "qkv",
+                        profiling ? traffic::linear(L.q_proj, n) + traffic::linear(L.k_proj, n) +
+                                        traffic::linear(L.v_proj, n)
+                                  : 0.0);
+        matmul(L.q_proj, h_.data(), n, q_.data(), pool_);
+        matmul(L.k_proj, h_.data(), n, k_.data(), pool_);
+        matmul(L.v_proj, h_.data(), n, v_.data(), pool_);
+      }
+      {
+        Section section(profiler_, "rope_kv", profiling ? traffic::rows(D, n, 2 * H + 4 * KV) : 0.0);
+        if (c_.qkv_bias) {
+          for (int t = 0; t < n; ++t) {
+            add_bias(q_.data() + static_cast<size_t>(t) * H * D, L.q_bias);
+            add_bias(k_.data() + static_cast<size_t>(t) * KV * D, L.k_bias);
+            add_bias(v_.data() + static_cast<size_t>(t) * KV * D, L.v_bias);
+          }
+        }
+        const auto& inv_freq = sliding ? inv_freq_local_ : inv_freq_global_;
         for (int t = 0; t < n; ++t) {
-          add_bias(q_.data() + static_cast<size_t>(t) * H * D, L.q_bias);
-          add_bias(k_.data() + static_cast<size_t>(t) * KV * D, L.k_bias);
-          add_bias(v_.data() + static_cast<size_t>(t) * KV * D, L.v_bias);
-        }
-      }
-      const auto& inv_freq = sliding ? inv_freq_local_ : inv_freq_global_;
-      for (int t = 0; t < n; ++t) {
-        for (int hh = 0; hh < H; ++hh) {
-          float* qv = q_.data() + (static_cast<size_t>(t) * H + hh) * D;
-          if (c_.qk_norm) norm(qv, L.q_norm, D, qv);
-          apply_rope(qv, start + t, inv_freq);
-        }
-        for (int kv = 0; kv < KV; ++kv) {
-          float* kvec = k_.data() + (static_cast<size_t>(t) * KV + kv) * D;
-          if (c_.qk_norm) norm(kvec, L.k_norm, D, kvec);
-          apply_rope(kvec, start + t, inv_freq);
-        }
-      }
-      // Global layers attend through the cache, so write the chunk first.
-      // Sliding layers read the chunk directly and update the ring after.
-      if (!sliding) {
-        for (int t = 0; t < n; ++t) {
-          store_kv(l, start + t, k_.data() + static_cast<size_t>(t) * KV * D,
-                   v_.data() + static_cast<size_t>(t) * KV * D);
-        }
-      }
-      pool_.parallel_for(static_cast<size_t>(n) * H, [&](size_t begin, size_t end) {
-        std::vector<float> scores;
-        for (size_t item = begin; item < end; ++item) {
-          const int t = static_cast<int>(item / H);
-          const int hh = static_cast<int>(item % H);
-          const int kv = hh / group;
-          const int pos = start + t;
-          const int lo = sliding ? std::max(0, pos - c_.sliding_window + 1) : 0;
-          const float* qv = q_.data() + (static_cast<size_t>(t) * H + hh) * D;
-          scores.resize(static_cast<size_t>(pos - lo + 1));
-          float max_score = -std::numeric_limits<float>::infinity();
-          for (int j = lo; j <= pos; ++j) {
-            const float* kvec = key_ptr(l, kv, j, start, k_.data());
-            float dot = 0.0f;
-            for (int d = 0; d < D; ++d) dot += qv[d] * kvec[d];
-            dot *= c_.attn_scale;
-            if (c_.attn_logit_softcapping > 0.0f) {
-              dot = std::tanh(dot / c_.attn_logit_softcapping) * c_.attn_logit_softcapping;
-            }
-            scores[static_cast<size_t>(j - lo)] = dot;
-            max_score = std::max(max_score, dot);
+          for (int hh = 0; hh < H; ++hh) {
+            float* qv = q_.data() + (static_cast<size_t>(t) * H + hh) * D;
+            if (c_.qk_norm) norm(qv, L.q_norm, D, qv);
+            apply_rope(qv, start + t, inv_freq);
           }
-          float denom = 0.0f;
-          for (float& s : scores) {
-            s = std::exp(s - max_score);
-            denom += s;
-          }
-          float* out = attn_.data() + (static_cast<size_t>(t) * H + hh) * D;
-          std::fill(out, out + D, 0.0f);
-          for (int j = lo; j <= pos; ++j) {
-            const float p = scores[static_cast<size_t>(j - lo)] / denom;
-            const float* vvec = value_ptr(l, kv, j, start, v_.data());
-            for (int d = 0; d < D; ++d) out[d] += p * vvec[d];
+          for (int kv = 0; kv < KV; ++kv) {
+            float* kvec = k_.data() + (static_cast<size_t>(t) * KV + kv) * D;
+            if (c_.qk_norm) norm(kvec, L.k_norm, D, kvec);
+            apply_rope(kvec, start + t, inv_freq);
           }
         }
-      });
-      if (sliding) {
-        const int first = std::max(0, n - c_.kv_capacity(l, max_context_));
-        for (int t = first; t < n; ++t) {
-          store_kv(l, start + t, k_.data() + static_cast<size_t>(t) * KV * D,
-                   v_.data() + static_cast<size_t>(t) * KV * D);
+        // Global layers attend through the cache, so write the chunk first.
+        // Sliding layers read the chunk directly and update the ring after.
+        if (!sliding) {
+          for (int t = 0; t < n; ++t) {
+            store_kv(l, start + t, k_.data() + static_cast<size_t>(t) * KV * D,
+                     v_.data() + static_cast<size_t>(t) * KV * D);
+          }
         }
       }
-      matmul(L.o_proj, attn_.data(), n, r_.data(), pool_);
-      add_residual(n, L.attn_post_norm);
-      for (int t = 0; t < n; ++t) norm(x_.data() + t * hidden, L.mlp_norm, hidden, h_.data() + t * hidden);
-      matmul(L.gate_proj, h_.data(), n, gate_.data(), pool_);
-      matmul(L.up_proj, h_.data(), n, up_.data(), pool_);
-      if (c_.activation == Activation::GeluTanh) {
-        for (size_t i = 0; i < sn * inter; ++i) gate_[i] = gelu_tanh(gate_[i]) * up_[i];
-      } else {
-        for (size_t i = 0; i < sn * inter; ++i) gate_[i] = silu(gate_[i]) * up_[i];
+      {
+        Section section(profiler_, "attention", profiling ? traffic::attention(c_, l, start, n) : 0.0);
+        attend(l, start, n, sliding, group);
+        if (sliding) {
+          const int first = std::max(0, n - c_.kv_capacity(l, max_context_));
+          for (int t = first; t < n; ++t) {
+            store_kv(l, start + t, k_.data() + static_cast<size_t>(t) * KV * D,
+                     v_.data() + static_cast<size_t>(t) * KV * D);
+          }
+        }
       }
-      matmul(L.down_proj, gate_.data(), n, r_.data(), pool_);
-      add_residual(n, L.mlp_post_norm);
+      {
+        Section section(profiler_, "o_proj", profiling ? traffic::linear(L.o_proj, n) : 0.0);
+        matmul(L.o_proj, attn_.data(), n, r_.data(), pool_);
+      }
+      {
+        Section section(profiler_, "residual", residual_bytes);
+        add_residual(n, L.attn_post_norm);
+      }
+      {
+        Section section(profiler_, "norm", norm_bytes);
+        for (int t = 0; t < n; ++t) norm(x_.data() + t * hidden, L.mlp_norm, hidden, h_.data() + t * hidden);
+      }
+      {
+        Section section(profiler_, "mlp_up",
+                        profiling ? traffic::linear(L.gate_proj, n) + traffic::linear(L.up_proj, n) +
+                                        traffic::rows(inter, n, 1)
+                                  : 0.0);
+        matmul(L.gate_proj, h_.data(), n, gate_.data(), pool_);
+        matmul(L.up_proj, h_.data(), n, up_.data(), pool_);
+        if (c_.activation == Activation::GeluTanh) {
+          for (size_t i = 0; i < sn * inter; ++i) gate_[i] = gelu_tanh(gate_[i]) * up_[i];
+        } else {
+          for (size_t i = 0; i < sn * inter; ++i) gate_[i] = silu(gate_[i]) * up_[i];
+        }
+      }
+      {
+        Section section(profiler_, "down_proj", profiling ? traffic::linear(L.down_proj, n) : 0.0);
+        matmul(L.down_proj, gate_.data(), n, r_.data(), pool_);
+      }
+      {
+        Section section(profiler_, "residual", residual_bytes);
+        add_residual(n, L.mlp_post_norm);
+      }
     }
     position_ += n;
     if (!want_logits) return;
     // Only the last row's logits are needed: skip the vocabulary projection
     // for every other prompt token.
+    Section section(profiler_, "lm_head", profiling ? traffic::linear(w_->lm_head, 1) + 4.0 * hidden : 0.0);
     std::vector<float> last(static_cast<size_t>(hidden));
     norm(x_.data() + static_cast<size_t>(n - 1) * hidden, w_->final_norm, hidden, last.data());
     matvec(w_->lm_head, last.data(), logits_.data(), pool_);
@@ -568,6 +625,48 @@ class DecoderCpu final : public Model {
       const float cap = c_.final_logit_softcapping;
       for (float& v : logits_) v = std::tanh(v / cap) * cap;
     }
+  }
+
+  // Attention for the n tokens of this pass (queries in q_, keys and values
+  // through key_ptr/value_ptr) into attn_.
+  void attend(int l, int start, int n, bool sliding, int group) {
+    const int H = c_.num_heads, D = c_.head_dim;
+    pool_.parallel_for(static_cast<size_t>(n) * H, [&](size_t begin, size_t end) {
+      std::vector<float> scores;
+      for (size_t item = begin; item < end; ++item) {
+        const int t = static_cast<int>(item / H);
+        const int hh = static_cast<int>(item % H);
+        const int kv = hh / group;
+        const int pos = start + t;
+        const int lo = sliding ? std::max(0, pos - c_.sliding_window + 1) : 0;
+        const float* qv = q_.data() + (static_cast<size_t>(t) * H + hh) * D;
+        scores.resize(static_cast<size_t>(pos - lo + 1));
+        float max_score = -std::numeric_limits<float>::infinity();
+        for (int j = lo; j <= pos; ++j) {
+          const float* kvec = key_ptr(l, kv, j, start, k_.data());
+          float dot = 0.0f;
+          for (int d = 0; d < D; ++d) dot += qv[d] * kvec[d];
+          dot *= c_.attn_scale;
+          if (c_.attn_logit_softcapping > 0.0f) {
+            dot = std::tanh(dot / c_.attn_logit_softcapping) * c_.attn_logit_softcapping;
+          }
+          scores[static_cast<size_t>(j - lo)] = dot;
+          max_score = std::max(max_score, dot);
+        }
+        float denom = 0.0f;
+        for (float& s : scores) {
+          s = std::exp(s - max_score);
+          denom += s;
+        }
+        float* out = attn_.data() + (static_cast<size_t>(t) * H + hh) * D;
+        std::fill(out, out + D, 0.0f);
+        for (int j = lo; j <= pos; ++j) {
+          const float p = scores[static_cast<size_t>(j - lo)] / denom;
+          const float* vvec = value_ptr(l, kv, j, start, v_.data());
+          for (int d = 0; d < D; ++d) out[d] += p * vvec[d];
+        }
+      }
+    });
   }
 
   std::shared_ptr<DecoderWeights> w_;

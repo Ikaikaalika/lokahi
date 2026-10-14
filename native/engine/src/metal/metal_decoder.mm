@@ -601,10 +601,27 @@ class DecoderMetal final : public Model {
     encode_qmm(enc, G.down, gate_, n, r_);
   }
 
+  // While profiling, ends the work encoded since the previous section in its
+  // own command buffer, waits for it, and books its GPU time as `name`; the
+  // caller continues with a fresh encoder. A no-op otherwise.
+  void section(__strong id<MTLComputeCommandEncoder>& enc, const char* name, double traffic_bytes) {
+    if (profiler_ == nullptr) return;
+    [enc endEncoding];
+    [active_cb_ commit];
+    [active_cb_ waitUntilCompleted];
+    LK_CHECK([active_cb_ status] == MTLCommandBufferStatusCompleted,
+             "metal: command buffer failed: " + ns_error([active_cb_ error]));
+    profiler_->add(name, [active_cb_ GPUEndTime] - [active_cb_ GPUStartTime], traffic_bytes);
+    active_cb_ = [queue_ commandBuffer];
+    enc = [active_cb_ computeCommandEncoder];
+  }
+
   // Encodes n tokens at positions [start, start + n) whose ids are at
   // tokens + tokens_offset. When `last`, also the final projection and argmax.
-  void encode_forward(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> tokens, size_t tokens_offset, int n,
+  void encode_forward(__strong id<MTLComputeCommandEncoder>& enc, id<MTLBuffer> tokens, size_t tokens_offset, int n,
                       int start, bool last, int history_index) {
+    const bool profiling = profiler_ != nullptr;
+    const int64_t hidden = c_.hidden_size;
     [enc setComputePipelineState:quant_pipeline("embed_rows", embed_)];
     bind_weights(enc, embed_, 0);
     bind(enc, tokens, tokens_offset, 3);
@@ -612,18 +629,38 @@ class DecoderMetal final : public Model {
     bytes(enc, EmbedParams{c_.hidden_size, n, c_.embed_scale}, 5);
     [enc dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(c_.hidden_size), static_cast<NSUInteger>(n), 1)
         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    section(enc, "embed", profiling ? traffic::embed(w_->embed, n) : 0.0);
     encode_rms_norm(enc, x_, layers_[0].attn_norm, h_, n);
+    section(enc, "norm", profiling ? traffic::rows(hidden, n, 2) + 4.0 * hidden : 0.0);
 
+    // The residual kernel adds the sublayer output (normalized first with
+    // sandwich norms) and applies the next norm in one pass.
+    const double residual_bytes = profiling ? traffic::rows(hidden, n, 4) + 8.0 * hidden : 0.0;
     for (size_t l = 0; l < layers_.size(); ++l) {
       const GpuLayer& G = layers_[l];
+      const DecoderLayer& L = w_->layers[l];
+      const int layer = static_cast<int>(l);
       encode_qkv(enc, G, n);
+      section(enc, "qkv",
+              profiling ? traffic::linear(L.q_proj, n) + traffic::linear(L.k_proj, n) + traffic::linear(L.v_proj, n)
+                        : 0.0);
       encode_rope(enc, G, n, start);
+      section(enc, "rope_kv",
+              profiling ? traffic::rows(c_.head_dim, n, 2 * c_.num_heads + 4 * c_.num_kv_heads) : 0.0);
       encode_attention(enc, G, n, start);
+      section(enc, "attention", profiling ? traffic::attention(c_, layer, start, n) : 0.0);
       encode_qmm(enc, G.o, attn_, n, r_);
+      section(enc, "o_proj", profiling ? traffic::linear(L.o_proj, n) : 0.0);
       encode_residual_norm(enc, G.attn_post_norm, &G.mlp_norm, n);
+      section(enc, "residual_norm", residual_bytes);
       encode_mlp(enc, G, n);
+      section(enc, "mlp",
+              profiling ? traffic::linear(L.gate_proj, n) + traffic::linear(L.up_proj, n) +
+                              traffic::linear(L.down_proj, n) + traffic::rows(c_.intermediate_size, n, 1)
+                        : 0.0);
       const BufRef* next = l + 1 < layers_.size() ? &layers_[l + 1].attn_norm : &final_norm_;
       encode_residual_norm(enc, G.mlp_post_norm, next, n);
+      section(enc, "residual_norm", residual_bytes);
     }
     if (!last) return;
     const size_t last_row = static_cast<size_t>(n - 1) * c_.hidden_size * sizeof(float);
@@ -635,6 +672,7 @@ class DecoderMetal final : public Model {
       bytes(enc, ElementwiseParams{c_.vocab_size}, 2);
       encode_elementwise(enc, c_.vocab_size);
     }
+    section(enc, "lm_head", profiling ? traffic::linear(w_->lm_head, 1) : 0.0);
     id<MTLComputePipelineState> argmax = pipeline("argmax_vocab");
     [enc setComputePipelineState:argmax];
     bind(enc, logits_, 0, 0);
@@ -643,6 +681,7 @@ class DecoderMetal final : public Model {
     bytes(enc, ArgmaxParams{c_.vocab_size, history_index}, 3);
     [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(1024, [argmax maxTotalThreadsPerThreadgroup] / 32 * 32), 1, 1)];
+    section(enc, "sample", profiling ? 4.0 * c_.vocab_size : 0.0);
   }
 
   void run_prefill(const int32_t* tokens, int n) {
@@ -650,26 +689,27 @@ class DecoderMetal final : public Model {
     LK_CHECK(position_ + n <= max_context_, "context length exceeded");
     for (int i = 0; i < n; ++i) LK_CHECK(tokens[i] >= 0 && tokens[i] < c_.vocab_size, "token id out of range");
     std::memcpy([prompt_ contents], tokens, sizeof(int32_t) * static_cast<size_t>(n));
-    id<MTLCommandBuffer> cb = [queue_ commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    active_cb_ = [queue_ commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [active_cb_ computeCommandEncoder];
     for (int begin = 0; begin < n; begin += chunk_) {
       const int count = std::min(chunk_, n - begin);
       encode_forward(enc, prompt_, sizeof(int32_t) * static_cast<size_t>(begin), count, position_ + begin,
                      begin + count == n, 0);
     }
     [enc endEncoding];
+    id<MTLCommandBuffer> cb = active_cb_;
     [cb commit];
     wait(cb);
     position_ += n;
   }
 
   id<MTLCommandBuffer> encode_decode_step(int pos, int history_index) {
-    id<MTLCommandBuffer> cb = [queue_ commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    active_cb_ = [queue_ commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [active_cb_ computeCommandEncoder];
     encode_forward(enc, token_, 0, 1, pos, true, history_index);
     [enc endEncoding];
-    pending_.push_back(cb);
-    return cb;
+    pending_.push_back(active_cb_);
+    return active_cb_;
   }
 
   void wait(id<MTLCommandBuffer> cb) {
@@ -706,6 +746,9 @@ class DecoderMetal final : public Model {
   id<MTLBuffer> part_o_ = nil, part_ml_ = nil;
   id<MTLBuffer> logits_ = nil, token_ = nil, history_ = nil, prompt_ = nil;
   std::vector<id<MTLCommandBuffer>> pending_;
+  // The command buffer encode_forward is appending to (sections replace it
+  // while profiling).
+  id<MTLCommandBuffer> active_cb_ = nil;
 };
 
 }  // namespace

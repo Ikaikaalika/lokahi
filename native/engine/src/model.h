@@ -22,6 +22,28 @@ struct GenerationTiming {
   std::vector<double> token_times;   // host time each generated token became available
 };
 
+// Time and memory traffic per section of the forward pass (embedding, norms,
+// projections, attention, ...), for attributing where a step's time goes.
+// Bytes are the minimum traffic the section must move: weights it reads plus
+// activations and KV it reads and writes.
+struct ProfileSection {
+  std::string name;
+  double seconds = 0.0;
+  int64_t calls = 0;
+  double bytes = 0.0;
+};
+
+class Profiler {
+ public:
+  void add(const std::string& name, double seconds, double bytes);
+  // Sections in the order they were first seen.
+  const std::vector<ProfileSection>& sections() const { return sections_; }
+  void clear() { sections_.clear(); }
+
+ private:
+  std::vector<ProfileSection> sections_;
+};
+
 class Model {
  public:
   virtual ~Model() = default;
@@ -35,6 +57,11 @@ class Model {
   virtual const std::vector<int32_t>& eos_token_ids() const = 0;
 
   virtual void reset() = 0;
+
+  // While set, the backend times every section of each forward pass into
+  // `profiler` (nullptr turns it off). Profiling serializes GPU work per
+  // section, so it measures attribution, not the fast path's wall time.
+  void set_profiler(Profiler* profiler) { profiler_ = profiler; }
 
   // Append `n` tokens at the current position. Returns the logits of the last
   // token; the pointer stays valid until the next call.
@@ -50,6 +77,9 @@ class Model {
   virtual std::vector<int32_t> generate_greedy(const std::vector<int32_t>& prompt, int max_new,
                                                bool stop_at_eos, GenerationTiming* timing,
                                                const TokenCallback& on_token = {});
+
+ protected:
+  Profiler* profiler_ = nullptr;
 };
 
 int32_t argmax(const float* values, int count);

@@ -177,6 +177,8 @@ state machine, hardware profile, and explicit limitations.
 | `src/lokahi/runtime/resident_mlx.py` | Evidence-gated resident MLX single-sequence versus continuous-batch routing |
 | `docs/STANDALONE_RUNTIME.md` | Standalone library, CLI, daemon, adapter, and native SoC architecture |
 | `docs/PERFORMANCE_CONTRACT.md` | Benchmark dimensions, evidence ladder, suites, and promotion gates |
+| `docs/IMPROVEMENT_LOOP.md` | How each change is measured, attributed, verified, and promoted, from kernel to fleet |
+| `benchmarks/scoreboard.py` | Pinned-model scoreboard vs MLX-LM and the recorded best; posted on pull requests |
 | `docs/MAXIMUM_SPEED_RUNTIME.md` | Strict full-resident fast profile and intelligent ANE participation |
 | `docs/DARKBLOOM_TARGET.md` | Exact Darkbloom comparison matrix and performance architecture |
 | `docs/DYNAMIC_SSD_RESIDENCY.md` | Auto/full/paged weight policy, native Metal I/O path, and safe resizing |

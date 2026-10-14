@@ -14,6 +14,7 @@ cmake --build build/engine -j
 ./build/engine/lokahi tokenize --model DIR --text "Aloha kākou"
 ./build/engine/lokahi pretokenize --model DIR --text "Aloha kākou"          # words BPE runs on
 ./build/engine/lokahi bench --model DIR --tokens-file prompt.txt --max-new 128
+./build/engine/lokahi profile --model DIR --tokens-file prompt.txt --max-new 32   # JSON: time per section
 ```
 
 ## Status
@@ -99,6 +100,27 @@ category, combining-class and composition tables from the pinned reference
 release, so new code points classify and normalize exactly as it does.
 Streaming holds back tokens that end inside a UTF-8 sequence or a
 byte-fallback run, so emitted text is never rewritten.
+
+## Profiling
+
+`lokahi profile` reports where a forward pass spends its time. It runs warmup
+generations, then one prefill and `--max-new` decode steps. Each section is
+reported with its total time, its call count and the minimum memory traffic
+its math requires. Sections follow each backend's own fused work, so the
+names differ:
+
+- **Metal:** embed, norm, qkv, rope_kv, attention, o_proj, residual_norm, mlp,
+  lm_head and sample. Each section is its own command buffer, and its time is
+  that buffer's GPU time.
+- **CPU:** embed, norm, qkv, rope_kv, attention, o_proj, residual, mlp_up,
+  down_proj and lm_head. Times are host time.
+
+The per-section synchronization makes profiled runs slower than `bench`. Use
+the shares to choose work, and `bench` to measure it.
+[`benchmarks/attribution.py`](../../benchmarks/attribution.py) ranks the
+sections by time above their bandwidth floor
+([improvement loop](../../docs/IMPROVEMENT_LOOP.md)). Tokens are unchanged by
+profiling (`tests/test_native_engine.py`).
 
 ## Checks on machines without Apple SDKs
 

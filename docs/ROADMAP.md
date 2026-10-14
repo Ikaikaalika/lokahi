@@ -5,7 +5,8 @@ GPU, Neural Engine, and unified memory together wherever measurements show
 the combined plan wins. This page is the build order. Claims follow
 [`PERFORMANCE_CONTRACT.md`](PERFORMANCE_CONTRACT.md): nothing here is
 promoted until correctness and hardware evidence exist for the exact model,
-chip, OS build, and workload.
+chip, OS build, and workload. Work is chosen and accepted by the
+[improvement loop](IMPROVEMENT_LOOP.md).
 
 ## Where things stand (2026-10-12)
 
@@ -16,6 +17,7 @@ chip, OS build, and workload.
 | Metal backend (same families) | Written; compiles on hosted macOS CI | Awaiting first self-hosted run |
 | Oracles vs MLX-LM cross-check | Written | Runs on the self-hosted Mac |
 | Self-hosted Apple Silicon CI | Written | Needs the runner registered ([setup](APPLE_SILICON_RUNNER.md)) |
+| [Improvement loop](IMPROVEMENT_LOOP.md): `lokahi profile`, attribution, scoreboard, PR comment | Written | Correctness of the tooling: the profiler leaves tokens unchanged; scoring is tested on synthetic reports. First scoreboard waits on the runner |
 | Common Compute fleet benchmarks | Spec below | Needs access to the provider app repository |
 | MLX-LM M1 baselines | Recorded (Qwen3 0.6B, Llama 3.2 1B, Gemma 3 1B) | Hardware, Aug 2026 |
 
