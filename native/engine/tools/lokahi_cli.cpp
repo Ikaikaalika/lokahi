@@ -3,6 +3,8 @@
 //   lokahi info       --model DIR [--backend B]
 //   lokahi logits     --model DIR --tokens 2,5,9 [--prefill N] --out FILE
 //   lokahi generate   --model DIR (--tokens 2,5,9 | --prompt TEXT) --max-new N [--no-eos-stop]
+//   lokahi sample     --logits-file F.f32 --vocab V [--temperature T] [--top-p P] [--top-k K]
+//                     [--min-p M] [--seed S] [--steps N] [--first-step S]
 //   lokahi bench      --model DIR (--tokens ... | --tokens-file F) --max-new N
 //                     [--warmups W] [--repetitions R]
 //   lokahi profile    --model DIR (--tokens ... | --tokens-file F | --prompt TEXT)
@@ -32,6 +34,7 @@
 #include "model.h"
 #include "json.h"
 #include "safetensors.h"
+#include "sampling.h"
 #include "tokenizer.h"
 
 using namespace lokahi;
@@ -99,6 +102,17 @@ LoadOptions load_options(const Args& args) {
   options.prefill_chunk = args.get_int("prefill-chunk", 512);
   options.cpu_threads = static_cast<unsigned>(args.get_int("threads", 0));
   return options;
+}
+
+SamplingParams sampling_options(const Args& args) {
+  SamplingParams params;
+  params.temperature = std::stof(args.get("temperature", "0"));
+  params.top_p = std::stof(args.get("top-p", "1"));
+  params.top_k = args.get_int("top-k", 0);
+  params.min_p = std::stof(args.get("min-p", "0"));
+  params.seed = std::stoull(args.get("seed", "0"));
+  validate_sampling(params);
+  return params;
 }
 
 std::string json_string(const std::string& text) {
@@ -196,6 +210,40 @@ int cmd_generate(const Args& args) {
   std::printf("{\"backend\":\"%s\",\"tokens\":%s%s,\"prefill_seconds\":%.9f,\"decode_seconds\":%.9f}\n",
               model->backend(), json_tokens(generated).c_str(), text.c_str(), timing.prefill_seconds,
               timing.decode_seconds);
+  return 0;
+}
+
+// The host sampler over rows of float32 logits: tokens[row][step] for steps
+// [first-step, first-step + steps).
+int cmd_sample(const Args& args) {
+  const int vocab = args.get_int("vocab", 0);
+  LK_CHECK(vocab > 0, "sample needs --vocab");
+  std::ifstream in(args.get("logits-file"), std::ios::binary | std::ios::ate);
+  LK_CHECK(in.good(), "cannot read --logits-file");
+  const auto bytes = static_cast<size_t>(in.tellg());
+  LK_CHECK(bytes > 0 && bytes % (sizeof(float) * static_cast<size_t>(vocab)) == 0,
+           "--logits-file size is not a whole number of rows");
+  std::vector<float> logits(bytes / sizeof(float));
+  in.seekg(0);
+  in.read(reinterpret_cast<char*>(logits.data()), static_cast<std::streamsize>(bytes));
+  const SamplingParams params = sampling_options(args);
+  const int steps = args.get_int("steps", 1);
+  const int first = args.get_int("first-step", 0);
+  const std::string backend = args.get("backend", "cpu");
+  LK_CHECK(backend == "cpu", "sample: backend '" + backend + "' is not available");
+  std::vector<int32_t> drawn;
+  for (size_t row = 0; row * static_cast<size_t>(vocab) < logits.size(); ++row) {
+    for (int step = first; step < first + steps; ++step) {
+      drawn.push_back(sample_token(logits.data() + row * static_cast<size_t>(vocab), vocab, params, step));
+    }
+  }
+  std::string rows;
+  for (size_t begin = 0; begin < drawn.size(); begin += static_cast<size_t>(steps)) {
+    std::vector<int32_t> tokens(drawn.begin() + static_cast<std::ptrdiff_t>(begin),
+                                drawn.begin() + static_cast<std::ptrdiff_t>(begin) + steps);
+    rows += (begin ? "," : "") + json_tokens(tokens);
+  }
+  std::printf("{\"tokens\":[%s]}\n", rows.c_str());
   return 0;
 }
 
@@ -404,7 +452,7 @@ int cmd_profile(const Args& args) {
 int main(int argc, char** argv) {
   try {
     Args args = parse_args(argc, argv);
-    LK_CHECK(args.has("model"), "--model is required");
+    LK_CHECK(args.has("model") || args.command == "sample", "--model is required");
     if (args.command == "tokenize") return cmd_tokenize(args);
     if (args.command == "detokenize") return cmd_detokenize(args);
     if (args.command == "pretokenize") return cmd_pretokenize(args);
@@ -412,6 +460,7 @@ int main(int argc, char** argv) {
     if (args.command == "info") return cmd_info(args);
     if (args.command == "logits") return cmd_logits(args);
     if (args.command == "generate") return cmd_generate(args);
+    if (args.command == "sample") return cmd_sample(args);
     if (args.command == "bench") return cmd_bench(args);
     if (args.command == "profile") return cmd_profile(args);
     fail("unknown command " + args.command);

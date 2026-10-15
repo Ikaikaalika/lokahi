@@ -7,5 +7,6 @@ the serving path.
 
 from .gemma3 import Gemma3Config, Gemma3Reference
 from .llama import LlamaFamilyConfig, LlamaFamilyReference
+from .sampling import SamplingParams
 
-__all__ = ["Gemma3Config", "Gemma3Reference", "LlamaFamilyConfig", "LlamaFamilyReference"]
+__all__ = ["Gemma3Config", "Gemma3Reference", "LlamaFamilyConfig", "LlamaFamilyReference", "SamplingParams"]

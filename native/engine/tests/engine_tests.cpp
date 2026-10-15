@@ -16,6 +16,7 @@
 #include "quant.h"
 #include "regex.h"
 #include "safetensors.h"
+#include "sampling.h"
 #include "thread_pool.h"
 #include "tokenizer.h"
 #include "unicode.h"
@@ -371,6 +372,49 @@ void test_byte_level_stable_prefix() {
 
 }  // namespace
 
+void test_sampling() {
+  // Known-answer vectors for Philox4x32-10 from Random123 (kat_vectors).
+  EXPECT((philox4x32_10({0, 0, 0, 0}, {0, 0}) == PhiloxBlock{0x6627e8d5, 0xe169c58d, 0xbc57ac4c, 0x9b00dbd8}));
+  EXPECT((philox4x32_10({0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff}, {0xffffffff, 0xffffffff}) ==
+          PhiloxBlock{0x408f276d, 0x41c83b0e, 0xa20bc7c6, 0x6d5451fd}));
+  EXPECT((philox4x32_10({0x243f6a88, 0x85a308d3, 0x13198a2e, 0x03707344}, {0xa4093822, 0x299f31d0}) ==
+          PhiloxBlock{0xd16cfe09, 0x94fdcceb, 0x5001e420, 0x24126ea1}));
+
+  // The key orders floats, including signs, zeros and infinities.
+  const float ordered[] = {-INFINITY, -1e30f, -2.5f, -1e-30f, -0.0f, 0.0f, 1e-30f, 2.5f, 1e30f, INFINITY};
+  for (size_t i = 1; i < sizeof(ordered) / sizeof(ordered[0]); ++i) {
+    EXPECT(order_key(ordered[i - 1]) < order_key(ordered[i]));
+  }
+
+  const std::vector<float> logits = {0.5f, 3.0f, 2.9f, -1.0f, 3.0f, 0.0f, 1.0f};
+  SamplingParams greedy;
+  EXPECT(sample_token(logits.data(), 7, greedy, 0) == 1);  // lowest index on ties
+  SamplingParams top1{1.0f, 1.0f, 1, 0.0f, 9};
+  EXPECT(sample_token(logits.data(), 7, top1, 3) == 1);
+  // Filters bound the support: min_p = 1 keeps only the tied maxima.
+  SamplingParams max_only{1.5f, 1.0f, 0, 1.0f, 5};
+  SamplingParams top3{2.0f, 1.0f, 3, 0.0f, 5};
+  SamplingParams nucleus{1.0f, 0.5f, 0, 0.0f, 5};
+  for (int step = 0; step < 200; ++step) {
+    const int32_t a = sample_token(logits.data(), 7, max_only, step);
+    EXPECT(a == 1 || a == 4);
+    const int32_t b = sample_token(logits.data(), 7, top3, step);
+    EXPECT(b == 1 || b == 2 || b == 4);
+    // The two tied maxima hold about 0.36 each, so the strictly greater mass
+    // before token 2 is about 0.72 >= 0.5 and the nucleus is {1, 4}.
+    const int32_t c = sample_token(logits.data(), 7, nucleus, step);
+    EXPECT(c == 1 || c == 4);
+  }
+  // Deterministic for a seed and step, and the noise matches its definition.
+  SamplingParams warm{0.8f, 0.95f, 0, 0.05f, 1234};
+  EXPECT(sample_token(logits.data(), 7, warm, 17) == sample_token(logits.data(), 7, warm, 17));
+  EXPECT(gumbel_noise(1234, 17, 5) == gumbel_noise(1234, 17, 5));
+  EXPECT(gumbel_noise(1234, 17, 5) != gumbel_noise(1234, 18, 5));
+  EXPECT(throws([] { validate_sampling(SamplingParams{-1.0f, 1.0f, 0, 0.0f, 0}); }));
+  EXPECT(throws([] { validate_sampling(SamplingParams{1.0f, 0.0f, 0, 0.0f, 0}); }));
+  EXPECT(throws([] { validate_sampling(SamplingParams{1.0f, 1.0f, 0, 1.5f, 0}); }));
+}
+
 int main() {
   test_json();
   test_half();
@@ -382,6 +426,7 @@ int main() {
   test_regex();
   test_tokenizer_stable_prefix();
   test_byte_level_stable_prefix();
+  test_sampling();
   if (g_failures) {
     std::fprintf(stderr, "%d expectation(s) failed\n", g_failures);
     return 1;
