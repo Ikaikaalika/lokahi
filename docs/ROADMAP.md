@@ -77,7 +77,7 @@ that work ran on the ANE.
 | Step | Work |
 |---|---|
 | C1 | Native tokenizer so the production path has no Python. SentencePiece-style BPE (Gemma, Llama 2, Mistral) and byte-level BPE (Llama 3, Qwen, GPT-OSS, DeepSeek, GLM) are done and match Hugging Face `tokenizers`. Next: chat templates (the Jinja subset in `tokenizer_config.json`, so prompts render natively), an incremental detokenizer in the C ABI for streaming, and faster `tokenizer.json` loading (about 1.2 s for a 262k vocabulary today) |
-| C2 | Sampling (temperature, top-k/p, min-p, repetition penalties) fused on the GPU, with CPU fallback |
+| C2 | Sampling fused on the GPU with a CPU reference. Done: seeded temperature, top-p, top-k and min-p with mlx_lm semantics, identical across backends. Next: repetition and presence penalties, logit bias, and grammar-constrained decoding |
 | C3 | Scheduler: separate prefill and decode queues, continuous batching, prefix cache, cancellation |
 | C4 | Matrix compute on the CPU: AMX on M1–M3 through Accelerate (BNNS / BLAS), and SME2 on M4 and later, for small-batch side work such as draft-model layers or embeddings, only where measured to help |
 

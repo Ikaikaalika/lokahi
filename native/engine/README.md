@@ -11,6 +11,7 @@ cmake --build build/engine -j
 ./build/engine/lokahi info --model /path/to/mlx-snapshot
 ./build/engine/lokahi run --model DIR --prompt "Explain unified memory in one paragraph."
 ./build/engine/lokahi generate --model DIR --prompt "Aloha" --max-new 64     # JSON: tokens + text
+./build/engine/lokahi generate --model DIR --prompt "Aloha" --temperature 0.7 --top-p 0.9 --seed 7
 ./build/engine/lokahi tokenize --model DIR --text "Aloha kākou"
 ./build/engine/lokahi pretokenize --model DIR --text "Aloha kākou"          # words BPE runs on
 ./build/engine/lokahi bench --model DIR --tokens-file prompt.txt --max-new 128
@@ -28,6 +29,7 @@ cmake --build build/engine -j
 | Tokenizer: SentencePiece-style BPE (Gemma, Llama 2, Mistral) from `tokenizer.json` | Implemented | Correctness: identical ids and text to Hugging Face `tokenizers` on trained fixtures (byte fallback, unknown fusion, added tokens, Metaspace) and a 262k-entry synthetic vocabulary (`tests/test_tokenizer.py`) |
 | Tokenizer: byte-level BPE (Llama 3, Qwen, GPT-OSS, DeepSeek, GLM) | Implemented | Correctness: identical words, ids and text to Hugging Face `tokenizers` for the Qwen 3, Llama 3, GLM, GPT-OSS o200k, DeepSeek V3 and GPT-2 configurations on text from every Unicode plane (`tests/test_tokenizer_bytelevel.py`); regex engine fuzzed against the reference's Oniguruma |
 | Streaming text output (`lokahi run`) | Implemented | Emits only text later tokens cannot rewrite; property-tested |
+| Seeded sampling: temperature, top-p, top-k, min-p (CPU and a GPU kernel) | Implemented; GPU kernel awaiting first hardware run | Correctness: draws equal an independent float64 oracle (`oracles/sampling.py`) and follow the exact distribution (chi-square); Philox matches Random123's known answers (`tests/test_sampling.py`) |
 
 No throughput claim is made until the self-hosted runner records hardware
 evidence against a fresh MLX-LM control.
@@ -72,6 +74,22 @@ The step ends with the last-row vocabulary projection and an argmax on the GPU.
 **Pipelined greedy generation.** Each step reads the previous token from GPU
 memory, so two steps stay in flight and the host never stalls the GPU between
 tokens.
+
+**Sampling.** Greedy decoding takes the argmax (lowest id on ties).
+Otherwise the step ends with a seeded draw that matches mlx_lm's semantics:
+
+- top-p, min-p and top-k filter the untempered distribution, each as a
+  threshold logit, so tokens tied at a boundary are all kept;
+- the token is the Gumbel-max over what is left of `logit / T`.
+
+The noise is Philox4x32-10 keyed by the seed and counted by
+(generated-token index, token id). The CPU sampler and the GPU kernel
+therefore draw the same tokens from the same logits, a seed reproduces its
+output regardless of pipelining, and the GPU path keeps two steps in flight
+exactly as greedy decoding does. On the GPU, the top-k and top-p thresholds
+are found by bisection over the float's order-preserving key, inside the
+same single threadgroup that draws the token. `lokahi sample --backend metal`
+runs that kernel on arbitrary logits for testing.
 
 **Prefill.**
 
