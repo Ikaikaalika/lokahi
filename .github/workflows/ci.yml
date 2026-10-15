@@ -69,3 +69,15 @@ jobs:
           python3 -m venv .venv
           .venv/bin/pip install numpy pytest tokenizers==0.23.3
           PYTHONPATH=src .venv/bin/python -m pytest -q tests/test_native_engine.py tests/test_tokenizer.py tests/test_tokenizer_bytelevel.py tests/test_c_abi.py tests/test_sampling.py
+      - name: Wire v1 service across a real XPC boundary (gate B, CPU backend)
+        run: |
+          PYTHONPATH=src .venv/bin/python -c 'import sys; from lokahi.fixtures import write_tiny_chat_model; write_tiny_chat_model(sys.argv[1])' build/xpc-model
+          cat > build/xpc-config.json <<JSON
+          {"models": [{"id": "tiny-gemma3", "revision": "$(printf 'a%.0s' $(seq 40))",
+                       "artifact_digest": "sha256:$(printf 'b%.0s' $(seq 64))", "adapter_id": "gemma3",
+                       "directory": "$PWD/build/xpc-model"}],
+           "backend": "cpu", "max_context": 4600, "text_flush_ms": 0,
+           "runtime_revision": "$(printf '1%.0s' $(seq 64))"}
+          JSON
+          LOKAHI_XPC_TEST_CONFIG="$PWD/build/xpc-config.json" swift test --package-path integrations/commoncompute \
+            -Xlinker -L"$PWD/build/engine" -Xlinker -rpath -Xlinker "$PWD/build/engine"
