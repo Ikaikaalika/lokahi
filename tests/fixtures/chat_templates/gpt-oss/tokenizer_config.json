@@ -1,0 +1,4 @@
+{
+  "bos_token": "<|startoftext|>",
+  "eos_token": "<|return|>"
+}

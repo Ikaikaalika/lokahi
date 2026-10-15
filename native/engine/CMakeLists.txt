@@ -20,6 +20,7 @@ add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 
 set(LOKAHI_CORE_SOURCES
   src/c_api.cpp
+  src/chat_template.cpp
   src/decoder.cpp
   src/json.cpp
   src/model.cpp

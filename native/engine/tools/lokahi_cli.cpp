@@ -15,6 +15,7 @@
 //                     [--stream [--stops-file S.json]]
 //   lokahi pretokenize --model DIR (--text TEXT | --texts-file F.json)
 //   lokahi run        --model DIR --prompt TEXT [--max-new N] [sampling flags]
+//   lokahi chat-template (--model DIR | --template-file F [--config-file C]) --messages-file M.json [...] (raw text)
 //   lokahi wire-check [--roundtrip | --encode | --stream REQUEST_ID] (FILE... | --stdin)
 //
 // `run` streams generated text to stdout; every other command prints one
@@ -34,6 +35,7 @@
 #include <string>
 #include <vector>
 
+#include "chat_template.h"
 #include "common.h"
 #include "model.h"
 #include "json.h"
@@ -635,12 +637,73 @@ int cmd_wire_check(int argc, char** argv) {
   return all_valid ? 0 : 1;
 }
 
+// Renders a chat template as transformers' apply_chat_template(tokenize=False)
+// does and writes the text unchanged. Extra variables come from --set k=v and
+// --flag k=true|false (comma-separated lists, since each option is given once)
+// and from --vars-file, a JSON object of strings and booleans for values that
+// contain commas.
+int cmd_chat_template(const Args& args) {
+  ChatTemplateContext context;
+  auto token = [](const Json& config, const char* key) {
+    const Json* value = config.find(key);
+    if (value && value->is_object()) value = value->find("content");
+    return value && value->is_string() ? value->as_string() : std::string();
+  };
+  auto load = [&]() {
+    if (args.has("model")) return load_chat_template(args.get("model"), &context);
+    LK_CHECK(args.has("template-file"), "--model or --template-file is required");
+    if (args.has("config-file")) {
+      const Json config = Json::parse(read_text_file(args.get("config-file")));
+      context.bos_token = token(config, "bos_token");
+      context.eos_token = token(config, "eos_token");
+    }
+    return ChatTemplate::parse(read_text_file(args.get("template-file")));
+  };
+  const ChatTemplate chat = load();
+  LK_CHECK(args.has("messages-file"), "--messages-file is required");
+  std::vector<ChatMessage> messages;
+  const Json list = Json::parse(read_text_file(args.get("messages-file")));
+  for (const Json& m : list.as_array()) {
+    messages.push_back({m.at("role").as_string(), m.at("content").as_string()});
+  }
+  context.add_generation_prompt = !args.has("no-generation-prompt");
+  auto each = [](const std::string& spec, auto&& apply) {
+    std::stringstream items(spec);
+    for (std::string item; std::getline(items, item, ',');) {
+      const size_t eq = item.find('=');
+      LK_CHECK(eq != std::string::npos, "expected key=value, got " + item);
+      apply(item.substr(0, eq), item.substr(eq + 1));
+    }
+  };
+  if (args.has("set")) {
+    each(args.get("set"), [&](const std::string& k, const std::string& v) { context.strings[k] = v; });
+  }
+  if (args.has("flag")) {
+    each(args.get("flag"), [&](const std::string& k, const std::string& v) {
+      LK_CHECK(v == "true" || v == "false", "--flag values are true or false, got " + v);
+      context.flags[k] = v == "true";
+    });
+  }
+  if (args.has("vars-file")) {
+    const Json vars = Json::parse(read_text_file(args.get("vars-file")));
+    for (const auto& [key, value] : vars.as_object()) {
+      LK_CHECK(value.is_string() || value.is_bool(), "--vars-file values must be strings or booleans: " + key);
+      if (value.is_string()) context.strings[key] = value.as_string();
+      if (value.is_bool()) context.flags[key] = value.as_bool();
+    }
+  }
+  const std::string text = chat.render(messages, context);
+  std::fwrite(text.data(), 1, text.size(), stdout);
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   try {
     if (argc >= 2 && std::strcmp(argv[1], "wire-check") == 0) return cmd_wire_check(argc - 2, argv + 2);
     Args args = parse_args(argc, argv);
+    if (args.command == "chat-template") return cmd_chat_template(args);
     LK_CHECK(args.has("model") || args.command == "sample", "--model is required");
     if (args.command == "tokenize") return cmd_tokenize(args);
     if (args.command == "detokenize") return cmd_detokenize(args);

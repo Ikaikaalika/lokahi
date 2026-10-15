@@ -1,0 +1,2 @@
+# Templates are stored byte for byte as published; SmolLM3's has trailing spaces.
+*.jinja -whitespace
