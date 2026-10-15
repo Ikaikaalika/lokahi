@@ -147,9 +147,56 @@ void test_quant_config() {
   EXPECT(quant_spec_for(config, "model.layers.0.mlp.up_proj").group_size == 64);
   EXPECT(!quant_spec_for(config, "model.norm").quantized());
   EXPECT(!quant_spec_for(Json::parse("{}"), "x").quantized());
+  // GPT-OSS's layout: mxfp4 by default, affine overrides, one without a mode.
+  const Json oss = Json::parse(R"({"quantization": {"group_size": 32, "bits": 4, "mode": "mxfp4",
+      "q": {"group_size": 64, "bits": 8, "mode": "affine"}, "router": {"group_size": 64, "bits": 8}}})");
+  EXPECT(quant_spec_for(oss, "expert").mxfp4() && quant_spec_for(oss, "expert").group_size == 32);
+  EXPECT(!quant_spec_for(oss, "q").mxfp4() && quant_spec_for(oss, "q").bits == 8);
+  EXPECT(!quant_spec_for(oss, "router").mxfp4() && quant_spec_for(oss, "router").group_size == 64);
   EXPECT(throws([] {
-    quant_spec_for(Json::parse(R"({"quantization": {"group_size": 32, "bits": 4, "mode": "mxfp4"}})"), "x");
+    quant_spec_for(Json::parse(R"({"quantization": {"group_size": 64, "bits": 4, "mode": "mxfp4"}})"), "x");
   }));
+  EXPECT(throws([] {
+    quant_spec_for(Json::parse(R"({"quantization": {"group_size": 16, "bits": 4, "mode": "nvfp4"}})"), "x");
+  }));
+}
+
+// MXFP4 rows against hand-computed values, including exponent 0 (2^-127).
+void test_mxfp4_kernels() {
+  Linear l;
+  l.rows = 2;
+  l.cols = 64;
+  l.quant.group_size = 32;
+  l.quant.bits = 4;
+  l.quant.mode = QuantMode::Mxfp4;
+  std::vector<uint32_t> words(16);
+  std::vector<uint8_t> exponents = {127, 125, 0, 130};  // 1, 1/4, 2^-127, 8
+  const float lut[16] = {0, 0.5f, 1, 1.5f, 2, 3, 4, 6, -0.0f, -0.5f, -1, -1.5f, -2, -3, -4, -6};
+  std::vector<float> expected(128), x(64);
+  std::mt19937 rng(7);
+  for (int i = 0; i < 128; ++i) {
+    const uint32_t code = rng() & 0xF;
+    words[static_cast<size_t>(i / 8)] |= code << (4 * (i % 8));
+    const float scale = std::ldexp(1.0f, static_cast<int>(exponents[static_cast<size_t>(i / 32)]) - 127);
+    expected[static_cast<size_t>(i)] = lut[code] * scale;
+  }
+  for (int i = 0; i < 64; ++i) x[static_cast<size_t>(i)] = static_cast<float>(i % 7) - 3.0f;
+  l.words = words.data();
+  l.exponents = exponents.data();
+  std::vector<float> row(64);
+  for (int r = 0; r < 2; ++r) {
+    dequantize_row(l, r, row.data());
+    double dot = 0.0;
+    for (int c = 0; c < 64; ++c) {
+      EXPECT(row[static_cast<size_t>(c)] == expected[static_cast<size_t>(r * 64 + c)]);
+      dot += static_cast<double>(expected[static_cast<size_t>(r * 64 + c)]) * x[static_cast<size_t>(c)];
+    }
+    ThreadPool pool(1);
+    float y[2];
+    matvec(l, x.data(), y, pool);
+    EXPECT(std::fabs(y[r] - dot) <= 1e-5 * std::max(1.0, std::fabs(dot)));
+  }
+  EXPECT(l.weight_bytes() == 2 * 8 * 4 + 2 * 2);
 }
 
 std::string write_safetensors(const std::string& header, const std::vector<uint8_t>& payload) {
@@ -494,6 +541,7 @@ int main() {
   test_half();
   test_quant_kernels();
   test_quant_config();
+  test_mxfp4_kernels();
   test_safetensors();
   test_thread_pool();
   test_unicode();

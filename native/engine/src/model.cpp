@@ -65,8 +65,11 @@ std::unique_ptr<Model> load_model(const std::string& directory, const LoadOption
   auto weights = DecoderWeights::load(directory);
   std::string backend = options.backend;
 #if defined(LOKAHI_WITH_METAL)
-  // Metal implements uniform layer geometry only (not Gemma 4's additions yet).
-  if (backend == "auto") backend = metal_available() && weights->config.uniform_layers() ? "metal" : "cpu";
+  // Metal implements uniform, dense-MLP layers with affine weights only so far.
+  if (backend == "auto") {
+    const bool metal = weights->config.uniform_layers() && !weights->uses_mxfp4();
+    backend = metal && metal_available() ? "metal" : "cpu";
+  }
   if (backend == "metal") return make_decoder_metal(std::move(weights), options);
 #else
   if (backend == "auto") backend = "cpu";

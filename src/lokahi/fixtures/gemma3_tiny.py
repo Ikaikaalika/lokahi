@@ -99,6 +99,16 @@ def _quantized(
     )
 
 
+def _mxfp4(rng: np.random.Generator, rows: int, cols: int, std: float) -> tuple[np.ndarray, np.ndarray]:
+    """Random MXFP4 codes and E8M0 exponents whose values have about ``std``."""
+
+    codes = rng.integers(0, 16, size=(rows, cols), dtype=np.uint32)
+    # Uniform E2M1 codes have a root mean square of sqrt(8.5625), about 2.93.
+    exponent = 127 + int(round(np.log2(std / np.sqrt(8.5625))))
+    exponents = exponent + rng.integers(-1, 2, size=(rows, cols // 32))
+    return pack_affine(codes, 4), exponents.astype(np.uint8)
+
+
 def write_tiny_gemma3(directory: Path, spec: TinyGemma3Spec = TinyGemma3Spec()) -> Path:
     """Write ``config.json`` and ``model.safetensors`` into ``directory``."""
 

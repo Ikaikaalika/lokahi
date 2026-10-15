@@ -81,6 +81,11 @@ DENSE_VARIANTS = {
     # Qwen 3 MoE (30B-A3B layout): stacked experts, an 8-bit router, top-2 of 8
     # renormalized, and a dense layer from mlp_only_layers.
     "qwen3-moe-top2-of-8": TinyDenseSpec(model_type="qwen3_moe", head_dim=64, mlp_only_layers=(1,), seed=9),
+    # GPT-OSS ships its experts in MXFP4: here stacked experts, and a dense
+    # Llama MLP.
+    "qwen3-moe-mxfp4-experts": TinyDenseSpec(model_type="qwen3_moe", head_dim=64, mlp_only_layers=(1,),
+                                             mxfp4_mlp=True, seed=11),
+    "llama-mxfp4-mlp": TinyDenseSpec(mxfp4_mlp=True, eight_bit_mlp_layers=(), seed=12),
     # Every other layer sparse, top-3 of 6 unnormalized, Transformers'
     # per-expert tensors, untied.
     "qwen3-moe-top3-of-6-per-expert": TinyDenseSpec(
@@ -128,10 +133,17 @@ def fixture_model(request, tmp_path_factory):
 CPU_ONLY = ("gemma4", "gemma4_text", "qwen3_moe")  # the Metal backend refuses these for now
 
 
+def _uses_mxfp4(config: dict) -> bool:
+    quant = config.get("quantization") or {}
+    return quant.get("mode") == "mxfp4" or any(isinstance(v, dict) and v.get("mode") == "mxfp4" for v in quant.values())
+
+
 def _skip_unsupported(directory: Path, backend: str) -> None:
     config = json.loads((directory / "config.json").read_text())
     if backend == "metal" and (config.get("text_config") or config)["model_type"] in CPU_ONLY:
         pytest.skip("the Metal backend does not implement this architecture yet")
+    if backend == "metal" and _uses_mxfp4(config):
+        pytest.skip("the Metal backend does not implement mxfp4 weights yet")
 
 
 @pytest.mark.parametrize("backend", _backends())
@@ -347,23 +359,55 @@ def test_gemma4_missing_layer_scalar_fails_closed(native_cli, tmp_path):
     assert "layers.3.layer_scalar" in _load_error(native_cli, directory)
 
 
-@pytest.mark.parametrize("architecture", ["gemma4", "qwen3_moe"])
-def test_cpu_only_architectures_fall_back_to_the_cpu(native_cli, tmp_path, architecture):
+@pytest.mark.parametrize("architecture", ["gemma4", "qwen3_moe", "llama-mxfp4"])
+def test_cpu_only_models_fall_back_to_the_cpu(native_cli, tmp_path, architecture):
     if architecture == "gemma4":
         directory = write_tiny_gemma4(tmp_path / "model", TinyGemma4Spec())
-    else:
+    elif architecture == "qwen3_moe":
         directory = write_tiny_dense(tmp_path / "model", TinyDenseSpec(model_type="qwen3_moe"))
-    # auto falls back to the CPU backend, which implements every architecture.
+    else:
+        directory = write_tiny_dense(tmp_path / "model", TinyDenseSpec(mxfp4_mlp=True, eight_bit_mlp_layers=()))
+    # auto falls back to the CPU backend, which implements every architecture and format.
     info = _run(native_cli, "info", "--model", str(directory), "--backend", "auto")
-    assert (info["architecture"], info["backend"]) == (architecture, "cpu")
+    assert (info["architecture"], info["backend"]) == (architecture.split("-")[0], "cpu")
     if "metal" in _backends():
-        assert "the Metal backend does not implement" in _load_error(native_cli, directory, "metal")
+        message = "is mxfp4, which the Metal kernels" if architecture == "llama-mxfp4" else "the Metal backend does not"
+        assert message in _load_error(native_cli, directory, "metal")
+
+
+def test_mxfp4_matches_its_definition():
+    # The OCP MXFP4 element and scale encodings, independently of the packer.
+    from lokahi.formats import FP4_E2M1, dequantize_mxfp4, e8m0_to_f32, pack_affine
+
+    assert FP4_E2M1.tolist()[:8] == [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
+    assert (FP4_E2M1[8:] == -FP4_E2M1[:8]).all() and np.signbit(FP4_E2M1[8])
+    assert e8m0_to_f32(np.array([127, 128, 0, 254])).tolist() == [1.0, 2.0, 2.0**-127, 2.0**127]
+    codes = np.arange(64, dtype=np.uint32).reshape(1, 64) % 16
+    matrix = dequantize_mxfp4(pack_affine(codes, 4), np.array([[127, 125]], dtype=np.uint8))
+    np.testing.assert_array_equal(matrix[0, :16], FP4_E2M1)
+    np.testing.assert_array_equal(matrix[0, 32:48], FP4_E2M1 / 4)
+
+
+@pytest.mark.parametrize(
+    ("override", "message"),
+    [
+        ({"group_size": 64, "bits": 4, "mode": "mxfp4"}, "mxfp4 needs 4 bits and group size 32"),
+        ({"group_size": 16, "bits": 4, "mode": "nvfp4"}, "quantization mode 'nvfp4' is not supported yet"),
+    ],
+)
+def test_unsupported_quantization_fails_closed(native_cli, tmp_path, override, message):
+    spec = TinyDenseSpec(mxfp4_mlp=True, eight_bit_mlp_layers=())
+    directory = write_tiny_dense(tmp_path / "model", spec)
+    config = json.loads((directory / "config.json").read_text())
+    config["quantization"]["model.layers.0.mlp.up_proj"] = override
+    (directory / "config.json").write_text(json.dumps(config))
+    assert message in _load_error(native_cli, directory)
 
 
 def test_moe_fixtures_route_far_from_ties(tmp_path):
     # Guards the fixtures: on the router's real inputs, the top-k choice must
     # be stable under float32 error, and every expert must serve some token.
-    for name in ("qwen3-moe-top2-of-8", "qwen3-moe-top3-of-6-per-expert"):
+    for name in ("qwen3-moe-top2-of-8", "qwen3-moe-mxfp4-experts", "qwen3-moe-top3-of-6-per-expert"):
         oracle = LlamaFamilyReference.load(write_tiny_dense(tmp_path / name, DENSE_VARIANTS[name]))
         k, route = oracle.config.num_experts_per_tok, oracle.route
         gaps: list[float] = []

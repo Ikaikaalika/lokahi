@@ -147,6 +147,8 @@ struct DecoderWeights {
 
   static std::shared_ptr<DecoderWeights> load(const std::string& directory);
   size_t matrix_bytes() const;
+  // Whether any matrix is MXFP4, which only the CPU kernels implement.
+  bool uses_mxfp4() const;
 };
 
 std::unique_ptr<Model> make_decoder_cpu(std::shared_ptr<DecoderWeights> weights, const LoadOptions& options);

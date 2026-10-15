@@ -1,6 +1,6 @@
-"""MLX affine quantization layout, implemented independently in NumPy.
+"""MLX quantization layouts (affine and MXFP4), implemented independently in NumPy.
 
-MLX stores a quantized ``[out, in]`` matrix as three tensors:
+MLX stores an affine-quantized ``[out, in]`` matrix as three tensors:
 
 * ``weight``: ``uint32`` ``[out, in * bits / 32]``; value ``k`` of a row sits in
   word ``k // (32 / bits)`` at bit offset ``bits * (k % (32 / bits))``;
@@ -8,6 +8,10 @@ MLX stores a quantized ``[out, in]`` matrix as three tensors:
 
 Dequantization is ``w = scales * q + biases`` per group. Only the 2-, 4- and
 8-bit layouts (which divide 32 evenly) are supported here.
+
+MXFP4 (``mode: "mxfp4"``, OCP microscaling) packs 4-bit E2M1 codes the same
+way and stores one ``uint8`` E8M0 exponent per 32 values in ``scales``, with no
+biases: ``w = E2M1[q] * 2 ** (e - 127)``.
 """
 from __future__ import annotations
 
@@ -30,16 +34,19 @@ class QuantSpec:
             raise ValueError(f"unsupported affine bit width {self.bits}")
         if self.group_size <= 0 or self.group_size % (32 // self.bits):
             raise ValueError(f"invalid group size {self.group_size}")
-        if self.mode != "affine":
+        if self.mode == "mxfp4" and (self.bits, self.group_size) != (4, 32):
+            raise ValueError("mxfp4 needs 4 bits and group size 32")
+        if self.mode not in ("affine", "mxfp4"):
             raise ValueError(f"unsupported quantization mode {self.mode!r}")
 
 
 def quant_spec_for(config: Mapping[str, Any], module: str) -> QuantSpec | None:
     """Resolve the quantization of ``module`` (e.g. ``model.layers.0.mlp.up_proj``).
 
-    MLX configs carry a default ``group_size``/``bits`` plus optional
+    MLX configs carry a default ``group_size``/``bits``/``mode`` plus optional
     per-module overrides keyed by module path; an override of ``false`` marks
-    an unquantized module.
+    an unquantized module, and keys an override leaves out take their mode's
+    defaults (affine: 64 and 4 bits; mxfp4: 32 and 4 bits).
     """
 
     quant = config.get("quantization")
@@ -48,11 +55,19 @@ def quant_spec_for(config: Mapping[str, Any], module: str) -> QuantSpec | None:
     override = quant.get(module)
     if override is False:
         return None
-    source = override if isinstance(override, Mapping) else quant
+    if isinstance(override, Mapping):
+        # As mlx.nn.quantize passes it to to_quantized: missing keys take that
+        # mode's defaults, not the model-wide ones.
+        mode = str(override.get("mode", "affine"))
+        return QuantSpec(
+            group_size=int(override.get("group_size", 32 if mode == "mxfp4" else 64)),
+            bits=int(override.get("bits", 4)),
+            mode=mode,
+        )
     return QuantSpec(
-        group_size=int(source.get("group_size", quant["group_size"])),
-        bits=int(source.get("bits", quant["bits"])),
-        mode=str(source.get("mode", quant.get("mode", "affine"))),
+        group_size=int(quant["group_size"]),
+        bits=int(quant["bits"]),
+        mode=str(quant.get("mode", "affine")),
     )
 
 
@@ -99,3 +114,28 @@ def dequantize_affine(
     scale = np.asarray(scales, dtype=np.float32).reshape(-1, groups, 1)
     bias = np.asarray(biases, dtype=np.float32).reshape(-1, groups, 1)
     return (grouped * scale + bias).reshape(*lead, rows, cols)
+
+
+# E2M1 values by code, in MLX's order.
+FP4_E2M1 = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
+                    dtype=np.float32)
+
+
+def e8m0_to_f32(exponents: np.ndarray) -> np.ndarray:
+    """E8M0 scales as float32: ``2 ** (e - 127)`` (``e = 0`` is the subnormal ``2 ** -127``)."""
+
+    return np.ldexp(np.float32(1.0), np.asarray(exponents, dtype=np.int32) - 127).astype(np.float32)
+
+
+def dequantize_mxfp4(words: np.ndarray, exponents: np.ndarray) -> np.ndarray:
+    """Return the ``float32`` matrix of an MXFP4 pair; leading (expert) dimensions are kept."""
+
+    words = np.asarray(words, dtype=np.uint32)
+    *lead, rows, _ = words.shape
+    codes = unpack_affine(words.reshape(-1, words.shape[-1]), 4)
+    cols = codes.shape[1]
+    if np.shape(exponents) != (*lead, rows, cols // 32):
+        raise ValueError("mxfp4 scales shape does not match weight")
+    values = FP4_E2M1[codes].reshape(-1, cols // 32, 32)
+    scale = e8m0_to_f32(exponents).reshape(-1, cols // 32, 1)
+    return (values * scale).reshape(*lead, rows, cols)
