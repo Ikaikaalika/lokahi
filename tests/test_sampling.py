@@ -188,8 +188,6 @@ def test_generation_draws_each_step_with_its_index(native_cli, fixture_model, ba
     """The engine's tokens are the reference sampler's draws on the engine's own
     logits, step by step: the step counter, filters and noise are wired right."""
 
-    if backend == "metal":
-        pytest.skip("Metal sampling arrives with its kernel")
     directory, oracle, scale = fixture_model
     params = GENERATION_PARAMS[kind](scale)
     steps = 12

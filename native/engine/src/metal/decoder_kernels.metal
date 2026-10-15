@@ -758,3 +758,174 @@ kernel void argmax_vocab(const device float* logits [[buffer(0)]],
     history[p.history_index] = bi;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Seeded sampling (sampling.h has the semantics and the host reference).
+// Filters are thresholds on the order-preserving float key: min-p directly,
+// top-k and top-p as the smallest key whose count or mass above it is under
+// the limit, found by bisection. The draw is Gumbel-max with Philox4x32-10
+// noise keyed by (seed, step, token id), the same noise the CPU uses.
+// One threadgroup whose size is a multiple of 32.
+// ---------------------------------------------------------------------------
+
+struct SampleParams {
+  int vocab;
+  int history_index;  // also the step that keys the noise
+  float inv_temperature;
+  float top_p;
+  int top_k;
+  float log_min_p;
+  uint seed_lo;
+  uint seed_hi;
+};
+
+constant uint kSamplingStream = 0x6C6F6B61u;
+
+inline uint order_key(float value) {
+  const uint bits = as_type<uint>(value);
+  return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+}
+
+inline uint4 philox4x32_10(uint4 c, uint2 k) {
+  for (int round = 0; round < 10; ++round) {
+    if (round > 0) k += uint2(0x9E3779B9u, 0xBB67AE85u);
+    const uint hi0 = mulhi(0xD2511F53u, c.x);
+    const uint lo0 = 0xD2511F53u * c.x;
+    const uint hi1 = mulhi(0xCD9E8D57u, c.z);
+    const uint lo1 = 0xCD9E8D57u * c.z;
+    c = uint4(hi1 ^ c.y ^ k.x, lo1, hi0 ^ c.w ^ k.y, lo0);
+  }
+  return c;
+}
+
+// Threadgroup-wide reductions; every thread receives the result.
+inline float tg_max(float v, threadgroup float* scratch, uint sg, uint lane, uint groups) {
+  v = simd_max(v);
+  if (lane == 0) scratch[sg] = v;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  v = simd_max(lane < groups ? scratch[lane] : -INFINITY);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  return v;
+}
+
+inline float tg_sum(float v, threadgroup float* scratch, uint sg, uint lane, uint groups) {
+  v = simd_sum(v);
+  if (lane == 0) scratch[sg] = v;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  v = simd_sum(lane < groups ? scratch[lane] : 0.0f);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  return v;
+}
+
+inline uint tg_count(uint v, threadgroup uint* scratch, uint sg, uint lane, uint groups) {
+  v = simd_sum(v);
+  if (lane == 0) scratch[sg] = v;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  v = simd_sum(lane < groups ? scratch[lane] : 0u);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  return v;
+}
+
+kernel void sample_vocab(const device float* logits [[buffer(0)]],
+                         device int* token [[buffer(1)]],
+                         device int* history [[buffer(2)]],
+                         constant SampleParams& p [[buffer(3)]],
+                         uint tid [[thread_position_in_threadgroup]],
+                         uint tpg [[threads_per_threadgroup]],
+                         uint sg [[simdgroup_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float scratch_f[32];
+  threadgroup uint scratch_u[32];
+  threadgroup int scratch_i[32];
+  const uint groups = tpg / 32;
+
+  float local_max = -INFINITY;
+  for (int i = int(tid); i < p.vocab; i += int(tpg)) local_max = max(local_max, logits[i]);
+  const float m = tg_max(local_max, scratch_f, sg, lane, groups);
+  const uint top = order_key(m);
+
+  // Each search finds the smallest key in [threshold, top] meeting its limit,
+  // which equals max(threshold, that filter's own threshold).
+  uint threshold = 0;
+  if (p.log_min_p > -INFINITY) threshold = max(threshold, order_key(m + p.log_min_p));
+  if (p.top_k > 0 && p.top_k < p.vocab) {
+    uint lo = threshold, hi = top;
+    while (lo < hi) {
+      const uint mid = lo + (hi - lo) / 2;
+      uint count = 0;
+      for (int i = int(tid); i < p.vocab; i += int(tpg)) count += order_key(logits[i]) > mid ? 1u : 0u;
+      if (tg_count(count, scratch_u, sg, lane, groups) < uint(p.top_k)) {
+        hi = mid;
+      } else {
+        lo = mid + 1;
+      }
+    }
+    threshold = lo;
+  }
+  if (p.top_p < 1.0f) {
+    float z = 0.0f;
+    for (int i = int(tid); i < p.vocab; i += int(tpg)) z += precise::exp(logits[i] - m);
+    const float target = p.top_p * tg_sum(z, scratch_f, sg, lane, groups);
+    uint lo = threshold, hi = top;
+    while (lo < hi) {
+      const uint mid = lo + (hi - lo) / 2;
+      float mass = 0.0f;
+      for (int i = int(tid); i < p.vocab; i += int(tpg)) {
+        const float l = logits[i];
+        if (order_key(l) > mid) mass += precise::exp(l - m);
+      }
+      if (tg_sum(mass, scratch_f, sg, lane, groups) < target) {
+        hi = mid;
+      } else {
+        lo = mid + 1;
+      }
+    }
+    threshold = lo;
+  }
+
+  // Gumbel-max over kept tokens; one Philox call covers four token ids.
+  const uint2 key = uint2(p.seed_lo, p.seed_hi);
+  float best = -INFINITY;
+  int best_i = 0x7FFFFFFF;
+  for (int base = int(tid) * 4; base < p.vocab; base += int(tpg) * 4) {
+    uint4 bits = uint4(0u);
+    bool drawn = false;
+    for (int j = 0; j < 4 && base + j < p.vocab; ++j) {
+      const float l = logits[base + j];
+      if (order_key(l) < threshold) continue;
+      if (!drawn) {
+        bits = philox4x32_10(uint4(uint(base >> 2), uint(p.history_index), kSamplingStream, 0u), key);
+        drawn = true;
+      }
+      const float u = (float(bits[j] >> 9) + 0.5f) * 0x1p-23f;
+      const float score = l * p.inv_temperature - precise::log(-precise::log(u));
+      if (best_i == 0x7FFFFFFF || score > best) {
+        best = score;
+        best_i = base + j;
+      }
+    }
+  }
+  for (ushort offset = 16; offset > 0; offset /= 2) {
+    const float ov = simd_shuffle_down(best, offset);
+    const int oi = simd_shuffle_down(best_i, offset);
+    if (ov > best || (ov == best && oi < best_i)) {
+      best = ov;
+      best_i = oi;
+    }
+  }
+  if (lane == 0) {
+    scratch_f[sg] = best;
+    scratch_i[sg] = best_i;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (tid == 0) {
+    for (uint s = 1; s < groups; ++s) {
+      if (scratch_f[s] > best || (scratch_f[s] == best && scratch_i[s] < best_i)) {
+        best = scratch_f[s];
+        best_i = scratch_i[s];
+      }
+    }
+    token[0] = best_i;
+    history[p.history_index] = best_i;
+  }
+}

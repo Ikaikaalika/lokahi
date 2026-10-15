@@ -5,6 +5,7 @@
 //   lokahi generate   --model DIR (--tokens 2,5,9 | --prompt TEXT) --max-new N [--no-eos-stop]
 //                     [--temperature T] [--top-p P] [--top-k K] [--min-p M] [--seed S]
 //   lokahi sample     --logits-file F.f32 --vocab V [sampling flags] [--steps N] [--first-step S]
+//                     [--backend cpu|metal]
 //   lokahi bench      --model DIR (--tokens ... | --tokens-file F) --max-new N
 //                     [--warmups W] [--repetitions R]
 //   lokahi profile    --model DIR (--tokens ... | --tokens-file F | --prompt TEXT)
@@ -36,6 +37,10 @@
 #include "safetensors.h"
 #include "sampling.h"
 #include "tokenizer.h"
+
+#if defined(LOKAHI_WITH_METAL)
+#include "metal/metal_decoder.h"
+#endif
 
 using namespace lokahi;
 
@@ -230,11 +235,16 @@ int cmd_sample(const Args& args) {
   const int steps = args.get_int("steps", 1);
   const int first = args.get_int("first-step", 0);
   const std::string backend = args.get("backend", "cpu");
-  LK_CHECK(backend == "cpu", "sample: backend '" + backend + "' is not available");
   std::vector<int32_t> drawn;
-  for (size_t row = 0; row * static_cast<size_t>(vocab) < logits.size(); ++row) {
-    for (int step = first; step < first + steps; ++step) {
-      drawn.push_back(sample_token(logits.data() + row * static_cast<size_t>(vocab), vocab, params, step));
+#if defined(LOKAHI_WITH_METAL)
+  if (backend == "metal") drawn = metal_sample_rows(logits, vocab, params, first, steps);
+#endif
+  if (drawn.empty()) {
+    LK_CHECK(backend == "cpu", "sample: backend '" + backend + "' is not available");
+    for (size_t row = 0; row * static_cast<size_t>(vocab) < logits.size(); ++row) {
+      for (int step = first; step < first + steps; ++step) {
+        drawn.push_back(sample_token(logits.data() + row * static_cast<size_t>(vocab), vocab, params, step));
+      }
     }
   }
   std::string rows;
