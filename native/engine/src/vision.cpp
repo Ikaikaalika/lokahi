@@ -79,9 +79,12 @@ std::unique_ptr<VisionEncoder> VisionEncoder::load(const std::string& directory,
   std::string backend = requested;
   if (is_gemma4_vision(config)) {
     auto weights = Gemma4VisionWeights::load(directory, config);
+#if defined(LOKAHI_WITH_METAL)
+    if (backend == "auto") backend = metal_gemma4_vision_supports(*weights) && metal_available() ? "metal" : "cpu";
+    if (backend == "metal") return make_gemma4_vision_metal(std::move(weights));
+#endif
     if (backend == "auto") backend = "cpu";
-    LK_CHECK(backend != "metal", "metal: Gemma 4's vision tower runs on the CPU only so far; use --backend cpu");
-    LK_CHECK(backend == "cpu", "unknown backend '" + backend + "'");
+    LK_CHECK(backend == "cpu", "unknown or unavailable backend '" + backend + "'");
     return make_gemma4_vision_cpu(std::move(weights), threads);
   }
   LK_CHECK(is_siglip(config), "vision: unsupported vision tower '" +

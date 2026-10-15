@@ -105,7 +105,7 @@ cross-check, then a pinned real model on the runner.
 | 6 | MoE: Qwen3-30B-A3B, GPT-OSS 20B/120B, Gemma 4 26B-A4B, GLM-4.5/4.6-Air | Routers, expert deduplication across the batch, MXFP4 (GPT-OSS), attention sinks, alternating window 128. Qwen3-30B-A3B, GPT-OSS 20B/120B with MXFP4, and GLM-4.5/4.5-Air (with DeepSeek V3's grouped sigmoid routing) done on the CPU and Metal backends (Metal verified for correctness on hosted CI's virtual GPU; routing on the GPU, gathered expert kernels; grouping prefill tokens by expert is next) |
 | 7 | Large MoE: DeepSeek V3.x, Kimi K2, GLM-4.6 | MLA attention; needs a 256–512 GB Mac or SSD expert paging |
 | 8 | Hybrid attention: Qwen3-Next | Gated DeltaNet linear attention state alongside full attention |
-| 9 | VLMs: Gemma 3/4 vision, Qwen2.5/3-VL, GLM-4.5V | Vision encoders (ANE candidate), M-RoPE, image token packing. Gemma 3's SigLIP tower and projector, the image-feature injection and its bidirectional image blocks done on the CPU and Metal backends; Gemma 4's variable-resolution tower on the CPU. Gemma 4 on Metal and image input through the service are next |
+| 9 | VLMs: Gemma 3/4 vision, Qwen2.5/3-VL, GLM-4.5V | Vision encoders (ANE candidate), M-RoPE, image token packing. Gemma 3's SigLIP tower and projector, the image-feature injection and its bidirectional image blocks done on the CPU and Metal backends; Gemma 4's variable-resolution tower on both backends. Image input through the service, and Qwen2.5/3-VL, are next |
 
 Inputs stay portable: MLX safetensors first, then GGUF and plain safetensors.
 

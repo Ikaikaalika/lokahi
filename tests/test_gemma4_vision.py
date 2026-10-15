@@ -153,11 +153,7 @@ def vlm(request, tmp_path_factory):
     return directory, Gemma4VisionReference.load(directory), images, _image_files(directory, images)
 
 
-# Only the CPU encodes Gemma 4 images so far; Metal refuses (below).
-VISION_BACKENDS = [b for b in _backends() if b == "cpu"]
-
-
-@pytest.mark.parametrize("backend", VISION_BACKENDS)
+@pytest.mark.parametrize("backend", _backends())
 def test_image_features_match_oracle(native_cli, vlm, backend, tmp_path):
     directory, oracle, images, files = vlm
     out = tmp_path / "features.bin"
@@ -166,12 +162,13 @@ def test_image_features_match_oracle(native_cli, vlm, backend, tmp_path):
     assert report == {"backend": backend, "tokens": TOKENS, "width": SPEC.text.hidden_size}
     got = np.fromfile(out, dtype=np.float32).reshape(sum(TOKENS), SPEC.text.hidden_size)
     expected = np.concatenate([oracle.encode(image) for image in images])
-    np.testing.assert_allclose(got, expected, atol=1e-5 * np.abs(expected).max(), rtol=0)
+    tolerance = 1e-5 if backend == "cpu" else 1e-3
+    np.testing.assert_allclose(got, expected, atol=tolerance * np.abs(expected).max(), rtol=0)
 
 
 # Chunks of 9 and 8 would cut an image (positions 4-9 and 15-22); passes end
 # where an image begins.
-@pytest.mark.parametrize("backend", VISION_BACKENDS)
+@pytest.mark.parametrize("backend", _backends())
 @pytest.mark.parametrize("chunk", [512, 9, 8])
 def test_logits_with_images_match_oracle(native_cli, vlm, backend, chunk, tmp_path):
     directory, oracle, images, files = vlm
@@ -191,7 +188,7 @@ def test_logits_with_images_match_oracle(native_cli, vlm, backend, chunk, tmp_pa
     np.testing.assert_array_equal(got.argmax(axis=1), expected.argmax(axis=1))
 
 
-@pytest.mark.parametrize("backend", VISION_BACKENDS)
+@pytest.mark.parametrize("backend", _backends())
 def test_greedy_with_images_matches_full_recompute(native_cli, vlm, backend):
     directory, oracle, images, files = vlm
     report = _run(
@@ -238,11 +235,3 @@ def test_image_inputs_fail_closed(native_cli, tmp_path):
     assert "per-layer inputs are not supported yet" in _fails(
         native_cli, "logits", "--model", str(per_layer), "--backend", "cpu", *prompt, "--images", files,
         "--out", str(tmp_path / "y.bin"))
-
-
-@pytest.mark.skipif("metal" not in _backends(), reason="needs the Metal backend")
-def test_metal_refuses_gemma4_images_for_now(native_cli, vlm, tmp_path):
-    directory, _, _, files = vlm
-    assert "runs on the CPU only so far" in _fails(
-        native_cli, "image-features", "--model", str(directory), "--backend", "metal", "--images", files,
-        "--out", str(tmp_path / "x.bin"))
