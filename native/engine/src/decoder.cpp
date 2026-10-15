@@ -226,6 +226,7 @@ DecoderConfig gemma4_config(const Json& raw) {
     c.layer_moe.assign(static_cast<size_t>(c.num_layers), true);
   }
   c.per_layer_input = static_cast<int>(cfg.int_or("hidden_size_per_layer_input", 0));
+  c.pad_token_id = static_cast<int>(cfg.int_or("pad_token_id", raw.int_or("pad_token_id", 0)));
   c.per_layer_embed_scale = bf16_round(std::sqrt(static_cast<float>(c.per_layer_input)));
   c.per_layer_projection_scale = bf16_round(1.0f / std::sqrt(static_cast<float>(c.hidden_size)));
   c.per_layer_input_scale = bf16_round(1.0f / std::sqrt(2.0f));
@@ -883,9 +884,6 @@ class DecoderCpu final : public Model {
   void begin_injection(int n) {
     active_ = std::move(injection_);
     injection_ = {};
-    if (!active_.empty()) {
-      LK_CHECK(c_.per_layer_input == 0, c_.architecture + ": image features with per-layer inputs are not supported yet");
-    }
     plan_ = plan_injection(active_, position_, n, c_.hidden_size, chunk_);
   }
 
@@ -975,8 +973,11 @@ class DecoderCpu final : public Model {
     const float embed_scale = c_.per_layer_embed_scale;
     const float input_scale = c_.per_layer_input_scale;
     for (int t = 0; t < n; ++t) {
-      LK_CHECK(tokens[t] < w_->embed_per_layer.rows, "token id has no per-layer embedding");
-      dequantize_row(w_->embed_per_layer, tokens[t], row_.data());
+      // Image positions look up the pad token's per-layer embedding; their
+      // projection above already reads the image features in x_.
+      const int32_t token = injected_row(position_ + t) >= 0 ? c_.pad_token_id : tokens[t];
+      LK_CHECK(token < w_->embed_per_layer.rows, "token id has no per-layer embedding");
+      dequantize_row(w_->embed_per_layer, token, row_.data());
       for (int64_t l = 0; l < c_.num_layers; ++l) {
         float* out = pl_.data() + static_cast<size_t>(t) * width + l * P;
         for (int64_t i = 0; i < P; ++i) out[i] *= projection_scale;

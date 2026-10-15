@@ -21,6 +21,11 @@ SPEC = TinyGemma4VisionSpec()
 NARROW = replace(SPEC, text=replace(TEXT, sliding_window=5, seed=1), seed=201)
 # use_bidirectional_attention unset: image tokens attend causally, as in E2B.
 CAUSAL = replace(SPEC, text=replace(TEXT, extra={}, seed=2), seed=202)
+# E2B's text model: per-layer inputs (image positions look up the pad token),
+# KV-shared layers with double-wide MLPs, causal images.
+E2B = replace(SPEC, text=replace(TEXT, hidden_size_per_layer_input=32, num_kv_shared_layers=2, use_double_wide_mlp=True,
+                                 attention_k_eq_v=False, num_global_key_value_heads=None, extra={}, seed=3),
+              standardize=False, seed=203)
 # Images of 24x36 and 48x24 pixels: 2x3 and 4x2 pooled tokens.
 SIZES = [(24, 36), (48, 24)]
 TOKENS = [(h // 12) * (w // 12) for h, w in SIZES]
@@ -105,6 +110,19 @@ def test_fixture_variants_guard_the_mask_rules(tmp_path):
     assert narrow.language.config.bidirectional_vision and not causal.language.config.bidirectional_vision
 
 
+def test_per_layer_inputs_look_up_the_pad_token_at_image_positions(tmp_path):
+    # Guards the E2B variant: the pad token's per-layer embedding differs
+    # from the image token's, so the substitution moves the logits.
+    reference = Gemma4VisionReference.load(write_tiny_gemma4_vision(tmp_path, E2B))
+    images = _images()
+    injected, blocks = reference.placement(PROMPT, images)
+    expected = reference.language.logits(PROMPT, injected, blocks)
+    pad = reference.language.config.pad_token_id
+    reference.language.config = replace(reference.language.config, pad_token_id=E2B.image_token_id)
+    unchanged = reference.language.logits(PROMPT, injected, blocks)  # image tokens look themselves up
+    assert pad == 0 and np.abs(expected - unchanged).max() > 0.01 * np.abs(expected).max()
+
+
 def test_placement_rejects_mismatched_images(reference):
     images = _images()
     with pytest.raises(ValueError, match="image token count"):
@@ -143,7 +161,7 @@ def _image_files(directory: Path, images: list[np.ndarray]) -> str:
     return ",".join(str(write_ppm(directory / f"image{i}.ppm", image)) for i, image in enumerate(images))
 
 
-VARIANTS = {"g4v": SPEC, "g4v-narrow-window": NARROW, "g4v-causal-images": CAUSAL}
+VARIANTS = {"g4v": SPEC, "g4v-narrow-window": NARROW, "g4v-causal-images": CAUSAL, "g4v-e2b-per-layer": E2B}
 
 
 @pytest.fixture(scope="module", params=sorted(VARIANTS))
@@ -229,9 +247,3 @@ def test_image_inputs_fail_closed(native_cli, tmp_path):
     assert "not a PPM" in _fails(native_cli, "image-features", *model, "--images", str(raw))
     assert "image tokens for 1 image" in _fails(native_cli, "logits", *model, *prompt, "--images",
                                                 files.split(",")[0])
-    # Transformers feeds per-layer inputs at image positions from the pad token.
-    per_layer = write_tiny_gemma4_vision(tmp_path / "per-layer",
-                                         replace(SPEC, text=replace(TEXT, hidden_size_per_layer_input=32)))
-    assert "per-layer inputs are not supported yet" in _fails(
-        native_cli, "logits", "--model", str(per_layer), "--backend", "cpu", *prompt, "--images", files,
-        "--out", str(tmp_path / "y.bin"))
