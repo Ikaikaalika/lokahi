@@ -132,8 +132,8 @@ GEMMA4_VARIANTS = {
     # no soft-cap.
     "gemma4-shared-both-kinds": TinyGemma4Spec(
         num_hidden_layers=8, sliding_window_pattern=4, num_kv_shared_layers=3, use_double_wide_mlp=False,
-        hidden_size_per_layer_input=16, group_size=16, final_logit_softcapping=None, attention_k_eq_v=True,
-        num_key_value_heads=2, num_global_key_value_heads=1, seed=8,
+        final_logit_softcapping=None, attention_k_eq_v=True, num_key_value_heads=2, num_global_key_value_heads=1,
+        seed=8,
     ),
 }
 VARIANTS = sorted(GEMMA3_VARIANTS) + sorted(GEMMA4_VARIANTS) + sorted(DENSE_VARIANTS)
@@ -152,7 +152,7 @@ def fixture_model(request, tmp_path_factory):
     return directory, LlamaFamilyReference.load(directory)
 
 
-CPU_ONLY = ("gemma4", "gemma4_text", "qwen3_moe", "gpt_oss")  # the Metal backend refuses these for now
+CPU_ONLY = ("qwen3_moe", "gpt_oss")  # the Metal backend refuses these for now
 
 
 def _uses_mxfp4(config: dict) -> bool:
@@ -331,7 +331,7 @@ def test_metal_refuses_head_sizes_its_kernels_lack(native_cli, tmp_path):
         [str(native_cli), "info", "--model", str(directory), "--backend", "metal"], capture_output=True, text=True
     )
     assert result.returncode != 0
-    assert "metal: head_dim must be 64, 128 or 256" in result.stderr
+    assert "metal: head_dim must be 64, 128, 256 or 512" in result.stderr
 
 
 def test_gemma4_fixtures_exercise_every_feature(tmp_path):
@@ -381,11 +381,9 @@ def test_gemma4_missing_layer_scalar_fails_closed(native_cli, tmp_path):
     assert "layers.3.layer_scalar" in _load_error(native_cli, directory)
 
 
-@pytest.mark.parametrize("architecture", ["gemma4", "qwen3_moe", "llama-mxfp4"])
+@pytest.mark.parametrize("architecture", ["qwen3_moe", "llama-mxfp4"])
 def test_cpu_only_models_fall_back_to_the_cpu(native_cli, tmp_path, architecture):
-    if architecture == "gemma4":
-        directory = write_tiny_gemma4(tmp_path / "model", TinyGemma4Spec())
-    elif architecture == "qwen3_moe":
+    if architecture == "qwen3_moe":
         directory = write_tiny_dense(tmp_path / "model", TinyDenseSpec(model_type="qwen3_moe"))
     else:
         directory = write_tiny_dense(tmp_path / "model", TinyDenseSpec(mxfp4_mlp=True, eight_bit_mlp_layers=()))

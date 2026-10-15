@@ -202,6 +202,9 @@ DecoderConfig gemma4_config(const Json& raw) {
     c.layer_intermediate.push_back(c.intermediate_size * (double_wide && source != i ? 2 : 1));
   }
   c.per_layer_input = static_cast<int>(cfg.int_or("hidden_size_per_layer_input", 0));
+  c.per_layer_embed_scale = bf16_round(std::sqrt(static_cast<float>(c.per_layer_input)));
+  c.per_layer_projection_scale = bf16_round(1.0f / std::sqrt(static_cast<float>(c.hidden_size)));
+  c.per_layer_input_scale = bf16_round(1.0f / std::sqrt(2.0f));
   c.layer_scalars = true;
   if (const Json* cap = cfg.find("final_logit_softcapping"); cap && cap->is_number()) {
     c.final_logit_softcapping = static_cast<float>(cap->as_number());
@@ -843,8 +846,8 @@ class DecoderCpu final : public Model {
 
   // Gemma 4's per-layer inputs for the pass, [n, layers, P]: the token's
   // per-layer embedding times sqrt(P), plus the normed projection of the
-  // scaled token embedding (in x_) times hidden^-0.5, all times 2^-0.5 (each
-  // constant rounded to BF16).
+  // scaled token embedding (in x_) times hidden^-0.5, all times 2^-0.5 (the
+  // config's constants, rounded to BF16).
   void per_layer_inputs(const int32_t* tokens, int n) {
     const int64_t P = c_.per_layer_input, width = static_cast<int64_t>(c_.num_layers) * P;
     const size_t sn = static_cast<size_t>(n);
@@ -855,9 +858,9 @@ class DecoderCpu final : public Model {
     pl_.resize(sn * width);
     row_.resize(static_cast<size_t>(width));
     matmul(w_->per_layer_model_proj, x_.data(), n, pl_.data(), pool_);
-    const float projection_scale = bf16_round(1.0f / std::sqrt(static_cast<float>(c_.hidden_size)));
-    const float embed_scale = bf16_round(std::sqrt(static_cast<float>(P)));
-    const float input_scale = bf16_round(1.0f / std::sqrt(2.0f));
+    const float projection_scale = c_.per_layer_projection_scale;
+    const float embed_scale = c_.per_layer_embed_scale;
+    const float input_scale = c_.per_layer_input_scale;
     for (int t = 0; t < n; ++t) {
       LK_CHECK(tokens[t] < w_->embed_per_layer.rows, "token id has no per-layer embedding");
       dequantize_row(w_->embed_per_layer, tokens[t], row_.data());

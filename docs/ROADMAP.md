@@ -100,8 +100,8 @@ cross-check, then a pinned real model on the runner.
 | 1 | Gemma 3 (270M–27B) | Done in code; verify on hardware |
 | 2 | Dense GQA family: Llama 3.x, Mistral, Qwen 2/2.5, Qwen 3 (and the DeepSeek-R1 distills built on them) | Done in code; verify on hardware. Pulled ahead of Gemma 4 because MLX-LM baselines exist for Llama 3.2 1B and Qwen3 0.6B |
 | 3 | More dense: SmolLM3, Phi, GLM dense, long-context Qwen | YaRN and partial rotary RoPE, NoPE layers, other norm placements |
-| 4 | Gemma 4 dense (12B) | `global_head_dim` 512 with one global KV head, `attention_k_eq_v`, partial "proportional" RoPE on global layers, final logit softcap 30, 5:1 sliding pattern with a 1024 window. Done on the CPU backend; Metal kernels next (512-wide heads, per-layer geometry) |
-| 5 | Gemma 4 E2B/E4B | Per-layer input embeddings, KV sharing across layers. Done on the CPU backend with wave 4 |
+| 4 | Gemma 4 dense (12B) | `global_head_dim` 512 with one global KV head, `attention_k_eq_v`, partial "proportional" RoPE on global layers, final logit softcap 30, 5:1 sliding pattern with a 1024 window. Done on the CPU and Metal backends (Metal verified for correctness on hosted CI's virtual GPU) |
+| 5 | Gemma 4 E2B/E4B | Per-layer input embeddings, KV sharing across layers. Done on the CPU and Metal backends with wave 4 |
 | 6 | MoE: Qwen3-30B-A3B, GPT-OSS 20B/120B, Gemma 4 26B-A4B, GLM-4.5/4.6-Air | Routers, expert deduplication across the batch, MXFP4 (GPT-OSS), attention sinks, alternating window 128. Qwen3-30B-A3B, GPT-OSS 20B/120B and MXFP4 done on the CPU backend (experts run once per pass over the tokens routed to them) |
 | 7 | Large MoE: DeepSeek V3.x, Kimi K2, GLM-4.6 | MLA attention; needs a 256–512 GB Mac or SSD expert paging |
 | 8 | Hybrid attention: Qwen3-Next | Gated DeltaNet linear attention state alongside full attention |

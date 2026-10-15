@@ -7,7 +7,7 @@
 // Gemma 4's per-layer geometry, KV sharing and per-layer inputs, and
 // mixture-of-experts layers), so a family
 // is a config parser rather than a fork. Backends that lack a feature refuse
-// the config (see uniform_layers()).
+// the config (see metal_implements()).
 #pragma once
 
 #include <memory>
@@ -85,6 +85,9 @@ struct DecoderConfig {
   // exponents over the whole head size ("proportional" RoPE).
   float global_partial_rotary = 1.0f;
   int per_layer_input = 0;          // hidden_size_per_layer_input; 0 disables
+  // Per-layer input constants as the references apply them: the lookup times
+  // sqrt(P), the projection times hidden^-0.5, their sum times 2^-0.5.
+  float per_layer_embed_scale = 1.0f, per_layer_projection_scale = 1.0f, per_layer_input_scale = 1.0f;
   bool layer_scalars = false;       // each layer's output times its layer_scalar
 
   // Mixture of experts (Qwen 3 MoE). In layers marked in layer_moe, a
@@ -117,13 +120,10 @@ struct DecoderConfig {
   bool shares_kv(int layer) const { return kv_source(layer) != layer; }
   bool k_eq_v(int layer) const { return !layer_k_eq_v.empty() && layer_k_eq_v[static_cast<size_t>(layer)]; }
   bool is_moe(int layer) const { return !layer_moe.empty() && layer_moe[static_cast<size_t>(layer)]; }
-  // True when every layer has the same geometry and dense MLP, and none of
-  // Gemma 4's additions are used: what the Metal backend implements today.
-  bool uniform_layers() const {
-    return layer_head_dim.empty() && layer_kv_heads.empty() && layer_intermediate.empty() &&
-           layer_kv_source.empty() && layer_k_eq_v.empty() && !v_norm && global_partial_rotary == 1.0f &&
-           per_layer_input == 0 && !layer_scalars && num_experts == 0 && !o_bias && !attention_sinks;
-  }
+  // What the Metal backend implements: every option but mixture-of-experts
+  // layers and GPT-OSS's attention biases and sinks. (MXFP4 matrices are
+  // refused per matrix.)
+  bool metal_implements() const { return num_experts == 0 && !o_bias && !attention_sinks; }
 };
 
 bool is_supported_decoder(const Json& raw);

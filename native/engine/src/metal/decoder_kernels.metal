@@ -1,4 +1,5 @@
-// Lokahi Metal kernels for dense decoders (Gemma 3 and the Llama family).
+// Lokahi Metal kernels for dense decoders (Gemma 3, Gemma 4 and the Llama
+// family).
 //
 // Activations are float32. Linear weights are MLX affine-quantized codes with
 // BF16 or F16 per-group scales and biases. Quantization parameters are
@@ -121,14 +122,16 @@ kernel void rms_norm_rows(const device float* in [[buffer(0)]],
   for (int i = int(tid); i < p.cols; i += int(tpg)) y[i] = x[i] * inv * (p.offset + weight[i]);
 }
 
-// x += r, with r first normalized by w_post when post_norm (sandwich norms);
-// then, if has_next, h = norm(x) * (offset + w_next).
+// x = (x + r) * scale, with r first normalized by w_post when post_norm
+// (sandwich norms) and scale Gemma 4's layer scalar (else 1); then, if
+// has_next, h = norm(x) * (offset + w_next).
 struct ResidualNormParams {
   int cols;
   float eps;
   float offset;
   int post_norm;
   int has_next;
+  float scale;
 };
 
 kernel void residual_norm_rows(device float* x_rows [[buffer(0)]],
@@ -152,13 +155,13 @@ kernel void residual_norm_rows(device float* x_rows [[buffer(0)]],
     for (int i = int(tid); i < p.cols; i += int(tpg)) ss += r[i] * r[i];
     const float inv_r = precise::rsqrt(threadgroup_sum(ss, scratch, sg, lane, simdgroups) / float(p.cols) + p.eps);
     for (int i = int(tid); i < p.cols; i += int(tpg)) {
-      const float v = x[i] + r[i] * inv_r * (p.offset + w_post[i]);
+      const float v = (x[i] + r[i] * inv_r * (p.offset + w_post[i])) * p.scale;
       x[i] = v;
       xs += v * v;
     }
   } else {
     for (int i = int(tid); i < p.cols; i += int(tpg)) {
-      const float v = x[i] + r[i];
+      const float v = (x[i] + r[i]) * p.scale;
       x[i] = v;
       xs += v * v;
     }
@@ -443,8 +446,10 @@ kernel void softcap(device float* values [[buffer(0)]],
 
 // ---------------------------------------------------------------------------
 // Optional q/k/v biases, optional per-head RMSNorm, rotate-half RoPE for q
-// and k, and KV-cache writes. Grid: threadgroups (heads + kv_heads,
-// n_tokens); head_dim / 2 threads each.
+// and k, an optional scale-free RMSNorm on v (Gemma 4), and KV-cache writes.
+// Grid: threadgroups (heads + kv_heads, n_tokens), or heads alone for layers
+// that share another layer's keys and values; head_dim / 2 threads each.
+// Rotations with inverse frequency 0 (partial RoPE) leave values unchanged.
 // ---------------------------------------------------------------------------
 
 struct RopeParams {
@@ -457,6 +462,7 @@ struct RopeParams {
   float offset;
   int qk_norm;
   int qkv_bias;
+  int v_norm;
 };
 
 kernel void qk_norm_rope_store(device float* q [[buffer(0)]],
@@ -523,8 +529,78 @@ kernel void qk_norm_rope_store(device float* q [[buffer(0)]],
   const device float* vs = v_in + (t * p.kv_heads + kvh) * p.head_dim;
   device float* vd = v_cache + (kvh * p.capacity + slot) * p.head_dim;
   const device float* vb = v_bias + kvh * p.head_dim;
-  vd[i] = vs[i] + (p.qkv_bias != 0 ? vb[i] : 0.0f);
-  vd[i + half_dim] = vs[i + half_dim] + (p.qkv_bias != 0 ? vb[i + half_dim] : 0.0f);
+  float v_lo = vs[i] + (p.qkv_bias != 0 ? vb[i] : 0.0f);
+  float v_hi = vs[i + half_dim] + (p.qkv_bias != 0 ? vb[i + half_dim] : 0.0f);
+  if (p.v_norm != 0) {  // Uniform across the threadgroup (every kv head).
+    const float ss = threadgroup_sum(v_lo * v_lo + v_hi * v_hi, scratch, sg, lane, (tpg + 31) / 32);
+    const float inv = precise::rsqrt(ss / float(p.head_dim) + p.eps);
+    v_lo *= inv;
+    v_hi *= inv;
+  }
+  vd[i] = v_lo;
+  vd[i + half_dim] = v_hi;
+}
+
+// ---------------------------------------------------------------------------
+// Gemma 4's per-layer inputs. per_layer_combine turns the pass's projection
+// of the scaled embedding and its per-layer embedding lookup (already times
+// sqrt(P)) into out[t, l, :] = (norm(proj * proj_scale) * w + lookup) *
+// input_scale; grid: threadgroups (layers, n_tokens). per_layer_gate then
+// gates a layer: g[t, :] = gelu(g[t, :]) * inputs[t, layer, :].
+// ---------------------------------------------------------------------------
+
+struct PerLayerCombineParams {
+  int size;    // P
+  int layers;
+  float eps;
+  float offset;
+  float proj_scale;
+  float input_scale;
+};
+
+kernel void per_layer_combine(const device float* proj [[buffer(0)]],
+                              const device float* lookup [[buffer(1)]],
+                              const device float* weight [[buffer(2)]],
+                              device float* out [[buffer(3)]],
+                              constant PerLayerCombineParams& p [[buffer(4)]],
+                              uint2 tgp [[threadgroup_position_in_grid]],
+                              uint2 tid2 [[thread_position_in_threadgroup]],
+                              uint2 tpg2 [[threads_per_threadgroup]],
+                              uint sg [[simdgroup_index_in_threadgroup]],
+                              uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float scratch[32];
+  const uint tid = tid2.x;
+  const uint tpg = tpg2.x;
+  const int row = int(tgp.y) * p.layers + int(tgp.x);
+  const device float* x = proj + row * p.size;
+  float ss = 0.0f;
+  for (int i = int(tid); i < p.size; i += int(tpg)) {
+    const float v = x[i] * p.proj_scale;
+    ss += v * v;
+  }
+  const float inv = precise::rsqrt(threadgroup_sum(ss, scratch, sg, lane, (tpg + 31) / 32) / float(p.size) + p.eps);
+  const device float* e = lookup + row * p.size;
+  device float* y = out + row * p.size;
+  for (int i = int(tid); i < p.size; i += int(tpg)) {
+    y[i] = (x[i] * p.proj_scale * inv * (p.offset + weight[i]) + e[i]) * p.input_scale;
+  }
+}
+
+struct PerLayerGateParams {
+  int size;    // P
+  int layers;
+  int layer;
+  int count;   // n_tokens * P
+};
+
+kernel void per_layer_gate(device float* g [[buffer(0)]],
+                           const device float* inputs [[buffer(1)]],
+                           constant PerLayerGateParams& p [[buffer(2)]],
+                           uint gid [[thread_position_in_grid]]) {
+  if (int(gid) >= p.count) return;
+  const int t = int(gid) / p.size;
+  const int i = int(gid) % p.size;
+  g[gid] = gelu_tanh(g[gid]) * inputs[(t * p.layers + p.layer) * p.size + i];
 }
 
 // ---------------------------------------------------------------------------
@@ -660,8 +736,9 @@ template <int G, int DPL>
   decltype(attn_partial<G, DPL>) attn_partial<G, DPL>;
 
 // Query heads per kv head (G) seen in supported checkpoints run from 1 to 8
-// (Qwen 2.5 uses 6 and 7, Qwen 3 14B uses 5); head_dim is 32 * DPL.
-#define LOKAHI_ATTN_ALL_DPL(G) LOKAHI_ATTN(G, 2) LOKAHI_ATTN(G, 4) LOKAHI_ATTN(G, 8)
+// (Qwen 2.5 uses 6 and 7, Qwen 3 14B uses 5); head_dim is 32 * DPL, up to
+// Gemma 4's 512-wide full-attention heads.
+#define LOKAHI_ATTN_ALL_DPL(G) LOKAHI_ATTN(G, 2) LOKAHI_ATTN(G, 4) LOKAHI_ATTN(G, 8) LOKAHI_ATTN(G, 16)
 LOKAHI_ATTN_ALL_DPL(1)
 LOKAHI_ATTN_ALL_DPL(2)
 LOKAHI_ATTN_ALL_DPL(3)
