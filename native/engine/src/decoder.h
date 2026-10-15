@@ -68,6 +68,13 @@ struct DecoderConfig {
   float attn_logit_softcapping = 0.0f;
   bool o_bias = false;           // a bias on the attention output projection (GPT-OSS)
   bool attention_sinks = false;  // a learned per-head logit in each softmax that attends to nothing
+  // Which layers let an image's tokens see the image's later tokens during
+  // prefill: all of them (Gemma 3), sliding layers only (Gemma 4 with
+  // use_bidirectional_attention "vision"), or none (images stay causal).
+  enum class ImageBlocks { None, AllLayers, SlidingLayers } image_blocks = ImageBlocks::None;
+  bool image_blocks_apply(bool sliding) const {
+    return image_blocks == ImageBlocks::AllLayers || (image_blocks == ImageBlocks::SlidingLayers && sliding);
+  }
   std::vector<int32_t> eos_token_ids;
   std::string weight_prefix;  // "" or "language_model."
 

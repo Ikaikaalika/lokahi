@@ -798,7 +798,7 @@ class DecoderMetal final : public Model {
   void encode_attention(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n, int start) {
     const int window = G.sliding ? c_.sliding_window : (1 << 30);
     // Image blocks let a query also see up to plan_.reach later keys.
-    const bool blocks = !plan_.empty() && plan_.reach > 0;
+    const bool blocks = !plan_.empty() && plan_.reach > 0 && c_.image_blocks_apply(G.sliding);
     const int keys_max = std::min(window + (blocks ? plan_.reach : 0), start + n);  // the most keys a query sees
     const int max_blocks = n == 1 ? kDecodeMaxBlocks : kPrefillMaxBlocks;
     const int min_block = n == 1 ? 32 : 64;

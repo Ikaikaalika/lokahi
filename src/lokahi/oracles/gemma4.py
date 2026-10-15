@@ -27,7 +27,12 @@ checkpoints are converted for:
   layer gates it with ``gelu(per_layer_input_gate(x))``, projects it back,
   norms it and adds it;
 * each layer's output is multiplied by its ``layer_scalar``;
-* the MLP is GeGLU with the tanh GELU, and logits are soft-capped.
+* the MLP is GeGLU with the tanh GELU, and logits are soft-capped;
+* with images (``logits(..., injected, blocks)``), the image features replace
+  their tokens' scaled embeddings as they are and, when
+  ``use_bidirectional_attention`` is ``"vision"``, each image's tokens attend
+  to each other in both directions on sliding layers only, within the window
+  (Transformers' ``AND(window, OR(causal, block))``); full layers stay causal.
 
 Quantized MLX checkpoints are dequantized to float32 on load.
 """
@@ -63,6 +68,7 @@ class Gemma4Config:
     num_kv_shared_layers: int
     hidden_size_per_layer_input: int
     final_logit_softcapping: float | None
+    bidirectional_vision: bool = False  # use_bidirectional_attention == "vision"
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "Gemma4Config":
@@ -96,6 +102,7 @@ class Gemma4Config:
             num_kv_shared_layers=int(cfg.get("num_kv_shared_layers", 0)),
             hidden_size_per_layer_input=int(cfg.get("hidden_size_per_layer_input") or 0),
             final_logit_softcapping=cfg.get("final_logit_softcapping"),
+            bidirectional_vision=cfg.get("use_bidirectional_attention") == "vision",
         )
 
     def sliding(self, layer: int) -> bool:
@@ -217,7 +224,8 @@ class Gemma4Reference:
         k = _rope(self._norm(f"{prefix}.k_norm", k), positions, cfg.inv_freq(index))
         return k, _rms(v, cfg.rms_norm_eps)
 
-    def _attention(self, index: int, x: np.ndarray, positions: np.ndarray, kv: tuple[np.ndarray, np.ndarray]):
+    def _attention(self, index: int, x: np.ndarray, positions: np.ndarray, kv: tuple[np.ndarray, np.ndarray],
+                   blocks: Sequence[tuple[int, int]] = ()):
         cfg = self.config
         prefix = f"model.layers.{index}.self_attn"
         n, heads, dim = x.shape[0], cfg.num_attention_heads, cfg.head_size(index)
@@ -227,6 +235,10 @@ class Gemma4Reference:
         i, j = positions[:, None], positions[None, :]
         allowed = j <= i
         if cfg.sliding(index):
+            if cfg.bidirectional_vision:
+                for begin, end in blocks:
+                    inside = (positions >= begin) & (positions < end)
+                    allowed |= inside[:, None] & inside[None, :]
             allowed &= (i - j) < cfg.sliding_window
         group = heads // k.shape[1]
         out = np.empty((n, heads, dim), dtype=np.float32)
@@ -240,14 +252,25 @@ class Gemma4Reference:
             out[:, head, :] = (probs @ v[:, kv_head, :]).astype(np.float32)
         return out.reshape(n, heads * dim) @ self.w[f"{prefix}.o_proj"].T
 
-    def logits(self, token_ids: Sequence[int]) -> np.ndarray:
-        """Return ``[len(token_ids), vocab]`` float32 logits."""
+    def logits(self, token_ids: Sequence[int], injected: Mapping[int, np.ndarray] | None = None,
+               blocks: Sequence[tuple[int, int]] = ()) -> np.ndarray:
+        """Return ``[len(token_ids), vocab]`` float32 logits.
+
+        ``injected`` maps prompt positions to rows that replace their scaled
+        token embeddings (image features); ``blocks`` are each image's
+        ``[begin, end)`` positions.
+        """
 
         cfg = self.config
         tokens = np.asarray(token_ids, dtype=np.int64)
         positions = np.arange(tokens.shape[0])
         x = self.w["model.embed_tokens"][tokens] * self._constant(math.sqrt(cfg.hidden_size))
+        if injected and cfg.hidden_size_per_layer_input:
+            # Transformers feeds image positions' per-layer inputs the pad token.
+            raise NotImplementedError("image features with per-layer inputs")
         per_layer = self._per_layer_inputs(tokens, x)
+        for position, row in (injected or {}).items():
+            x[position] = row
         kvs: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         for index in range(cfg.num_hidden_layers):
             prefix = f"model.layers.{index}"
@@ -255,7 +278,8 @@ class Gemma4Reference:
             source = cfg.kv_source(index)
             if source == index:
                 kvs[index] = self._kv(index, h, positions)
-            x = x + self._norm(f"{prefix}.post_attention_layernorm", self._attention(index, h, positions, kvs[source]))
+            attention = self._attention(index, h, positions, kvs[source], blocks)
+            x = x + self._norm(f"{prefix}.post_attention_layernorm", attention)
             h = self._norm(f"{prefix}.pre_feedforward_layernorm", x)
             mlp = (_gelu_tanh(h @ self.w[f"{prefix}.mlp.gate_proj"].T) * (h @ self.w[f"{prefix}.mlp.up_proj"].T)) @ (
                 self.w[f"{prefix}.mlp.down_proj"].T

@@ -1584,3 +1584,71 @@ kernel void avg_pool_tokens(const device float* in [[buffer(0)]],
       sum += in[((ty * kernel_size + ky) * p.side + tx * kernel_size + kx) * p.cols + c];
   out[token * p.cols + c] = sum / float(kernel_size * kernel_size);
 }
+
+// ---------------------------------------------------------------------------
+// Gemma 4's vision tower: axial 2-D RoPE and pooling with standardization.
+// ---------------------------------------------------------------------------
+
+struct AxialRopeParams {
+  int heads;
+  int dim;    // head size; each axis rotates dim / 2 channels
+  int freqs;  // dim / 4 frequencies per axis
+};
+
+// In place on rows [tokens, heads, dim]: the first half of each head rotates
+// by its token's x, the second by its y, each rotate-half within its half.
+// Tables hold cos and sin [position, freqs], computed on the host in double.
+// Grid: (2 * freqs, heads, tokens).
+kernel void rope_axial(device float* x [[buffer(0)]],
+                       const device int* xy [[buffer(1)]],
+                       const device float* cos_table [[buffer(2)]],
+                       const device float* sin_table [[buffer(3)]],
+                       constant AxialRopeParams& p [[buffer(4)]],
+                       uint3 gid [[thread_position_in_grid]]) {
+  const int j = int(gid.x);
+  const int head = int(gid.y);
+  const int t = int(gid.z);
+  if (j >= 2 * p.freqs || head >= p.heads) return;
+  const int axis = j / p.freqs;
+  const int i = j % p.freqs;
+  const int pos = xy[2 * t + axis];
+  device float* part = x + (t * p.heads + head) * p.dim + axis * (p.dim / 2);
+  const float c = cos_table[pos * p.freqs + i];
+  const float s = sin_table[pos * p.freqs + i];
+  const float a = part[i];
+  const float b = part[i + p.freqs];
+  part[i] = a * c - b * s;
+  part[i + p.freqs] = b * c + a * s;
+}
+
+struct PoolStandardizeParams {
+  int cols;
+  int patch_cols;   // patches per row
+  int pooled_cols;  // pooled tokens per row
+  int kernel_size;
+  int tokens;
+  float scale;      // sqrt(hidden)
+  int standardize;
+};
+
+// out[token] = mean of the token's kernel x kernel patches, times scale, then
+// (v - bias) * mul when standardizing. Grid: (cols, tokens).
+kernel void pool_standardize(const device float* in [[buffer(0)]],
+                             device float* out [[buffer(1)]],
+                             const device float* bias [[buffer(2)]],
+                             const device float* mul [[buffer(3)]],
+                             constant PoolStandardizeParams& p [[buffer(4)]],
+                             uint2 gid [[thread_position_in_grid]]) {
+  const int c = int(gid.x);
+  const int token = int(gid.y);
+  if (c >= p.cols || token >= p.tokens) return;
+  const int ty = token / p.pooled_cols;
+  const int tx = token % p.pooled_cols;
+  const int k = p.kernel_size;
+  float sum = 0.0f;
+  for (int ky = 0; ky < k; ++ky)
+    for (int kx = 0; kx < k; ++kx) sum += in[((ty * k + ky) * p.patch_cols + tx * k + kx) * p.cols + c];
+  float v = sum / float(k * k) * p.scale;
+  if (p.standardize != 0) v = (v - bias[c]) * mul[c];
+  out[token * p.cols + c] = v;
+}

@@ -5,7 +5,8 @@
 //   lokahi generate   --model DIR (--tokens 2,5,9 | --prompt TEXT) --max-new N [--no-eos-stop]
 //                     [--images A.rgb,B.rgb]
 //                     [--temperature T] [--top-p P] [--top-k K] [--min-p M] [--seed S]
-//   lokahi image-features --model DIR --images A.rgb[,B.rgb] --out FILE [--backend B]
+//   lokahi image-features --model DIR --images A.ppm[,B.ppm] --out FILE [--backend B]
+//   lokahi image-geometry --model DIR --width W --height H   # the processor's resize target
 //   lokahi sample     --logits-file F.f32 --vocab V [sampling flags] [--steps N] [--first-step S]
 //                     [--backend cpu|metal]
 //   lokahi bench      --model DIR (--tokens ... | --tokens-file F) --max-new N
@@ -24,9 +25,10 @@
 // `run` streams generated text to stdout and `serve` writes one wire
 // document per line; every other command prints one JSON object on stdout.
 //
-// --images takes raw RGB8 files already resized to the vision tower's image
-// size (image_size * image_size * 3 bytes, rows top to bottom); image i fills
-// the prompt's i-th run of image tokens.
+// --images takes binary PPM (P6) files already resized to a size the model
+// takes (image-geometry reports the processor's choice), or for models with
+// one square size, raw RGB8 bytes of it; image i fills the prompt's i-th run
+// of image tokens.
 #include <sys/resource.h>
 
 #include <algorithm>
@@ -199,19 +201,9 @@ std::vector<std::string> split_list(const std::string& text) {
 
 // Each --images file through the vision tower, in order.
 std::vector<std::vector<float>> encode_images(const Args& args, VisionEncoder& encoder) {
-  const VisionConfig& c = encoder.config();
-  const size_t bytes = static_cast<size_t>(c.image_size) * c.image_size * 3;
   std::vector<std::vector<float>> features;
   for (const std::string& path : split_list(args.get("images"))) {
-    std::ifstream in(path, std::ios::binary | std::ios::ate);
-    LK_CHECK(in.good(), "cannot read image " + path);
-    LK_CHECK(static_cast<size_t>(in.tellg()) == bytes,
-             path + " is not a " + std::to_string(c.image_size) + "x" + std::to_string(c.image_size) + " RGB8 image (" +
-                 std::to_string(bytes) + " bytes)");
-    std::vector<uint8_t> rgb(bytes);
-    in.seekg(0);
-    in.read(reinterpret_cast<char*>(rgb.data()), static_cast<std::streamsize>(bytes));
-    features.push_back(encoder.encode(encoder.preprocess(rgb.data()).data()));
+    features.push_back(encoder.encode(read_image(path, encoder.fixed_size())));
   }
   LK_CHECK(!features.empty(), "--images names no files");
   return features;
@@ -229,7 +221,8 @@ std::unique_ptr<VisionEncoder> load_vision(const Args& args) {
 void inject_images(const Args& args, Model& model, const std::vector<int32_t>& tokens) {
   if (!args.has("images")) return;
   auto encoder = load_vision(args);
-  model.inject(place_images(tokens, model.position(), encoder->config(), encode_images(args, *encoder)));
+  model.inject(place_images(tokens, model.position(), encoder->image_token_id(), encoder->text_hidden_size(),
+                            encode_images(args, *encoder)));
 }
 
 int cmd_image_features(const Args& args) {
@@ -238,23 +231,35 @@ int cmd_image_features(const Args& args) {
   const auto features = encode_images(args, *encoder);
   std::ofstream out(args.get("out"), std::ios::binary);
   LK_CHECK(out.good(), "cannot write " + args.get("out"));
+  std::string tokens;
   for (const auto& image : features) {
     out.write(reinterpret_cast<const char*>(image.data()), static_cast<std::streamsize>(sizeof(float) * image.size()));
+    tokens += (tokens.empty() ? "" : ",") + std::to_string(image.size() / static_cast<size_t>(encoder->text_hidden_size()));
   }
-  std::printf("{\"backend\":\"%s\",\"images\":%zu,\"tokens_per_image\":%d,\"width\":%d}\n", encoder->backend(),
-              features.size(), encoder->config().tokens_per_image, encoder->config().text_hidden_size);
+  std::printf("{\"backend\":\"%s\",\"tokens\":[%s],\"width\":%d}\n", encoder->backend(), tokens.c_str(),
+              encoder->text_hidden_size());
+  return 0;
+}
+
+// The size the model's processor resizes a --width x --height image to, and
+// the image tokens it then takes.
+int cmd_image_geometry(const Args& args) {
+  LK_CHECK(args.has("width") && args.has("height"), "image-geometry needs --width and --height");
+  auto encoder = VisionEncoder::load(args.get("model"), "cpu");
+  LK_CHECK(encoder != nullptr, "this model has no vision tower");
+  const auto [width, height] = encoder->target_size(args.get_int("width", 0), args.get_int("height", 0));
+  std::printf("{\"width\":%d,\"height\":%d,\"tokens\":%d,\"image_token_id\":%d}\n", width, height,
+              encoder->tokens_for(width, height), encoder->image_token_id());
   return 0;
 }
 
 int cmd_info(const Args& args) {
   auto model = load_model(args.get("model"), load_options(args));
   std::string vision;
-  const Json config = Json::parse(read_text_file(args.get("model") + "/config.json"));
-  if (has_vision(config)) {
-    const VisionConfig c = VisionConfig::from_json(config, nullptr);
-    vision = ",\"vision\":{\"image_size\":" + std::to_string(c.image_size) +
-             ",\"tokens_per_image\":" + std::to_string(c.tokens_per_image) +
-             ",\"image_token_id\":" + std::to_string(c.image_token_id) + "}";
+  if (auto encoder = VisionEncoder::load(args.get("model"), "cpu")) {
+    // image_size 0: images take any accepted size (image-geometry).
+    vision = ",\"vision\":{\"image_size\":" + std::to_string(encoder->fixed_size()) +
+             ",\"image_token_id\":" + std::to_string(encoder->image_token_id()) + "}";
   }
   std::printf(
       "{\"architecture\":\"%s\",\"backend\":\"%s\",\"vocab_size\":%d,\"max_context\":%d,"
@@ -825,6 +830,7 @@ int main(int argc, char** argv) {
     if (args.command == "run") return cmd_run(args);
     if (args.command == "info") return cmd_info(args);
     if (args.command == "image-features") return cmd_image_features(args);
+    if (args.command == "image-geometry") return cmd_image_geometry(args);
     if (args.command == "logits") return cmd_logits(args);
     if (args.command == "generate") return cmd_generate(args);
     if (args.command == "sample") return cmd_sample(args);
