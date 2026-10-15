@@ -695,7 +695,7 @@ size_t DecoderWeights::matrix_bytes() const {
   return total;
 }
 
-bool DecoderWeights::uses_mxfp4() const {
+bool DecoderWeights::dense_mxfp4() const {
   if (embed.quant.mxfp4() || lm_head.quant.mxfp4() || embed_per_layer.quant.mxfp4() ||
       per_layer_model_proj.quant.mxfp4()) {
     return true;
@@ -705,11 +705,6 @@ bool DecoderWeights::uses_mxfp4() const {
                             &l.per_layer_gate, &l.per_layer_proj, &l.router, &l.shared_gate, &l.shared_up,
                             &l.shared_down}) {
       if (m->quant.mxfp4()) return true;
-    }
-    for (const auto* experts : {&l.expert_gate, &l.expert_up, &l.expert_down}) {
-      for (const Linear& expert : *experts) {
-        if (expert.quant.mxfp4()) return true;
-      }
     }
   }
   return false;

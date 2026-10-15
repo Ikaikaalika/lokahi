@@ -131,13 +131,11 @@ struct DecoderConfig {
   bool shares_kv(int layer) const { return kv_source(layer) != layer; }
   bool k_eq_v(int layer) const { return !layer_k_eq_v.empty() && layer_k_eq_v[static_cast<size_t>(layer)]; }
   bool is_moe(int layer) const { return !layer_moe.empty() && layer_moe[static_cast<size_t>(layer)]; }
-  // What the Metal backend implements: every option but GPT-OSS's and GLM's
-  // routers and attention additions (biases, sinks, classic partial RoPE).
-  // (MXFP4 matrices and expert counts are checked by the backend.)
+  // What the Metal backend implements: every option but GLM-4.5's grouped
+  // sigmoid router, shared experts and classic partial RoPE. (MXFP4 outside
+  // experts and expert counts are checked by the backend.)
   bool metal_implements() const {
-    const bool experts = num_experts == 0 || (router == Router::Softmax && !router_bias && !expert_bias &&
-                                              shared_intermediate == 0);
-    return experts && !o_bias && !attention_sinks && rotary_dim == 0;
+    return router != Router::SigmoidGrouped && shared_intermediate == 0 && rotary_dim == 0;
   }
 };
 
@@ -182,8 +180,9 @@ struct DecoderWeights {
 
   static std::shared_ptr<DecoderWeights> load(const std::string& directory);
   size_t matrix_bytes() const;
-  // Whether any matrix is MXFP4, which only the CPU kernels implement.
-  bool uses_mxfp4() const;
+  // Whether any matrix other than an expert is MXFP4: the Metal kernels read
+  // MXFP4 only for experts so far.
+  bool dense_mxfp4() const;
 };
 
 std::unique_ptr<Model> make_decoder_cpu(std::shared_ptr<DecoderWeights> weights, const LoadOptions& options);
