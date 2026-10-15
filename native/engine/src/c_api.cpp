@@ -21,6 +21,19 @@ namespace {
 
 thread_local std::string g_last_error;
 
+lokahi::SamplingParams sampling_params(const lokahi_sampling* sampling) {
+  lokahi::SamplingParams params;
+  if (sampling != nullptr) {
+    params.temperature = sampling->temperature;
+    params.top_p = sampling->top_p;
+    params.top_k = sampling->top_k;
+    params.min_p = sampling->min_p;
+    params.seed = sampling->seed;
+  }
+  lokahi::validate_sampling(params);
+  return params;
+}
+
 template <typename Fn>
 int guarded(Fn&& fn) {
   try {
@@ -97,14 +110,22 @@ int lokahi_decode(lokahi_model* model, int32_t token, float* logits_out) {
 int lokahi_generate_greedy(lokahi_model* model, const int32_t* prompt, int32_t prompt_count,
                            int32_t max_new, int32_t stop_at_eos, int32_t* out_tokens,
                            int32_t* out_count, lokahi_timing* timing) {
+  return lokahi_generate(model, prompt, prompt_count, max_new, nullptr, stop_at_eos, out_tokens, out_count,
+                         timing);
+}
+
+int lokahi_generate(lokahi_model* model, const int32_t* prompt, int32_t prompt_count, int32_t max_new,
+                    const lokahi_sampling* sampling, int32_t stop_at_eos, int32_t* out_tokens,
+                    int32_t* out_count, lokahi_timing* timing) {
   return guarded([&] {
     if (model == nullptr || prompt == nullptr || prompt_count <= 0 || out_tokens == nullptr ||
         out_count == nullptr) {
       throw std::invalid_argument("bad arguments");
     }
+    const lokahi::SamplingParams params = sampling_params(sampling);
     lokahi::GenerationTiming t;
     std::vector<int32_t> input(prompt, prompt + prompt_count);
-    auto tokens = model->model->generate_greedy(input, max_new, stop_at_eos != 0, &t);
+    auto tokens = model->model->generate(input, max_new, params, stop_at_eos != 0, &t);
     std::copy(tokens.begin(), tokens.end(), out_tokens);
     *out_count = static_cast<int32_t>(tokens.size());
     if (timing) {
@@ -112,6 +133,16 @@ int lokahi_generate_greedy(lokahi_model* model, const int32_t* prompt, int32_t p
       timing->decode_seconds = t.decode_seconds;
       timing->generated_tokens = static_cast<int32_t>(tokens.size());
     }
+  });
+}
+
+int lokahi_sample(const float* logits, int32_t vocab, const lokahi_sampling* sampling, int32_t step,
+                  int32_t* out_token) {
+  return guarded([&] {
+    if (logits == nullptr || vocab <= 0 || step < 0 || out_token == nullptr) {
+      throw std::invalid_argument("bad arguments");
+    }
+    *out_token = lokahi::sample_token(logits, vocab, sampling_params(sampling), step);
   });
 }
 

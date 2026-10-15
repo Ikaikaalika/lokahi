@@ -18,7 +18,7 @@
 extern "C" {
 #endif
 
-#define LOKAHI_ABI_VERSION 1
+#define LOKAHI_ABI_VERSION 2
 
 typedef struct lokahi_model lokahi_model;
 
@@ -57,6 +57,28 @@ int lokahi_decode(lokahi_model* model, int32_t token, float* logits_out);
 int lokahi_generate_greedy(lokahi_model* model, const int32_t* prompt, int32_t prompt_count,
                            int32_t max_new, int32_t stop_at_eos, int32_t* out_tokens,
                            int32_t* out_count, lokahi_timing* timing);
+
+/* Seeded sampling with mlx_lm semantics: top-p, min-p and top-k filter the
+ * untempered distribution, then a token is drawn with probability
+ * proportional to exp(logit / temperature). */
+typedef struct {
+  float temperature; /* >= 0; 0 is greedy */
+  float top_p;       /* (0, 1]; 1 disables */
+  int32_t top_k;     /* >= 0; 0 disables */
+  float min_p;       /* [0, 1]; 0 disables */
+  uint64_t seed;
+} lokahi_sampling;
+
+/* Generation from the current position; `sampling` NULL is greedy. Generated
+ * token i is drawn with noise keyed by (seed, i, token id), so a seed gives
+ * the same tokens on every backend. Writes up to max_new tokens. */
+int lokahi_generate(lokahi_model* model, const int32_t* prompt, int32_t prompt_count, int32_t max_new,
+                    const lokahi_sampling* sampling, int32_t stop_at_eos, int32_t* out_tokens,
+                    int32_t* out_count, lokahi_timing* timing);
+
+/* The host reference sampler: one token from `vocab` logits at noise step `step`. */
+int lokahi_sample(const float* logits, int32_t vocab, const lokahi_sampling* sampling, int32_t step,
+                  int32_t* out_token);
 
 /* Tokenizer for <directory>/tokenizer.json (Hugging Face format). */
 typedef struct lokahi_tokenizer lokahi_tokenizer;

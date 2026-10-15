@@ -2,9 +2,10 @@
 //
 // One serial compute encoder per command buffer runs a whole prefill (all
 // chunks) or one decode step: embedding, every layer, the last-row
-// vocabulary projection, and device-side argmax. Greedy generation keeps two
-// decode steps in flight; each step reads the previous token from GPU memory,
-// so the host never sits on the critical path between tokens.
+// vocabulary projection, and device-side argmax or seeded sampling.
+// Generation keeps two decode steps in flight; each step reads the previous
+// token from GPU memory, so the host never sits on the critical path between
+// tokens.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
@@ -27,6 +28,15 @@ namespace {
 
 std::string ns_error(NSError* error) {
   return error ? std::string([[error localizedDescription] UTF8String]) : std::string("unknown error");
+}
+
+id<MTLLibrary> compile_kernels(id<MTLDevice> device) {
+  MTLCompileOptions* compile = [MTLCompileOptions new];
+  compile.languageVersion = MTLLanguageVersion3_0;
+  NSError* error = nil;
+  id<MTLLibrary> library = [device newLibraryWithSource:@(kDecoderKernelSource) options:compile error:&error];
+  LK_CHECK(library != nil, "metal: kernel compilation failed: " + ns_error(error));
+  return library;
 }
 
 struct BufRef {
@@ -131,6 +141,22 @@ struct AttnParams {
 };
 struct ReduceParams { int heads; int head_dim; int n_blocks; };
 struct ArgmaxParams { int vocab; int history_index; };
+struct SampleParams {
+  int vocab;
+  int history_index;  // also the step that keys the sampling noise
+  float inv_temperature;
+  float top_p;      // >= 1 disables
+  int top_k;        // <= 0 or >= vocab disables
+  float log_min_p;  // -inf disables
+  uint32_t seed_lo;
+  uint32_t seed_hi;
+};
+
+SampleParams sample_params(const SamplingParams& sp, int vocab, int history_index) {
+  return SampleParams{vocab, history_index, 1.0f / sp.temperature, sp.top_p, sp.top_k,
+                      sp.min_p > 0.0f ? std::log(sp.min_p) : -INFINITY, static_cast<uint32_t>(sp.seed),
+                      static_cast<uint32_t>(sp.seed >> 32)};
+}
 
 constexpr int kDecodeMaxBlocks = 64;
 constexpr int kPrefillMaxBlocks = 8;
@@ -145,11 +171,7 @@ class DecoderMetal final : public Model {
       device_ = MTLCreateSystemDefaultDevice();
       LK_CHECK(device_ != nil, "metal: no Metal device");
       queue_ = [device_ newCommandQueue];
-      MTLCompileOptions* compile = [MTLCompileOptions new];
-      compile.languageVersion = MTLLanguageVersion3_0;
-      NSError* error = nil;
-      library_ = [device_ newLibraryWithSource:@(kDecoderKernelSource) options:compile error:&error];
-      LK_CHECK(library_ != nil, "metal: kernel compilation failed: " + ns_error(error));
+      library_ = compile_kernels(device_);
       validate();
       upload();
       allocate_state();
@@ -193,12 +215,19 @@ class DecoderMetal final : public Model {
     }
   }
 
-  std::vector<int32_t> generate_greedy(const std::vector<int32_t>& prompt, int max_new, bool stop_at_eos,
-                                       GenerationTiming* timing, const TokenCallback& on_token) override {
+  std::vector<int32_t> generate(const std::vector<int32_t>& prompt, int max_new, const SamplingParams& sampling,
+                                bool stop_at_eos, GenerationTiming* timing, const TokenCallback& on_token) override {
     std::vector<int32_t> out;
     if (max_new <= 0) return out;
+    validate_sampling(sampling);
     @autoreleasepool {
       drain();
+      // Steps encoded during this call sample with these parameters.
+      struct Restore {
+        SamplingParams& target;
+        ~Restore() { target = SamplingParams{}; }
+      } restore{sampling_};
+      sampling_ = sampling;
       const int prompt_len = static_cast<int>(prompt.size());
       LK_CHECK(position_ + prompt_len + max_new - 1 <= max_context_, "context length exceeded");
       const auto& eos = c_.eos_token_ids;
@@ -673,14 +702,18 @@ class DecoderMetal final : public Model {
       encode_elementwise(enc, c_.vocab_size);
     }
     section(enc, "lm_head", profiling ? traffic::linear(w_->lm_head, 1) : 0.0);
-    id<MTLComputePipelineState> argmax = pipeline("argmax_vocab");
-    [enc setComputePipelineState:argmax];
+    id<MTLComputePipelineState> pick = pipeline(sampling_.greedy() ? "argmax_vocab" : "sample_vocab");
+    [enc setComputePipelineState:pick];
     bind(enc, logits_, 0, 0);
     bind(enc, token_, 0, 1);
     bind(enc, history_, 0, 2);
-    bytes(enc, ArgmaxParams{c_.vocab_size, history_index}, 3);
+    if (sampling_.greedy()) {
+      bytes(enc, ArgmaxParams{c_.vocab_size, history_index}, 3);
+    } else {
+      bytes(enc, sample_params(sampling_, c_.vocab_size, history_index), 3);
+    }
     [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-        threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(1024, [argmax maxTotalThreadsPerThreadgroup] / 32 * 32), 1, 1)];
+        threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(1024, [pick maxTotalThreadsPerThreadgroup] / 32 * 32), 1, 1)];
     section(enc, "sample", profiling ? 4.0 * c_.vocab_size : 0.0);
   }
 
@@ -749,6 +782,8 @@ class DecoderMetal final : public Model {
   // The command buffer encode_forward is appending to (sections replace it
   // while profiling).
   id<MTLCommandBuffer> active_cb_ = nil;
+  // How the final step picks a token; greedy outside generate().
+  SamplingParams sampling_;
 };
 
 }  // namespace
@@ -768,6 +803,58 @@ std::string metal_device_name() {
 
 std::unique_ptr<Model> make_decoder_metal(std::shared_ptr<DecoderWeights> weights, const LoadOptions& options) {
   return std::make_unique<DecoderMetal>(std::move(weights), options);
+}
+
+std::vector<int32_t> metal_sample_rows(const std::vector<float>& logits, int vocab, const SamplingParams& params,
+                                       int first_step, int steps) {
+  validate_sampling(params);
+  LK_CHECK(vocab > 0 && !logits.empty() && logits.size() % static_cast<size_t>(vocab) == 0,
+           "metal sample: logits are not whole rows");
+  LK_CHECK(first_step >= 0 && steps > 0, "metal sample: bad step range");
+  std::vector<int32_t> out;
+  @autoreleasepool {
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    LK_CHECK(device != nil, "metal: no Metal device");
+    id<MTLLibrary> library = compile_kernels(device);
+    const bool greedy = params.greedy();
+    NSError* error = nil;
+    id<MTLFunction> function = [library newFunctionWithName:greedy ? @"argmax_vocab" : @"sample_vocab"];
+    id<MTLComputePipelineState> pso = [device newComputePipelineStateWithFunction:function error:&error];
+    LK_CHECK(pso != nil, "metal: sampling pipeline: " + ns_error(error));
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    id<MTLBuffer> rows = [device newBufferWithBytes:logits.data()
+                                             length:logits.size() * sizeof(float)
+                                            options:MTLResourceStorageModeShared];
+    id<MTLBuffer> token = [device newBufferWithLength:sizeof(int32_t) options:MTLResourceStorageModeShared];
+    id<MTLBuffer> history = [device newBufferWithLength:sizeof(int32_t) * static_cast<size_t>(first_step + steps)
+                                                options:MTLResourceStorageModeShared];
+    const NSUInteger threads = std::min<NSUInteger>(1024, [pso maxTotalThreadsPerThreadgroup] / 32 * 32);
+    const size_t row_count = logits.size() / static_cast<size_t>(vocab);
+    for (size_t row = 0; row < row_count; ++row) {
+      for (int step = first_step; step < first_step + steps; ++step) {
+        id<MTLCommandBuffer> cb = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setBuffer:rows offset:row * static_cast<size_t>(vocab) * sizeof(float) atIndex:0];
+        [enc setBuffer:token offset:0 atIndex:1];
+        [enc setBuffer:history offset:0 atIndex:2];
+        if (greedy) {
+          const ArgmaxParams p{vocab, step};
+          [enc setBytes:&p length:sizeof(p) atIndex:3];
+        } else {
+          const SampleParams p = sample_params(params, vocab, step);
+          [enc setBytes:&p length:sizeof(p) atIndex:3];
+        }
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+        [enc endEncoding];
+        [cb commit];
+        [cb waitUntilCompleted];
+        LK_CHECK([cb status] == MTLCommandBufferStatusCompleted, "metal: command buffer failed: " + ns_error([cb error]));
+        out.push_back(static_cast<const int32_t*>([history contents])[step]);
+      }
+    }
+  }
+  return out;
 }
 
 }  // namespace lokahi

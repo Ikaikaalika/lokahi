@@ -26,6 +26,7 @@ set(LOKAHI_CORE_SOURCES
   src/quant.cpp
   src/regex.cpp
   src/safetensors.cpp
+  src/sampling.cpp
   src/thread_pool.cpp
   src/tokenizer.cpp
   src/unicode.cpp

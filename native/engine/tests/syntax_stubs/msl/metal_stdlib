@@ -17,14 +17,27 @@ struct half {
   operator float() const { return 0.0f; }
 };
 struct float4 { float x, y, z, w; };
-struct uint2 { uint x, y; };
+struct uint2 {
+  uint x, y;
+  uint2() : x(0), y(0) {}
+  uint2(uint a, uint b) : x(a), y(b) {}
+  uint2& operator+=(uint2 o) { x += o.x; y += o.y; return *this; }
+};
 struct uint3 { uint x, y, z; };
-struct uint4 { uint x, y, z, w; };
+struct uint4 {
+  uint x, y, z, w;
+  uint4() : x(0), y(0), z(0), w(0) {}
+  explicit uint4(uint a) : x(a), y(a), z(a), w(a) {}
+  uint4(uint a, uint b, uint c, uint d) : x(a), y(b), z(c), w(d) {}
+  uint operator[](int i) const { return i == 0 ? x : i == 1 ? y : i == 2 ? z : w; }
+};
 struct ulong2 { ulong x, y; ulong2(ulong a, ulong b) : x(a), y(b) {} };
 namespace metal {
 enum class mem_flags { mem_none, mem_device, mem_threadgroup };
 inline void threadgroup_barrier(mem_flags) {}
 template <typename T> T simd_sum(T v) { return v; }
+template <typename T> T simd_max(T v) { return v; }
+inline uint mulhi(uint a, uint b) { return static_cast<uint>((static_cast<unsigned long long>(a) * b) >> 32); }
 template <typename T> T simd_shuffle_down(T v, ushort) { return v; }
 template <typename T, typename U> T as_type(U v) { T out; std::memcpy(&out, &v, sizeof(T)); return out; }
 template <typename T> T max(T a, T b) { return a > b ? a : b; }
@@ -35,5 +48,6 @@ inline float tanh(float v) { return std::tanh(v); }
 inline float cos(float v) { return std::cos(v); }
 inline float sin(float v) { return std::sin(v); }
 inline float exp(float v) { return std::exp(v); }
+inline float log(float v) { return std::log(v); }
 }  // namespace precise
 }  // namespace metal
