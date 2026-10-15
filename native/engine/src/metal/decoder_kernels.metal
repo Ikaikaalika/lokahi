@@ -500,6 +500,110 @@ kernel void qmv_gather(const device uint* w [[buffer(0)]],
   }
 }
 
+// GLM-4.5 / DeepSeek V3 (noaux_tc) routing, one simdgroup per token:
+// sigmoid scores plus the correction bias choose the top k within the best
+// topk_groups groups (by each group's two best); the chosen experts' raw
+// scores, renormalized when norm_topk (and k > 1), times scaling, weight
+// them. Ties go to the lower group or expert index. Lane 0 does the
+// selection: at most 256 experts, so it is cheap next to the experts.
+struct MoeGroupedParams {
+  int experts;
+  int k;
+  int groups;
+  int topk_groups;
+  int norm_topk;
+  float scaling;
+};
+
+kernel void moe_route_grouped(const device float* logits [[buffer(0)]],
+                              device int* chosen [[buffer(1)]],
+                              device float* weights [[buffer(2)]],
+                              constant MoeGroupedParams& p [[buffer(3)]],
+                              const device float* correction [[buffer(4)]],
+                              uint t [[threadgroup_position_in_grid]],
+                              uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float score[256];
+  threadgroup float selection[256];
+  const device float* l = logits + int(t) * p.experts;
+  for (int e = int(lane); e < p.experts; e += 32) {
+    score[e] = 1.0f / (1.0f + precise::exp(-l[e]));
+    selection[e] = score[e] + correction[e];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (lane != 0) return;
+  const int per_group = p.experts / p.groups;
+  if (p.groups > 1) {
+    float group_score[32];
+    for (int g = 0; g < p.groups; ++g) {
+      float first = -INFINITY, second = -INFINITY;
+      for (int e = g * per_group; e < (g + 1) * per_group; ++e) {
+        const float v = selection[e];
+        if (v > first) {
+          second = first;
+          first = v;
+        } else if (v > second) {
+          second = v;
+        }
+      }
+      group_score[g] = first + (per_group > 1 ? second : 0.0f);
+    }
+    uint dropped = 0;
+    for (int j = 0; j < p.groups - p.topk_groups; ++j) {  // zero the lowest groups
+      int worst = -1;
+      for (int g = 0; g < p.groups; ++g) {
+        if (!((dropped >> g) & 1u) && (worst < 0 || group_score[g] < group_score[worst])) worst = g;
+      }
+      dropped |= 1u << worst;
+      for (int e = worst * per_group; e < (worst + 1) * per_group; ++e) selection[e] = 0.0f;
+    }
+  }
+  uint taken[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  float total = 0.0f;
+  for (int j = 0; j < p.k; ++j) {
+    int best = -1;
+    for (int e = 0; e < p.experts; ++e) {
+      if (!((taken[e >> 5] >> (e & 31)) & 1u) && (best < 0 || selection[e] > selection[best])) best = e;
+    }
+    taken[best >> 5] |= 1u << (best & 31);
+    chosen[int(t) * p.k + j] = best;
+    weights[int(t) * p.k + j] = score[best];
+    total += score[best];
+  }
+  const float scale = (p.k > 1 && p.norm_topk != 0 ? 1.0f / total : 1.0f) * p.scaling;
+  for (int j = 0; j < p.k; ++j) weights[int(t) * p.k + j] *= scale;
+}
+
+// y[t, r] = W[r, :] . x[t, :] for a dense matrix (dtype 0 F32, 1 BF16, 2
+// F16): GLM's unquantized router. Grid: threadgroups (row pairs, n_tokens),
+// two simdgroups of one row each.
+struct DenseParams {
+  int rows;
+  int cols;
+  int dtype;
+};
+
+inline float dense_at(const device uchar* w, int index, int dtype) {
+  if (dtype == 1) return as_type<float>(uint(reinterpret_cast<const device ushort*>(w)[index]) << 16);
+  if (dtype == 2) return float(reinterpret_cast<const device half*>(w)[index]);
+  return reinterpret_cast<const device float*>(w)[index];
+}
+
+kernel void dense_rows(const device uchar* w [[buffer(0)]],
+                       const device float* x [[buffer(1)]],
+                       device float* y [[buffer(2)]],
+                       constant DenseParams& p [[buffer(3)]],
+                       uint2 tg [[threadgroup_position_in_grid]],
+                       uint sg [[simdgroup_index_in_threadgroup]],
+                       uint lane [[thread_index_in_simdgroup]]) {
+  const int row = int(tg.x) * 2 + int(sg);
+  const int t = int(tg.y);
+  if (row >= p.rows) return;
+  float acc = 0.0f;
+  for (int c = int(lane); c < p.cols; c += 32) acc += dense_at(w, row * p.cols + c, p.dtype) * x[t * p.cols + c];
+  acc = simd_sum(acc);
+  if (lane == 0) y[t * p.rows + row] = acc;
+}
+
 struct BiasParams {
   int cols;
   int count;  // n_rows * cols
@@ -517,18 +621,20 @@ struct MoeCombineParams {
   int cols;   // hidden
   int k;
   int count;  // n_tokens * hidden
+  int has_shared;
 };
 
-// out[t, :] = sum_j weights[t, j] * slots[t * k + j, :]
+// out[t, :] = sum_j weights[t, j] * slots[t * k + j, :] (+ shared[t, :])
 kernel void moe_combine(const device float* slots [[buffer(0)]],
                         const device float* weights [[buffer(1)]],
                         device float* out [[buffer(2)]],
                         constant MoeCombineParams& p [[buffer(3)]],
+                        const device float* shared [[buffer(4)]],
                         uint gid [[thread_position_in_grid]]) {
   if (int(gid) >= p.count) return;
   const int t = int(gid) / p.cols;
   const int d = int(gid) % p.cols;
-  float total = 0.0f;
+  float total = p.has_shared != 0 ? shared[gid] : 0.0f;
   for (int j = 0; j < p.k; ++j) total += weights[t * p.k + j] * slots[(t * p.k + j) * p.cols + d];
   out[gid] = total;
 }
@@ -681,7 +787,19 @@ struct RopeParams {
   int qk_norm;
   int qkv_bias;
   int v_norm;
+  int rotary;  // dimensions RoPE rotates: head_dim, or fewer for classic partial RoPE (GLM)
 };
+
+// Classic partial RoPE for value j of a normed head in `head`: rotate-half
+// within the first 2 * rh dimensions; the rest pass through.
+inline float rotate_partial(threadgroup const float* head, int j, int rh, int pos, const device float* inv_freq) {
+  if (j >= 2 * rh) return head[j];
+  const int k = j < rh ? j : j - rh;
+  const float angle = float(pos) * inv_freq[k];
+  const float cs = precise::cos(angle);
+  const float sn = precise::sin(angle);
+  return j < rh ? head[j] * cs - head[j + rh] * sn : head[j] * cs + head[j - rh] * sn;
+}
 
 kernel void qk_norm_rope_store(device float* q [[buffer(0)]],
                                const device float* k_in [[buffer(1)]],
@@ -702,6 +820,7 @@ kernel void qk_norm_rope_store(device float* q [[buffer(0)]],
                                uint lane [[thread_index_in_simdgroup]]) {
   // Position builtins must all share one vector width, hence uint2 + .x.
   threadgroup float scratch[32];
+  threadgroup float normed[512];  // one head, for classic partial RoPE
   const uint tid = tid2.x;
   const uint tpg = tpg2.x;
   const int head = int(tgp.x);
@@ -729,11 +848,20 @@ kernel void qk_norm_rope_store(device float* q [[buffer(0)]],
     na = a * inv * (p.offset + nw[i]);
     nb = b * inv * (p.offset + nw[i + half_dim]);
   }
-  const float angle = float(pos) * inv_freq[i];
-  const float cs = precise::cos(angle);
-  const float sn = precise::sin(angle);
-  const float ra = na * cs - nb * sn;
-  const float rb = nb * cs + na * sn;
+  float ra, rb;
+  if (p.rotary == p.head_dim) {
+    const float angle = float(pos) * inv_freq[i];
+    const float cs = precise::cos(angle);
+    const float sn = precise::sin(angle);
+    ra = na * cs - nb * sn;
+    rb = nb * cs + na * sn;
+  } else {  // Uniform across the threadgroup.
+    normed[i] = na;
+    normed[i + half_dim] = nb;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    ra = rotate_partial(normed, i, p.rotary / 2, pos, inv_freq);
+    rb = rotate_partial(normed, i + half_dim, p.rotary / 2, pos, inv_freq);
+  }
   if (is_q) {
     device float* dst = q + (t * p.heads + head) * p.head_dim;
     dst[i] = ra;

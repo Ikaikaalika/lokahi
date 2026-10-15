@@ -65,10 +65,9 @@ std::unique_ptr<Model> load_model(const std::string& directory, const LoadOption
   auto weights = DecoderWeights::load(directory);
   std::string backend = options.backend;
 #if defined(LOKAHI_WITH_METAL)
-  // Metal implements every option but GLM-4.5's router and partial RoPE, and
-  // MXFP4 only for experts, so far.
+  // Metal reads MXFP4 only for experts so far.
   if (backend == "auto") {
-    const bool metal = weights->config.metal_implements() && !weights->dense_mxfp4();
+    const bool metal = !weights->dense_mxfp4();
     backend = metal && metal_available() ? "metal" : "cpu";
   }
   if (backend == "metal") return make_decoder_metal(std::move(weights), options);
