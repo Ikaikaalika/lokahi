@@ -37,6 +37,7 @@ enum class mem_flags { mem_none, mem_device, mem_threadgroup };
 inline void threadgroup_barrier(mem_flags) {}
 template <typename T> T simd_sum(T v) { return v; }
 template <typename T> T simd_max(T v) { return v; }
+template <typename T> T simd_min(T v) { return v; }
 inline uint mulhi(uint a, uint b) { return static_cast<uint>((static_cast<unsigned long long>(a) * b) >> 32); }
 template <typename T> T simd_shuffle_down(T v, ushort) { return v; }
 template <typename T, typename U> T as_type(U v) { T out; std::memcpy(&out, &v, sizeof(T)); return out; }

@@ -317,6 +317,149 @@ kernel void qmv_glu(const device uint* wg [[buffer(0)]],
 }
 
 // ---------------------------------------------------------------------------
+// Mixture of experts. moe_route picks each token's experts from its router
+// logits; qmv_gather_glu and qmv_gather run the chosen experts' projections
+// for every (token, slot) pair, reading the expert index from device memory
+// and offsetting into the stacked [experts, rows, ...] weights; moe_combine
+// sums the slots by their router weights.
+// ---------------------------------------------------------------------------
+
+struct MoeRouteParams {
+  int experts;
+  int k;
+  int topk_softmax;   // 1: softmax over the chosen logits; 0: softmax over all experts
+  int norm_topk;      // with softmax over all experts, renormalize over the chosen
+};
+
+// One simdgroup per token. Ties go to the lower expert index.
+kernel void moe_route(const device float* logits [[buffer(0)]],
+                      device int* chosen [[buffer(1)]],
+                      device float* weights [[buffer(2)]],
+                      constant MoeRouteParams& p [[buffer(3)]],
+                      uint t [[threadgroup_position_in_grid]],
+                      uint lane [[thread_index_in_simdgroup]]) {
+  const device float* l = logits + int(t) * p.experts;
+  float top = -INFINITY;
+  for (int e = int(lane); e < p.experts; e += 32) top = max(top, l[e]);
+  top = simd_max(top);
+  float total = 0.0f;
+  for (int e = int(lane); e < p.experts; e += 32) total += exp(l[e] - top);
+  total = simd_sum(total);
+  // Experts already chosen, as a bit set over up to 256 experts.
+  uint taken[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  float kept = 0.0f;
+  for (int j = 0; j < p.k; ++j) {
+    float best = -INFINITY;
+    int index = 1 << 30;
+    for (int e = int(lane); e < p.experts; e += 32) {
+      const bool used = (taken[e >> 5] >> (e & 31)) & 1u;
+      if (!used && (l[e] > best || (l[e] == best && e < index))) {
+        best = l[e];
+        index = e;
+      }
+    }
+    const float winner = simd_max(best);
+    const int e = simd_min(best == winner ? index : (1 << 30));
+    taken[e >> 5] |= 1u << (e & 31);
+    const float weight = exp(l[e] - top);
+    kept += weight;
+    if (lane == 0) {
+      chosen[int(t) * p.k + j] = e;
+      weights[int(t) * p.k + j] = weight;
+    }
+  }
+  const float scale = (p.topk_softmax != 0 || p.norm_topk != 0) ? 1.0f / kept : 1.0f / total;
+  if (lane == 0) {
+    for (int j = 0; j < p.k; ++j) weights[int(t) * p.k + j] *= scale;
+  }
+}
+
+struct GatherParams {
+  int rows;
+  int cols;
+  int k;            // slots per token
+  int input_rows;   // 1: input row t = pair / k; 0: input row = pair
+  int silu;
+};
+
+// y[pair, :] = act(gate_e(x)) * up_e(x) with e = chosen[pair].
+kernel void qmv_gather_glu(const device uint* wg [[buffer(0)]],
+                           const device ushort* sg_scales [[buffer(1)]],
+                           const device ushort* bg [[buffer(2)]],
+                           const device uint* wu [[buffer(3)]],
+                           const device ushort* su [[buffer(4)]],
+                           const device ushort* bu [[buffer(5)]],
+                           const device float* x [[buffer(6)]],
+                           device float* y [[buffer(7)]],
+                           constant GatherParams& p [[buffer(8)]],
+                           const device int* chosen [[buffer(9)]],
+                           uint2 tg [[threadgroup_position_in_grid]],
+                           uint sg [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+  const int row0 = (int(tg.x) * QMV_SIMDGROUPS + int(sg)) * QMV_ROWS;
+  const int pair = int(tg.y);
+  if (row0 >= p.rows) return;
+  const int e = chosen[pair];
+  const int words = p.rows * (p.cols * QBITS / 32), groups = p.rows * (p.cols / QGROUP);
+  const device float* xr = x + (p.input_rows != 0 ? pair / p.k : pair) * p.cols;
+  float gate[QMV_ROWS] = {0.0f, 0.0f, 0.0f, 0.0f};
+  float up[QMV_ROWS] = {0.0f, 0.0f, 0.0f, 0.0f};
+  qmv_accumulate(wg + e * words, sg_scales + e * groups, bg + e * groups, xr, row0, p.rows, p.cols, lane, gate);
+  qmv_accumulate(wu + e * words, su + e * groups, bu + e * groups, xr, row0, p.rows, p.cols, lane, up);
+  for (int r = 0; r < QMV_ROWS; ++r) {
+    const float g = simd_sum(gate[r]);
+    const float u = simd_sum(up[r]);
+    if (lane == 0 && row0 + r < p.rows) y[pair * p.rows + row0 + r] = glu(g, u, p.silu);
+  }
+}
+
+// y[pair, :] = W_e x[pair or pair / k] with e = chosen[pair].
+kernel void qmv_gather(const device uint* w [[buffer(0)]],
+                       const device ushort* scales [[buffer(1)]],
+                       const device ushort* biases [[buffer(2)]],
+                       const device float* x [[buffer(3)]],
+                       device float* y [[buffer(4)]],
+                       constant GatherParams& p [[buffer(5)]],
+                       const device int* chosen [[buffer(6)]],
+                       uint2 tg [[threadgroup_position_in_grid]],
+                       uint sg [[simdgroup_index_in_threadgroup]],
+                       uint lane [[thread_index_in_simdgroup]]) {
+  const int row0 = (int(tg.x) * QMV_SIMDGROUPS + int(sg)) * QMV_ROWS;
+  const int pair = int(tg.y);
+  if (row0 >= p.rows) return;
+  const int e = chosen[pair];
+  const int words = p.rows * (p.cols * QBITS / 32), groups = p.rows * (p.cols / QGROUP);
+  const device float* xr = x + (p.input_rows != 0 ? pair / p.k : pair) * p.cols;
+  float acc[QMV_ROWS] = {0.0f, 0.0f, 0.0f, 0.0f};
+  qmv_accumulate(w + e * words, scales + e * groups, biases + e * groups, xr, row0, p.rows, p.cols, lane, acc);
+  for (int r = 0; r < QMV_ROWS; ++r) {
+    const float total = simd_sum(acc[r]);
+    if (lane == 0 && row0 + r < p.rows) y[pair * p.rows + row0 + r] = total;
+  }
+}
+
+struct MoeCombineParams {
+  int cols;   // hidden
+  int k;
+  int count;  // n_tokens * hidden
+};
+
+// out[t, :] = sum_j weights[t, j] * slots[t * k + j, :]
+kernel void moe_combine(const device float* slots [[buffer(0)]],
+                        const device float* weights [[buffer(1)]],
+                        device float* out [[buffer(2)]],
+                        constant MoeCombineParams& p [[buffer(3)]],
+                        uint gid [[thread_position_in_grid]]) {
+  if (int(gid) >= p.count) return;
+  const int t = int(gid) / p.cols;
+  const int d = int(gid) % p.cols;
+  float total = 0.0f;
+  for (int j = 0; j < p.k; ++j) total += weights[t * p.k + j] * slots[(t * p.k + j) * p.cols + d];
+  out[gid] = total;
+}
+
+// ---------------------------------------------------------------------------
+// Quantized matrix-matrix product for prefill: Y[n, rows] = X[n, cols] W^T.// ---------------------------------------------------------------------------
 // Quantized matrix-matrix product for prefill: Y[n, rows] = X[n, cols] W^T.
 //
 // 32x32 output tiles, 4 simdgroups each owning a 16x16 quadrant of 8x8

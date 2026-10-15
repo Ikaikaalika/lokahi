@@ -131,10 +131,14 @@ struct DecoderConfig {
   bool shares_kv(int layer) const { return kv_source(layer) != layer; }
   bool k_eq_v(int layer) const { return !layer_k_eq_v.empty() && layer_k_eq_v[static_cast<size_t>(layer)]; }
   bool is_moe(int layer) const { return !layer_moe.empty() && layer_moe[static_cast<size_t>(layer)]; }
-  // What the Metal backend implements: every option but mixture-of-experts
-  // layers and GPT-OSS's attention biases and sinks. (MXFP4 matrices are
-  // refused per matrix.)
-  bool metal_implements() const { return num_experts == 0 && !o_bias && !attention_sinks && rotary_dim == 0; }
+  // What the Metal backend implements: every option but GPT-OSS's and GLM's
+  // routers and attention additions (biases, sinks, classic partial RoPE).
+  // (MXFP4 matrices and expert counts are checked by the backend.)
+  bool metal_implements() const {
+    const bool experts = num_experts == 0 || (router == Router::Softmax && !router_bias && !expert_bias &&
+                                              shared_intermediate == 0);
+    return experts && !o_bias && !attention_sinks && rotary_dim == 0;
+  }
 };
 
 bool is_supported_decoder(const Json& raw);

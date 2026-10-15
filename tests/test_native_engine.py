@@ -121,10 +121,10 @@ DENSE_VARIANTS = {
     # Qwen 3 with long-context YaRN.
     "qwen3-yarn": TinyDenseSpec(model_type="qwen3", head_dim=64, rope_theta=1e6, rope_scaling=QWEN3_YARN, seed=16),
     # Every other layer sparse, top-3 of 6 unnormalized, Transformers'
-    # per-expert tensors, untied.
+    # per-expert tensors, untied (64-wide heads, which Metal covers).
     "qwen3-moe-top3-of-6-per-expert": TinyDenseSpec(
-        model_type="qwen3_moe", num_experts=6, num_experts_per_tok=3, decoder_sparse_step=2, norm_topk_prob=False,
-        stacked_experts=False, tie_word_embeddings=False, seed=10,
+        model_type="qwen3_moe", head_dim=64, num_experts=6, num_experts_per_tok=3, decoder_sparse_step=2,
+        norm_topk_prob=False, stacked_experts=False, tie_word_embeddings=False, seed=10,
     ),
 }
 GEMMA4_VARIANTS = {
@@ -164,7 +164,7 @@ def fixture_model(request, tmp_path_factory):
     return directory, LlamaFamilyReference.load(directory)
 
 
-CPU_ONLY = ("qwen3_moe", "gpt_oss", "glm4_moe")  # the Metal backend refuses these for now
+CPU_ONLY = ("gpt_oss", "glm4_moe")  # the Metal backend refuses these for now
 
 
 def _uses_mxfp4(config: dict) -> bool:
@@ -393,10 +393,11 @@ def test_gemma4_missing_layer_scalar_fails_closed(native_cli, tmp_path):
     assert "layers.3.layer_scalar" in _load_error(native_cli, directory)
 
 
-@pytest.mark.parametrize("architecture", ["qwen3_moe", "llama-mxfp4"])
+@pytest.mark.parametrize("architecture", ["gpt_oss", "glm4_moe", "llama-mxfp4"])
 def test_cpu_only_models_fall_back_to_the_cpu(native_cli, tmp_path, architecture):
-    if architecture == "qwen3_moe":
-        directory = write_tiny_dense(tmp_path / "model", TinyDenseSpec(model_type="qwen3_moe"))
+    if architecture in ("gpt_oss", "glm4_moe"):
+        variant = "gpt-oss-affine-top3" if architecture == "gpt_oss" else "glm4-moe-air"
+        directory = write_tiny_dense(tmp_path / "model", DENSE_VARIANTS[variant])
     else:
         directory = write_tiny_dense(tmp_path / "model", TinyDenseSpec(mxfp4_mlp=True, eight_bit_mlp_layers=()))
     # auto falls back to the CPU backend, which implements every architecture and format.
