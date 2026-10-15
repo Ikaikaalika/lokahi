@@ -71,20 +71,21 @@ class Gemma3Config:
                 raise NotImplementedError(f"rope_scaling type {kind!r}")
         if cfg.get("hidden_activation", "gelu_pytorch_tanh") != "gelu_pytorch_tanh":
             raise NotImplementedError(f"activation {cfg.get('hidden_activation')!r}")
-        head_dim = int(cfg.get("head_dim", 256))
+        # Multimodal checkpoints list only the text fields that differ from
+        # Transformers' Gemma3TextConfig; the rest take its defaults.
         return cls(
-            vocab_size=int(cfg["vocab_size"]),
+            vocab_size=int(cfg.get("vocab_size", 262208)),
             hidden_size=int(cfg["hidden_size"]),
             intermediate_size=int(cfg["intermediate_size"]),
             num_hidden_layers=layers,
-            num_attention_heads=int(cfg["num_attention_heads"]),
-            num_key_value_heads=int(cfg["num_key_value_heads"]),
-            head_dim=head_dim,
+            num_attention_heads=int(cfg.get("num_attention_heads", 8)),
+            num_key_value_heads=int(cfg.get("num_key_value_heads", 4)),
+            head_dim=int(cfg.get("head_dim", 256)),
             rms_norm_eps=float(cfg.get("rms_norm_eps", 1e-6)),
             rope_theta=float(cfg.get("rope_theta", 1_000_000.0)),
             rope_local_base_freq=float(cfg.get("rope_local_base_freq", 10_000.0)),
             rope_linear_factor=factor,
-            query_pre_attn_scalar=float(cfg.get("query_pre_attn_scalar", head_dim)),
+            query_pre_attn_scalar=float(cfg.get("query_pre_attn_scalar", 256)),
             sliding_window=int(cfg.get("sliding_window", 4096)),
             layer_is_sliding=sliding,
             final_logit_softcapping=cfg.get("final_logit_softcapping"),
@@ -187,7 +188,8 @@ class Gemma3Reference:
     def _norm(self, name: str, x: np.ndarray) -> np.ndarray:
         return _rms_norm(x, self.w[name], self.config.rms_norm_eps)
 
-    def _attention(self, index: int, x: np.ndarray, positions: np.ndarray) -> np.ndarray:
+    def _attention(self, index: int, x: np.ndarray, positions: np.ndarray,
+                   blocks: Sequence[tuple[int, int]] = ()) -> np.ndarray:
         cfg = self.config
         prefix = f"model.layers.{index}.self_attn"
         tokens = x.shape[0]
@@ -206,6 +208,15 @@ class Gemma3Reference:
         i = positions[:, None]
         j = positions[None, :]
         allowed = j <= i
+        # Tokens of one image also attend to each other in both directions.
+        # Transformers (create_masks_for_vision_model) ORs the blocks onto the
+        # causal mask and then applies the window: AND(window, OR(causal,
+        # block)). Some 4.5x releases applied the window first instead; the
+        # two agree whenever a block fits the window, as on every published
+        # Gemma 3 (256 image tokens, windows of 512 or more).
+        for begin, end in blocks:
+            inside = (positions >= begin) & (positions < end)
+            allowed |= inside[:, None] & inside[None, :]
         if sliding:
             allowed &= (i - j) < cfg.sliding_window
         scale = cfg.query_pre_attn_scalar ** -0.5
@@ -230,16 +241,24 @@ class Gemma3Reference:
         up = x @ self.w[f"{prefix}.up_proj"].T
         return (gate * up) @ self.w[f"{prefix}.down_proj"].T
 
-    def logits(self, token_ids: Sequence[int]) -> np.ndarray:
-        """Return ``[len(token_ids), vocab]`` float32 logits."""
+    def logits(self, token_ids: Sequence[int], injected: Mapping[int, np.ndarray] | None = None,
+               blocks: Sequence[tuple[int, int]] = ()) -> np.ndarray:
+        """Return ``[len(token_ids), vocab]`` float32 logits.
+
+        ``injected`` maps prompt positions to rows that replace their (scaled)
+        token embeddings, unscaled (image features); ``blocks`` are the
+        ``[begin, end)`` ranges that attend bidirectionally (one per image).
+        """
 
         cfg = self.config
         tokens = np.asarray(token_ids, dtype=np.int64)
         positions = np.arange(tokens.shape[0])
         x = self.w["model.embed_tokens"][tokens] * cfg.embed_scale
+        for position, row in (injected or {}).items():
+            x[position] = row
         for index in range(cfg.num_hidden_layers):
             prefix = f"model.layers.{index}"
-            attn = self._attention(index, self._norm(f"{prefix}.input_layernorm", x), positions)
+            attn = self._attention(index, self._norm(f"{prefix}.input_layernorm", x), positions, blocks)
             x = x + self._norm(f"{prefix}.post_attention_layernorm", attn)
             mlp = self._mlp(index, self._norm(f"{prefix}.pre_feedforward_layernorm", x))
             x = x + self._norm(f"{prefix}.post_feedforward_layernorm", mlp)

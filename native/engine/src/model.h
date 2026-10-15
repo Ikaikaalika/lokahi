@@ -5,6 +5,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "sampling.h"
@@ -46,6 +47,17 @@ class Profiler {
   std::vector<ProfileSection> sections_;
 };
 
+// Rows that replace the scaled token embeddings at some prompt positions
+// (image features, hidden_size wide) and [begin, end) position ranges whose
+// tokens also attend to each other's later positions during prefill (one per
+// image, as Gemma 3's image blocks do). Positions are absolute.
+struct PromptInjection {
+  std::vector<int> positions;
+  std::vector<float> rows;  // [positions.size(), hidden_size]
+  std::vector<std::pair<int, int>> blocks;
+  bool empty() const { return positions.empty() && blocks.empty(); }
+};
+
 class Model {
  public:
   virtual ~Model() = default;
@@ -68,6 +80,11 @@ class Model {
   // Append `n` tokens at the current position. Returns the logits of the last
   // token; the pointer stays valid until the next call.
   virtual const float* prefill(const int32_t* tokens, int n) = 0;
+
+  // Applies `injection` to the next prefill (also the one generate starts
+  // with), whose tokens must cover all of it; reset drops it. Backends that
+  // cannot take one fail closed here.
+  void inject(PromptInjection injection);
   virtual const float* decode(int32_t token) = 0;
 
   // Called with each generated token as it becomes available on the host;
@@ -87,7 +104,10 @@ class Model {
   }
 
  protected:
+  virtual bool accepts_injection() const { return false; }
+
   Profiler* profiler_ = nullptr;
+  PromptInjection injection_;  // pending for the next prefill
 };
 
 int32_t argmax(const float* values, int count);

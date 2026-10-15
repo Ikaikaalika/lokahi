@@ -25,6 +25,7 @@ from lokahi.fixtures import (
 )
 from lokahi.formats.safetensors import read_safetensors
 from lokahi.oracles import Gemma3Reference, Gemma4Reference, LlamaFamilyReference
+from lokahi.oracles.gemma3 import Gemma3Config
 
 TOKENS = [2, 5, 9, 33, 100, 7, 7, 7, 400, 3, 2, 11, 90, 91, 92, 93, 17, 18, 19, 20, 21, 22]
 
@@ -237,6 +238,21 @@ def test_context_overflow_fails_closed(native_cli, tmp_path):
     )
     assert result.returncode != 0
     assert "context length exceeded" in result.stderr
+
+
+def test_oracle_reads_gemma3_multimodal_config_defaults():
+    # mlx-community/gemma-3-4b-it-4bit lists only the text fields that differ
+    # from Transformers' defaults (the engine's side: test_gemma3_config).
+    raw = {
+        "model_type": "gemma3",
+        "text_config": {"hidden_size": 2560, "intermediate_size": 10240, "model_type": "gemma3_text",
+                        "num_hidden_layers": 34, "rope_scaling": {"factor": 8.0, "rope_type": "linear"},
+                        "sliding_window": 1024},
+    }
+    cfg = Gemma3Config.from_dict(raw)
+    assert (cfg.vocab_size, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim) == (262208, 8, 4, 256)
+    assert cfg.query_pre_attn_scalar == 256 and cfg.rope_linear_factor == 8.0 and cfg.sliding_window == 1024
+    assert cfg.layer_is_sliding == tuple(index % 6 != 5 for index in range(34))
 
 
 def test_reports_the_architecture(native_cli, tmp_path):

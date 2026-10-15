@@ -1,9 +1,11 @@
 // lokahi: command-line driver for the native engine.
 //
 //   lokahi info       --model DIR [--backend B]
-//   lokahi logits     --model DIR --tokens 2,5,9 [--prefill N] --out FILE
+//   lokahi logits     --model DIR --tokens 2,5,9 [--prefill N] [--images A.rgb,B.rgb] --out FILE
 //   lokahi generate   --model DIR (--tokens 2,5,9 | --prompt TEXT) --max-new N [--no-eos-stop]
+//                     [--images A.rgb,B.rgb]
 //                     [--temperature T] [--top-p P] [--top-k K] [--min-p M] [--seed S]
+//   lokahi image-features --model DIR --images A.rgb[,B.rgb] --out FILE
 //   lokahi sample     --logits-file F.f32 --vocab V [sampling flags] [--steps N] [--first-step S]
 //                     [--backend cpu|metal]
 //   lokahi bench      --model DIR (--tokens ... | --tokens-file F) --max-new N
@@ -21,6 +23,10 @@
 //
 // `run` streams generated text to stdout and `serve` writes one wire
 // document per line; every other command prints one JSON object on stdout.
+//
+// --images takes raw RGB8 files already resized to the vision tower's image
+// size (image_size * image_size * 3 bytes, rows top to bottom); image i fills
+// the prompt's i-th run of image tokens.
 #include <sys/resource.h>
 
 #include <algorithm>
@@ -46,6 +52,7 @@
 #include "service.h"
 #include "text_stream.h"
 #include "tokenizer.h"
+#include "vision.h"
 #include "wire.h"
 
 #if defined(LOKAHI_WITH_METAL)
@@ -113,6 +120,8 @@ std::vector<int32_t> prompt_tokens(const Args& args) {
 LoadOptions load_options(const Args& args) {
   LoadOptions options;
   options.backend = args.get("backend", "auto");
+  // Only the CPU backend takes image features so far.
+  if (args.has("images") && options.backend == "auto") options.backend = "cpu";
   options.max_context = args.get_int("max-context", 4096);
   options.prefill_chunk = args.get_int("prefill-chunk", 512);
   options.cpu_threads = static_cast<unsigned>(args.get_int("threads", 0));
@@ -181,13 +190,77 @@ double median(std::vector<double> values) {
   return values.size() % 2 ? values[mid] : 0.5 * (values[mid - 1] + values[mid]);
 }
 
+std::vector<std::string> split_list(const std::string& text) {
+  std::vector<std::string> items;
+  std::stringstream in(text);
+  for (std::string item; std::getline(in, item, ',');) {
+    if (!item.empty()) items.push_back(item);
+  }
+  return items;
+}
+
+// Each --images file through the vision tower, in order.
+std::vector<std::vector<float>> encode_images(const Args& args, VisionEncoder& encoder) {
+  const VisionConfig& c = encoder.config();
+  const size_t bytes = static_cast<size_t>(c.image_size) * c.image_size * 3;
+  std::vector<std::vector<float>> features;
+  for (const std::string& path : split_list(args.get("images"))) {
+    std::ifstream in(path, std::ios::binary | std::ios::ate);
+    LK_CHECK(in.good(), "cannot read image " + path);
+    LK_CHECK(static_cast<size_t>(in.tellg()) == bytes,
+             path + " is not a " + std::to_string(c.image_size) + "x" + std::to_string(c.image_size) + " RGB8 image (" +
+                 std::to_string(bytes) + " bytes)");
+    std::vector<uint8_t> rgb(bytes);
+    in.seekg(0);
+    in.read(reinterpret_cast<char*>(rgb.data()), static_cast<std::streamsize>(bytes));
+    features.push_back(encoder.encode(encoder.preprocess(rgb.data()).data()));
+  }
+  LK_CHECK(!features.empty(), "--images names no files");
+  return features;
+}
+
+std::unique_ptr<VisionEncoder> load_vision(const Args& args) {
+  auto encoder = VisionEncoder::load(args.get("model"), static_cast<unsigned>(args.get_int("threads", 0)));
+  LK_CHECK(encoder != nullptr, "this model has no vision tower");
+  return encoder;
+}
+
+// With --images, hands the next prefill of `tokens` their features.
+void inject_images(const Args& args, Model& model, const std::vector<int32_t>& tokens) {
+  if (!args.has("images")) return;
+  auto encoder = load_vision(args);
+  model.inject(place_images(tokens, model.position(), encoder->config(), encode_images(args, *encoder)));
+}
+
+int cmd_image_features(const Args& args) {
+  LK_CHECK(args.has("images") && args.has("out"), "image-features needs --images and --out");
+  auto encoder = load_vision(args);
+  const auto features = encode_images(args, *encoder);
+  std::ofstream out(args.get("out"), std::ios::binary);
+  LK_CHECK(out.good(), "cannot write " + args.get("out"));
+  for (const auto& image : features) {
+    out.write(reinterpret_cast<const char*>(image.data()), static_cast<std::streamsize>(sizeof(float) * image.size()));
+  }
+  std::printf("{\"images\":%zu,\"tokens_per_image\":%d,\"width\":%d}\n", features.size(),
+              encoder->config().tokens_per_image, encoder->config().text_hidden_size);
+  return 0;
+}
+
 int cmd_info(const Args& args) {
   auto model = load_model(args.get("model"), load_options(args));
+  std::string vision;
+  const Json config = Json::parse(read_text_file(args.get("model") + "/config.json"));
+  if (has_vision(config)) {
+    const VisionConfig c = VisionConfig::from_json(config, nullptr);
+    vision = ",\"vision\":{\"image_size\":" + std::to_string(c.image_size) +
+             ",\"tokens_per_image\":" + std::to_string(c.tokens_per_image) +
+             ",\"image_token_id\":" + std::to_string(c.image_token_id) + "}";
+  }
   std::printf(
       "{\"architecture\":\"%s\",\"backend\":\"%s\",\"vocab_size\":%d,\"max_context\":%d,"
-      "\"weight_bytes\":%zu}\n",
+      "\"weight_bytes\":%zu%s}\n",
       model->architecture(), model->backend(), model->vocab_size(), model->max_context(),
-      model->weight_bytes());
+      model->weight_bytes(), vision.c_str());
   return 0;
 }
 
@@ -201,6 +274,7 @@ int cmd_logits(const Args& args) {
   LK_CHECK(out.good(), "cannot write " + args.get("out"));
   const int vocab = model->vocab_size();
   int rows = 0;
+  inject_images(args, *model, std::vector<int32_t>(tokens.begin(), tokens.begin() + prefill));
   const float* logits = model->prefill(tokens.data(), prefill);
   out.write(reinterpret_cast<const char*>(logits), sizeof(float) * vocab);
   ++rows;
@@ -218,6 +292,7 @@ int cmd_generate(const Args& args) {
   auto model = load_model(args.get("model"), load_options(args));
   std::vector<int32_t> tokens = prompt_tokens(args);
   GenerationTiming timing;
+  inject_images(args, *model, tokens);
   auto generated = model->generate(tokens, args.get_int("max-new", 16), sampling_options(args),
                                    !args.has("no-eos-stop"), &timing);
   std::string text;
@@ -749,6 +824,7 @@ int main(int argc, char** argv) {
     if (args.command == "pretokenize") return cmd_pretokenize(args);
     if (args.command == "run") return cmd_run(args);
     if (args.command == "info") return cmd_info(args);
+    if (args.command == "image-features") return cmd_image_features(args);
     if (args.command == "logits") return cmd_logits(args);
     if (args.command == "generate") return cmd_generate(args);
     if (args.command == "sample") return cmd_sample(args);

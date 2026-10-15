@@ -33,6 +33,7 @@ set(LOKAHI_CORE_SOURCES
   src/thread_pool.cpp
   src/tokenizer.cpp
   src/unicode.cpp
+  src/vision.cpp
   src/wire.cpp
 )
 
