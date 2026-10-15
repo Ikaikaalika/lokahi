@@ -2,7 +2,7 @@
 
 The service runs ``write_tiny_chat_model`` (a tiny generated Gemma 3 with a
 byte-level tokenizer and a ChatML chat template), driven through
-`lokahi serve`. Every document it writes must pass the kit's reference verifier
+`lokahi serve` and through the C ABI. Every document it writes must pass the kit's reference verifier
 (``verify_kit.validate_document``) and the per-request stream rules:
 accepted first at sequence 0, sequences increasing, one terminal receipt.
 Outputs are checked against independent references. Prompts are rendered
@@ -15,6 +15,7 @@ only.
 """
 from __future__ import annotations
 
+import ctypes
 import json
 import subprocess
 import sys
@@ -324,3 +325,52 @@ def test_deadline_stops_a_running_request(native_cli, tiny, tmp_path):
     assert receipt["status"] == "failed" and receipt["finish_reason"] == "error"
     assert receipt["failure"]["code"] == "deadline-exceeded"
     assert receipt["failure"]["stage"] in ("running", "partial_output")
+
+
+ENVELOPE = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(ctypes.c_char), ctypes.c_size_t)
+
+
+@pytest.fixture(scope="module")
+def lib(native_cli):
+    name = "liblokahi.dylib" if sys.platform == "darwin" else "liblokahi.so"
+    library = ctypes.CDLL(str(Path(native_cli).parent / name))
+    library.lokahi_last_error.restype = ctypes.c_char_p
+    library.lokahi_service_create.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_void_p)]
+    library.lokahi_service_start.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t, ENVELOPE,
+                                             ctypes.c_void_p]
+    library.lokahi_service_control.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
+    library.lokahi_service_free.argtypes = [ctypes.c_void_p]
+    return library
+
+
+def test_c_abi_service_streams_and_frees_with_receipts(lib, tiny, tmp_path):
+    directory = tiny[0]
+    _, _, text = _expected_greedy(tiny, 16)
+    config = _config(tmp_path / "c.json", directory, text_flush_ms=0).read_bytes()
+    streams = Streams()
+    lock = threading.Lock()
+    done = threading.Event()
+
+    @ENVELOPE
+    def sink(context, data, length):
+        with lock:
+            doc = streams.add(ctypes.string_at(data, length))
+        if doc["message_type"] == "receipt" and doc["request_id"] == "req-abi":
+            done.set()
+
+    service = ctypes.c_void_p()
+    assert lib.lokahi_service_create(config, len(config), ctypes.byref(service)) == 0, lib.lokahi_last_error()
+    try:
+        start = json.dumps(_start("req-abi")).encode()
+        assert lib.lokahi_service_start(service, start, len(start), sink, None) == 0, lib.lokahi_last_error()
+        assert done.wait(60)
+        assert streams.receipt("req-abi")["output_text"] == text
+        bad = b'{"schema_version": 1}'
+        assert lib.lokahi_service_start(service, bad, len(bad), sink, None) != 0
+        assert lib.lokahi_service_control(service, bad, len(bad)) != 0
+        long = json.dumps(_start("req-abi-long", 4000)).encode()
+        assert lib.lokahi_service_start(service, long, len(long), sink, None) == 0
+    finally:
+        lib.lokahi_service_free(service)  # cancels the long request and delivers its receipt first
+    receipt = streams.receipt("req-abi-long")
+    assert receipt["status"] in ("cancelled", "completed")

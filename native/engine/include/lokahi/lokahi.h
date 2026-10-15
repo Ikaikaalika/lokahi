@@ -98,6 +98,36 @@ int lokahi_detokenize(const lokahi_tokenizer* tokenizer, const int32_t* ids, int
                       int32_t skip_special_tokens, char* out_text, size_t capacity,
                       size_t* out_length);
 
+/* The Lōkahi wire v1 service: the Common Compute boundary. Requests are
+ * encoded `start` and `control` documents; the service answers with encoded
+ * `event` and `receipt` documents (integrations/commoncompute/lokahi-wire-v1),
+ * each validated before it is delivered, and exactly one receipt per request.
+ *
+ * config_json is a UTF-8 JSON object:
+ *   {"models": [{"id", "revision", "artifact_digest", "adapter_id"?, "directory"}],
+ *    "backend"?, "max_context"?, "queue_limit"?, "text_flush_ms"?, "runtime_revision"?} */
+typedef struct lokahi_service lokahi_service;
+
+/* Receives one encoded event or receipt: `length` bytes of UTF-8 JSON, not
+ * NUL-terminated. Called on a service thread, one call at a time per request;
+ * it must not call back into the service. */
+typedef void (*lokahi_envelope_fn)(void* context, const char* envelope, size_t length);
+
+int lokahi_service_create(const char* config_json, size_t length, lokahi_service** out_service);
+
+/* Admits a start document. Fails when the document is invalid or its
+ * request_id is still in flight (no receipt can be addressed then); every
+ * other outcome, rejection included, arrives on `sink`. */
+int lokahi_service_start(lokahi_service* service, const char* request, size_t length, lokahi_envelope_fn sink,
+                         void* context);
+
+/* Applies a cancel or drain control document. Cancelling an unknown or
+ * finished request does nothing. */
+int lokahi_service_control(lokahi_service* service, const char* control, size_t length);
+
+/* Cancels outstanding requests, delivers their receipts, and frees the service. */
+void lokahi_service_free(lokahi_service* service);
+
 #ifdef __cplusplus
 }
 #endif

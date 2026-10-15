@@ -5,8 +5,10 @@
 #include <string>
 #include <vector>
 
+#include "json.h"
 #include "lokahi/lokahi.h"
 #include "model.h"
+#include "service.h"
 #include "tokenizer.h"
 
 struct lokahi_model {
@@ -15,6 +17,10 @@ struct lokahi_model {
 
 struct lokahi_tokenizer {
   lokahi::Tokenizer tokenizer;
+};
+
+struct lokahi_service {
+  std::unique_ptr<lokahi::Service> service;
 };
 
 namespace {
@@ -184,5 +190,34 @@ int lokahi_detokenize(const lokahi_tokenizer* tokenizer, const int32_t* ids, int
     std::memcpy(out_text, text.c_str(), text.size() + 1);
   });
 }
+
+int lokahi_service_create(const char* config_json, size_t length, lokahi_service** out_service) {
+  return guarded([&] {
+    if (config_json == nullptr || out_service == nullptr) throw std::invalid_argument("null argument");
+    const lokahi::Json config = lokahi::Json::parse(std::string_view(config_json, length));
+    auto handle = std::make_unique<lokahi_service>();
+    handle->service = std::make_unique<lokahi::Service>(lokahi::ServiceOptions::from_json(config));
+    *out_service = handle.release();
+  });
+}
+
+int lokahi_service_start(lokahi_service* service, const char* request, size_t length, lokahi_envelope_fn sink,
+                         void* context) {
+  return guarded([&] {
+    if (service == nullptr || request == nullptr || sink == nullptr) throw std::invalid_argument("null argument");
+    service->service->start(std::string_view(request, length), [sink, context](const std::string& envelope) {
+      sink(context, envelope.data(), envelope.size());
+    });
+  });
+}
+
+int lokahi_service_control(lokahi_service* service, const char* control, size_t length) {
+  return guarded([&] {
+    if (service == nullptr || control == nullptr) throw std::invalid_argument("null argument");
+    service->service->control(std::string_view(control, length));
+  });
+}
+
+void lokahi_service_free(lokahi_service* service) { delete service; }
 
 }  // extern "C"
