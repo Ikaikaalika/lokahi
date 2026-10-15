@@ -1375,3 +1375,212 @@ kernel void sample_vocab(const device float* logits [[buffer(0)]],
     history[p.history_index] = best_i;
   }
 }
+
+// ---------------------------------------------------------------------------
+// Vision encoder (SigLIP and Gemma 3's projector): dense matrix products,
+// LayerNorm, GELU, row softmax and average pooling. Float32 activations;
+// weights F32, F16 or BF16.
+// ---------------------------------------------------------------------------
+
+// C[m, n] = alpha * A[m, k] B' (+ bias[j]) (+ C[i, j]), where B' is B^T for
+// a B stored [n, k] (TRANS_B) and B for one stored [k, n]. Leading
+// dimensions are in elements.
+struct MmParams {
+  int m;
+  int n;
+  int k;
+  int lda;
+  int ldb;
+  int ldc;
+  float alpha;
+  int has_bias;
+  int accumulate;
+};
+
+struct Bf16 {
+  ushort bits;
+};
+inline float load_value(const device float* p, int i) { return p[i]; }
+inline float load_value(const device half* p, int i) { return float(p[i]); }
+inline float load_value(const device Bf16* p, int i) { return as_type<float>(uint(p[i].bits) << 16); }
+
+// The qmm tiling (32x32 tiles, four simdgroups of 16x16) with bounds checks
+// on every edge, so m, n and k are arbitrary.
+template <typename TB, bool TRANS_B>
+[[kernel]] void dense_mm(const device float* a [[buffer(0)]],
+                         const device TB* b [[buffer(1)]],
+                         device float* c [[buffer(2)]],
+                         constant MmParams& p [[buffer(3)]],
+                         const device float* bias [[buffer(4)]],
+                         uint2 tg [[threadgroup_position_in_grid]],
+                         uint tid [[thread_index_in_threadgroup]],
+                         uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float as[QMM_BM][QMM_BK + QMM_PAD];
+  threadgroup float bs[QMM_BN][QMM_BK + QMM_PAD];
+  threadgroup float out_tile[QMM_BM][QMM_BN + QMM_PAD];
+
+  const int m0 = int(tg.y) * QMM_BM;
+  const int n0 = int(tg.x) * QMM_BN;
+  const int sm = int(sg / 2) * 16;
+  const int sn = int(sg % 2) * 16;
+
+  simdgroup_float8x8 acc[2][2];
+  for (int i = 0; i < 2; ++i)
+    for (int j = 0; j < 2; ++j) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+
+  for (int k0 = 0; k0 < p.k; k0 += QMM_BK) {
+    for (int i = int(tid); i < QMM_BM * QMM_BK; i += 128) {
+      const int r = i / QMM_BK;
+      const int kk = i % QMM_BK;
+      const int row = m0 + r;
+      const int col = k0 + kk;
+      as[r][kk] = row < p.m && col < p.k ? a[row * p.lda + col] : 0.0f;
+    }
+    for (int i = int(tid); i < QMM_BN * QMM_BK; i += 128) {
+      // Consecutive threads read consecutive addresses in either layout.
+      const int r = TRANS_B ? i / QMM_BK : i % QMM_BN;
+      const int kk = TRANS_B ? i % QMM_BK : i / QMM_BN;
+      const int row = n0 + r;
+      const int col = k0 + kk;
+      bs[r][kk] = row < p.n && col < p.k ? load_value(b, TRANS_B ? row * p.ldb + col : col * p.ldb + row) : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int kk = 0; kk < QMM_BK; kk += 8) {
+      simdgroup_float8x8 x[2];
+      simdgroup_float8x8 y[2];
+      for (int i = 0; i < 2; ++i) simdgroup_load(x[i], &as[sm + 8 * i][kk], QMM_BK + QMM_PAD);
+      for (int j = 0; j < 2; ++j)
+        simdgroup_load(y[j], &bs[sn + 8 * j][kk], QMM_BK + QMM_PAD, ulong2(0, 0), true);
+      for (int i = 0; i < 2; ++i)
+        for (int j = 0; j < 2; ++j) simdgroup_multiply_accumulate(acc[i][j], x[i], y[j], acc[i][j]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  for (int i = 0; i < 2; ++i)
+    for (int j = 0; j < 2; ++j)
+      simdgroup_store(acc[i][j], &out_tile[sm + 8 * i][sn + 8 * j], QMM_BN + QMM_PAD);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int i = int(tid); i < QMM_BM * QMM_BN; i += 128) {
+    const int r = i / QMM_BN;
+    const int col = i % QMM_BN;
+    const int row = m0 + r;
+    const int j = n0 + col;
+    if (row >= p.m || j >= p.n) continue;
+    float value = p.alpha * out_tile[r][col];
+    if (p.has_bias != 0) value += bias[j];
+    device float* out = c + row * p.ldc + j;
+    *out = p.accumulate != 0 ? value + *out : value;
+  }
+}
+
+#define LOKAHI_MM(NAME, TB, TRANS_B) \
+  template LOKAHI_INSTANCE_ATTRS(NAME) decltype(dense_mm<TB, TRANS_B>) dense_mm<TB, TRANS_B>;
+LOKAHI_MM("dense_mm_f32_nt", float, true)
+LOKAHI_MM("dense_mm_f16_nt", half, true)
+LOKAHI_MM("dense_mm_bf16_nt", Bf16, true)
+LOKAHI_MM("dense_mm_f32_nn", float, false)
+LOKAHI_MM("dense_mm_f16_nn", half, false)
+LOKAHI_MM("dense_mm_bf16_nn", Bf16, false)
+
+// Threadgroup-wide maximum. `scratch` holds one float per simdgroup.
+inline float threadgroup_max(float value, threadgroup float* scratch, uint sg, uint lane, uint simdgroups) {
+  value = simd_max(value);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (lane == 0) scratch[sg] = value;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float total = -INFINITY;
+  for (uint i = 0; i < simdgroups; ++i) total = max(total, scratch[i]);
+  return total;
+}
+
+struct LayerNormParams {
+  int cols;
+  float eps;
+};
+
+// out = (x - mean) / sqrt(var + eps) * weight + bias. One threadgroup per row.
+kernel void layer_norm_rows(const device float* in [[buffer(0)]],
+                            const device float* weight [[buffer(1)]],
+                            const device float* bias [[buffer(2)]],
+                            device float* out [[buffer(3)]],
+                            constant LayerNormParams& p [[buffer(4)]],
+                            uint row [[threadgroup_position_in_grid]],
+                            uint tid [[thread_position_in_threadgroup]],
+                            uint tpg [[threads_per_threadgroup]],
+                            uint sg [[simdgroup_index_in_threadgroup]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float scratch[32];
+  const device float* x = in + row * p.cols;
+  const uint simdgroups = (tpg + 31) / 32;
+  float sum = 0.0f;
+  for (int i = int(tid); i < p.cols; i += int(tpg)) sum += x[i];
+  const float mean = threadgroup_sum(sum, scratch, sg, lane, simdgroups) / float(p.cols);
+  float squares = 0.0f;
+  for (int i = int(tid); i < p.cols; i += int(tpg)) squares += (x[i] - mean) * (x[i] - mean);
+  const float inv = precise::rsqrt(threadgroup_sum(squares, scratch, sg, lane, simdgroups) / float(p.cols) + p.eps);
+  device float* y = out + row * p.cols;
+  for (int i = int(tid); i < p.cols; i += int(tpg)) y[i] = (x[i] - mean) * inv * weight[i] + bias[i];
+}
+
+// Rows of s become softmax(s). One threadgroup per row.
+kernel void softmax_rows(device float* s [[buffer(0)]],
+                         constant ElementwiseParams& p [[buffer(1)]],
+                         uint row [[threadgroup_position_in_grid]],
+                         uint tid [[thread_position_in_threadgroup]],
+                         uint tpg [[threads_per_threadgroup]],
+                         uint sg [[simdgroup_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float scratch[32];
+  device float* x = s + row * p.count;
+  const uint simdgroups = (tpg + 31) / 32;
+  float m = -INFINITY;
+  for (int i = int(tid); i < p.count; i += int(tpg)) m = max(m, x[i]);
+  m = threadgroup_max(m, scratch, sg, lane, simdgroups);
+  float sum = 0.0f;
+  for (int i = int(tid); i < p.count; i += int(tpg)) {
+    const float e = precise::exp(x[i] - m);
+    x[i] = e;
+    sum += e;
+  }
+  const float inv = 1.0f / threadgroup_sum(sum, scratch, sg, lane, simdgroups);
+  for (int i = int(tid); i < p.count; i += int(tpg)) x[i] *= inv;
+}
+
+kernel void gelu_inplace(device float* x [[buffer(0)]],
+                         constant ElementwiseParams& p [[buffer(1)]],
+                         uint gid [[thread_position_in_grid]]) {
+  if (int(gid) < p.count) x[gid] = gelu_tanh(x[gid]);
+}
+
+kernel void copy_floats(const device float* src [[buffer(0)]],
+                        device float* dst [[buffer(1)]],
+                        constant ElementwiseParams& p [[buffer(2)]],
+                        uint gid [[thread_position_in_grid]]) {
+  if (int(gid) < p.count) dst[gid] = src[gid];
+}
+
+struct PoolParams {
+  int cols;
+  int side;         // patches per side
+  int tokens_side;  // pooled tokens per side
+};
+
+// The patch grid [side * side, cols] averaged over kernel x kernel squares
+// into [tokens_side^2, cols], both row-major.
+kernel void avg_pool_tokens(const device float* in [[buffer(0)]],
+                            device float* out [[buffer(1)]],
+                            constant PoolParams& p [[buffer(2)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+  const int c = int(gid.x);
+  const int token = int(gid.y);
+  if (c >= p.cols || token >= p.tokens_side * p.tokens_side) return;
+  const int kernel_size = p.side / p.tokens_side;
+  const int ty = token / p.tokens_side;
+  const int tx = token % p.tokens_side;
+  float sum = 0.0f;
+  for (int ky = 0; ky < kernel_size; ++ky)
+    for (int kx = 0; kx < kernel_size; ++kx)
+      sum += in[((ty * kernel_size + ky) * p.side + tx * kernel_size + kx) * p.cols + c];
+  out[token * p.cols + c] = sum / float(kernel_size * kernel_size);
+}

@@ -7,6 +7,12 @@
 #include <utility>
 
 #include "common.h"
+#include "thread_pool.h"
+
+#if defined(LOKAHI_WITH_METAL)
+#include "metal/metal_decoder.h"
+#include "metal/metal_vision.h"
+#endif
 
 namespace lokahi {
 
@@ -123,21 +129,24 @@ VisionConfig VisionConfig::from_json(const Json& config, const Json* preprocesso
   return c;
 }
 
-std::unique_ptr<VisionEncoder> VisionEncoder::load(const std::string& directory, unsigned threads) {
+int VisionConfig::tokens_per_side() const {
+  return static_cast<int>(std::lround(std::sqrt(static_cast<double>(tokens_per_image))));
+}
+
+std::shared_ptr<VisionWeights> VisionWeights::load(const std::string& directory) {
   const Json config = Json::parse(read_text_file(directory + "/config.json"));
   if (!has_vision(config)) return nullptr;
   Json preprocessor;
   const std::string preprocessor_path = directory + "/preprocessor_config.json";
   const bool has_preprocessor = std::ifstream(preprocessor_path, std::ios::binary).good();
   if (has_preprocessor) preprocessor = Json::parse(read_text_file(preprocessor_path));
-  std::unique_ptr<VisionEncoder> e(
-      new VisionEncoder(VisionConfig::from_json(config, has_preprocessor ? &preprocessor : nullptr), threads));
-  const VisionConfig& c = e->c_;
-  e->checkpoint_ = std::make_shared<Checkpoint>(Checkpoint::open_directory(directory));
-  const Checkpoint& ck = *e->checkpoint_;
+  auto w = std::make_shared<VisionWeights>();
+  w->config = VisionConfig::from_json(config, has_preprocessor ? &preprocessor : nullptr);
+  const VisionConfig& c = w->config;
+  w->checkpoint = std::make_shared<Checkpoint>(Checkpoint::open_directory(directory));
+  const Checkpoint& ck = *w->checkpoint;
   const std::string tower = kTower;
   const int64_t hidden = c.hidden_size, inter = c.intermediate_size, P = c.patch_size;
-  const int64_t patches = static_cast<int64_t>(c.patches_per_side()) * c.patches_per_side();
   auto linear = [&](const std::string& module, int64_t rows, int64_t cols) {
     Linear out = bind_linear(ck, config, module, module);
     LK_CHECK(out.rows == rows && out.cols == cols, module + ": unexpected shape");
@@ -150,28 +159,27 @@ std::unique_ptr<VisionEncoder> VisionEncoder::load(const std::string& directory,
   const TensorView& conv = ck.get(conv_name);
   std::vector<float> raw = vector_of(ck, conv_name, hidden * P * P * 3);
   if (conv.shape == std::vector<int64_t>{hidden, P, P, 3}) {
-    e->patch_weight_ = std::move(raw);
+    w->patch_weight = std::move(raw);
   } else {
     LK_CHECK(conv.shape == (std::vector<int64_t>{hidden, 3, P, P}), conv_name + ": unexpected shape");
-    e->patch_weight_.resize(raw.size());
+    w->patch_weight.resize(raw.size());
     for (int64_t o = 0; o < hidden; ++o) {
       for (int64_t ch = 0; ch < 3; ++ch) {
         for (int64_t ky = 0; ky < P; ++ky) {
           for (int64_t kx = 0; kx < P; ++kx) {
-            e->patch_weight_[static_cast<size_t>(((o * P + ky) * P + kx) * 3 + ch)] =
+            w->patch_weight[static_cast<size_t>(((o * P + ky) * P + kx) * 3 + ch)] =
                 raw[static_cast<size_t>(((o * 3 + ch) * P + ky) * P + kx)];
           }
         }
       }
     }
   }
-  e->patch_ = dense_view(conv_name, e->patch_weight_, hidden, P * P * 3);
-  e->patch_bias_ = vector_of(ck, tower + ".embeddings.patch_embedding.bias", hidden);
-  e->positions_ = vector_of(ck, tower + ".embeddings.position_embedding.weight", patches * hidden);
+  w->patch_bias = vector_of(ck, tower + ".embeddings.patch_embedding.bias", hidden);
+  w->positions = vector_of(ck, tower + ".embeddings.position_embedding.weight", c.patches() * hidden);
 
   for (int l = 0; l < c.num_layers; ++l) {
     const std::string base = tower + ".encoder.layers." + std::to_string(l);
-    Layer L;
+    VisionWeights::Layer L;
     L.ln1_weight = vector_of(ck, base + ".layer_norm1.weight", hidden);
     L.ln1_bias = vector_of(ck, base + ".layer_norm1.bias", hidden);
     L.ln2_weight = vector_of(ck, base + ".layer_norm2.weight", hidden);
@@ -188,54 +196,59 @@ std::unique_ptr<VisionEncoder> VisionEncoder::load(const std::string& directory,
     L.fc1_bias = vector_of(ck, base + ".mlp.fc1.bias", inter);
     L.fc2 = linear(base + ".mlp.fc2", hidden, inter);
     L.fc2_bias = vector_of(ck, base + ".mlp.fc2.bias", hidden);
-    e->layers_.push_back(std::move(L));
+    w->layers.push_back(std::move(L));
   }
-  e->post_weight_ = vector_of(ck, tower + ".post_layernorm.weight", hidden);
-  e->post_bias_ = vector_of(ck, tower + ".post_layernorm.bias", hidden);
-  e->soft_norm_ = vector_of(ck, "multi_modal_projector.mm_soft_emb_norm.weight", hidden);
-
-  // The projection is [hidden, text_hidden] (features times it); transposed
-  // here so it runs as an ordinary [rows = text_hidden, cols = hidden] Linear.
+  w->post_weight = vector_of(ck, tower + ".post_layernorm.weight", hidden);
+  w->post_bias = vector_of(ck, tower + ".post_layernorm.bias", hidden);
+  w->soft_norm = vector_of(ck, "multi_modal_projector.mm_soft_emb_norm.weight", hidden);
   const std::string projection_name = "multi_modal_projector.mm_input_projection_weight";
-  const int64_t text_hidden = c.text_hidden_size;
-  LK_CHECK(ck.get(projection_name).shape == (std::vector<int64_t>{hidden, text_hidden}),
+  w->projection = &ck.get(projection_name);
+  LK_CHECK(w->projection->shape == (std::vector<int64_t>{hidden, c.text_hidden_size}),
            projection_name + ": unexpected shape");
-  const std::vector<float> projection = vector_of(ck, projection_name, hidden * text_hidden);
-  e->projection_weight_.resize(projection.size());
-  for (int64_t i = 0; i < hidden; ++i) {
-    for (int64_t j = 0; j < text_hidden; ++j) {
-      e->projection_weight_[static_cast<size_t>(j * hidden + i)] = projection[static_cast<size_t>(i * text_hidden + j)];
-    }
-  }
-  e->projection_ = dense_view(projection_name, e->projection_weight_, text_hidden, hidden);
-  return e;
+  const DType dtype = w->projection->dtype;
+  LK_CHECK(dtype == DType::F32 || dtype == DType::BF16 || dtype == DType::F16,
+           projection_name + ": unsupported dtype");
+  return w;
+}
+
+std::unique_ptr<VisionEncoder> VisionEncoder::load(const std::string& directory, const std::string& requested,
+                                                   unsigned threads) {
+  auto weights = VisionWeights::load(directory);
+  if (weights == nullptr) return nullptr;
+  std::string backend = requested;
+#if defined(LOKAHI_WITH_METAL)
+  if (backend == "auto") backend = metal_vision_supports(*weights) && metal_available() ? "metal" : "cpu";
+  if (backend == "metal") return make_vision_metal(std::move(weights));
+#else
+  if (backend == "auto") backend = "cpu";
+  LK_CHECK(backend != "metal", "this build has no Metal backend");
+#endif
+  LK_CHECK(backend == "cpu", "unknown backend '" + backend + "'");
+  return make_vision_cpu(std::move(weights), threads);
 }
 
 std::vector<float> VisionEncoder::preprocess(const uint8_t* rgb) const {
-  const size_t S = static_cast<size_t>(c_.image_size);
+  const VisionConfig& c = config();
+  const size_t S = static_cast<size_t>(c.image_size);
   std::vector<float> out(3 * S * S);
   for (size_t y = 0; y < S; ++y) {
     for (size_t x = 0; x < S; ++x) {
       for (size_t ch = 0; ch < 3; ++ch) {
-        const float value = static_cast<float>(rgb[(y * S + x) * 3 + ch]) * c_.rescale;
-        out[(ch * S + y) * S + x] = (value - c_.mean[ch]) / c_.std[ch];
+        const float value = static_cast<float>(rgb[(y * S + x) * 3 + ch]) * c.rescale;
+        out[(ch * S + y) * S + x] = (value - c.mean[ch]) / c.std[ch];
       }
     }
   }
   return out;
 }
 
-std::vector<float> VisionEncoder::encode(const float* pixels) {
-  const int64_t S = c_.image_size, P = c_.patch_size, side = c_.patches_per_side();
-  const int64_t N = side * side, hidden = c_.hidden_size, inter = c_.intermediate_size;
-  const int64_t heads = c_.num_heads, D = hidden / heads, width = P * P * 3;
-  const size_t sn = static_cast<size_t>(N);
-
-  // Patches flattened as (row, column, channel), the convolution's layout.
-  std::vector<float> patches(sn * width);
+std::vector<float> VisionEncoder::patches(const float* pixels) const {
+  const VisionConfig& c = config();
+  const int64_t S = c.image_size, P = c.patch_size, side = c.patches_per_side(), width = P * P * 3;
+  std::vector<float> out(static_cast<size_t>(side * side * width));
   for (int64_t gy = 0; gy < side; ++gy) {
     for (int64_t gx = 0; gx < side; ++gx) {
-      float* row = patches.data() + (gy * side + gx) * width;
+      float* row = out.data() + (gy * side + gx) * width;
       for (int64_t ky = 0; ky < P; ++ky) {
         for (int64_t kx = 0; kx < P; ++kx) {
           for (int64_t ch = 0; ch < 3; ++ch) row[(ky * P + kx) * 3 + ch] = pixels[(ch * S + gy * P + ky) * S + gx * P + kx];
@@ -243,16 +256,59 @@ std::vector<float> VisionEncoder::encode(const float* pixels) {
       }
     }
   }
+  return out;
+}
+
+namespace {
+
+class VisionCpu final : public VisionEncoder {
+ public:
+  VisionCpu(std::shared_ptr<const VisionWeights> weights, unsigned threads)
+      : VisionEncoder(std::move(weights)), pool_(threads) {
+    const VisionConfig& c = config();
+    const int64_t hidden = c.hidden_size, text_hidden = c.text_hidden_size;
+    patch_ = dense_view("patch_embedding", weights_->patch_weight, hidden, c.patch_size * c.patch_size * 3);
+    // The projection is [hidden, text_hidden] (features times it); transposed
+    // here so it runs as an ordinary [rows = text_hidden, cols = hidden] Linear.
+    const std::vector<float> projection =
+        vector_of(*weights_->checkpoint, "multi_modal_projector.mm_input_projection_weight", hidden * text_hidden);
+    projection_weight_.resize(projection.size());
+    for (int64_t i = 0; i < hidden; ++i) {
+      for (int64_t j = 0; j < text_hidden; ++j) {
+        projection_weight_[static_cast<size_t>(j * hidden + i)] = projection[static_cast<size_t>(i * text_hidden + j)];
+      }
+    }
+    projection_ = dense_view("mm_input_projection_weight", projection_weight_, text_hidden, hidden);
+  }
+
+  const char* backend() const override { return "cpu"; }
+  std::vector<float> encode(const float* pixels) override;
+
+ private:
+  ThreadPool pool_;
+  std::vector<float> projection_weight_;
+  Linear patch_, projection_;
+};
+
+std::vector<float> VisionCpu::encode(const float* pixels) {
+  const VisionConfig& c = config();
+  const VisionWeights& w = *weights_;
+  const int64_t side = c.patches_per_side();
+  const int64_t N = side * side, hidden = c.hidden_size, inter = c.intermediate_size;
+  const int64_t heads = c.num_heads, D = hidden / heads;
+  const size_t sn = static_cast<size_t>(N);
+
+  const std::vector<float> patch_rows = patches(pixels);
   std::vector<float> x(sn * hidden), h(sn * hidden), q(sn * hidden), k(sn * hidden), v(sn * hidden),
       attn(sn * hidden), r(sn * hidden), f(sn * inter);
-  matmul(patch_, patches.data(), N, x.data(), pool_);
-  add_rows(x.data(), patch_bias_, N);
-  for (size_t i = 0; i < x.size(); ++i) x[i] += positions_[i];
+  matmul(patch_, patch_rows.data(), N, x.data(), pool_);
+  add_rows(x.data(), w.patch_bias, N);
+  for (size_t i = 0; i < x.size(); ++i) x[i] += w.positions[i];
 
   const float scale = 1.0f / std::sqrt(static_cast<float>(D));
-  for (const Layer& L : layers_) {
+  for (const VisionWeights::Layer& L : w.layers) {
     for (int64_t t = 0; t < N; ++t) {
-      layer_norm(x.data() + t * hidden, L.ln1_weight, L.ln1_bias, hidden, c_.layer_norm_eps, h.data() + t * hidden);
+      layer_norm(x.data() + t * hidden, L.ln1_weight, L.ln1_bias, hidden, c.layer_norm_eps, h.data() + t * hidden);
     }
     matmul(L.q_proj, h.data(), N, q.data(), pool_);
     matmul(L.k_proj, h.data(), N, k.data(), pool_);
@@ -292,7 +348,7 @@ std::vector<float> VisionEncoder::encode(const float* pixels) {
     add_rows(r.data(), L.out_bias, N);
     for (size_t i = 0; i < x.size(); ++i) x[i] += r[i];
     for (int64_t t = 0; t < N; ++t) {
-      layer_norm(x.data() + t * hidden, L.ln2_weight, L.ln2_bias, hidden, c_.layer_norm_eps, h.data() + t * hidden);
+      layer_norm(x.data() + t * hidden, L.ln2_weight, L.ln2_bias, hidden, c.layer_norm_eps, h.data() + t * hidden);
     }
     matmul(L.fc1, h.data(), N, f.data(), pool_);
     add_rows(f.data(), L.fc1_bias, N);
@@ -302,13 +358,13 @@ std::vector<float> VisionEncoder::encode(const float* pixels) {
     for (size_t i = 0; i < x.size(); ++i) x[i] += r[i];
   }
   for (int64_t t = 0; t < N; ++t) {
-    layer_norm(x.data() + t * hidden, post_weight_, post_bias_, hidden, c_.layer_norm_eps, h.data() + t * hidden);
+    layer_norm(x.data() + t * hidden, w.post_weight, w.post_bias, hidden, c.layer_norm_eps, h.data() + t * hidden);
   }
 
   // Average-pool the patch grid to tokens_per_image tokens (row-major), then
   // Gemma's RMSNorm (1 + weight) and the projection into the text width.
-  const int64_t T = c_.tokens_per_image;
-  const int64_t tokens_side = static_cast<int64_t>(std::lround(std::sqrt(static_cast<double>(T))));
+  const int64_t T = c.tokens_per_image;
+  const int64_t tokens_side = c.tokens_per_side();
   const int64_t kernel = side / tokens_side;
   std::vector<float> pooled(static_cast<size_t>(T * hidden), 0.0f);
   const float inv_area = 1.0f / static_cast<float>(kernel * kernel);
@@ -324,13 +380,19 @@ std::vector<float> VisionEncoder::encode(const float* pixels) {
       }
       double squares = 0.0;
       for (int64_t i = 0; i < hidden; ++i) squares += static_cast<double>(out[i]) * out[i];
-      const float inv = static_cast<float>(1.0 / std::sqrt(squares / static_cast<double>(hidden) + c_.layer_norm_eps));
-      for (int64_t i = 0; i < hidden; ++i) out[i] = out[i] * inv * (1.0f + soft_norm_[static_cast<size_t>(i)]);
+      const float inv = static_cast<float>(1.0 / std::sqrt(squares / static_cast<double>(hidden) + c.layer_norm_eps));
+      for (int64_t i = 0; i < hidden; ++i) out[i] = out[i] * inv * (1.0f + w.soft_norm[static_cast<size_t>(i)]);
     }
   }
-  std::vector<float> features(static_cast<size_t>(T * c_.text_hidden_size));
+  std::vector<float> features(static_cast<size_t>(T * c.text_hidden_size));
   matmul(projection_, pooled.data(), T, features.data(), pool_);
   return features;
+}
+
+}  // namespace
+
+std::unique_ptr<VisionEncoder> make_vision_cpu(std::shared_ptr<const VisionWeights> weights, unsigned threads) {
+  return std::make_unique<VisionCpu>(std::move(weights), threads);
 }
 
 PromptInjection place_images(const std::vector<int32_t>& tokens, int start, const VisionConfig& config,

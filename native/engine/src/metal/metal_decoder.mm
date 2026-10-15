@@ -22,9 +22,9 @@
 
 #include "common.h"
 #include "decoder_kernels_source.h"
+#include "metal/metal_common.h"
 
 namespace lokahi {
-namespace {
 
 std::string ns_error(NSError* error) {
   return error ? std::string([[error localizedDescription] UTF8String]) : std::string("unknown error");
@@ -38,6 +38,8 @@ id<MTLLibrary> compile_kernels(id<MTLDevice> device) {
   LK_CHECK(library != nil, "metal: kernel compilation failed: " + ns_error(error));
   return library;
 }
+
+namespace {
 
 struct BufRef {
   id<MTLBuffer> buffer = nil;

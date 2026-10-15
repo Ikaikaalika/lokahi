@@ -140,14 +140,37 @@ def vlm(request, tmp_path_factory):
     return directory, Gemma3VisionReference.load(directory), images, _image_files(directory, images)
 
 
-def test_image_features_match_oracle(native_cli, vlm, tmp_path):
+@pytest.mark.parametrize("backend", _backends())
+def test_image_features_match_oracle(native_cli, vlm, backend, tmp_path):
     directory, oracle, images, files = vlm
     out = tmp_path / "features.bin"
-    report = _run(native_cli, "image-features", "--model", str(directory), "--images", files, "--out", str(out))
-    assert report == {"images": 2, "tokens_per_image": SPEC.mm_tokens_per_image, "width": SPEC.text.hidden_size}
+    report = _run(native_cli, "image-features", "--model", str(directory), "--backend", backend,
+                  "--images", files, "--out", str(out))
+    assert report == {"backend": backend, "images": 2, "tokens_per_image": SPEC.mm_tokens_per_image,
+                      "width": SPEC.text.hidden_size}
     got = np.fromfile(out, dtype=np.float32).reshape(2, SPEC.mm_tokens_per_image, SPEC.text.hidden_size)
     expected = np.stack([oracle.encode(preprocess(image)) for image in images])
-    np.testing.assert_allclose(got, expected, atol=1e-5 * np.abs(expected).max(), rtol=0)
+    tolerance = 1e-5 if backend == "cpu" else 1e-3
+    np.testing.assert_allclose(got, expected, atol=tolerance * np.abs(expected).max(), rtol=0)
+
+
+# 64 patches pooled to 16 tokens: matrix products span several 32-row tiles.
+WIDE = replace(SPEC, image_size=112, mm_tokens_per_image=16, seed=102)
+
+
+@pytest.mark.parametrize("backend", _backends())
+def test_image_features_match_oracle_across_tiles(native_cli, backend, tmp_path):
+    directory = write_tiny_gemma3_vision(tmp_path / "wide", WIDE)
+    oracle = Gemma3VisionReference.load(directory)
+    rng = np.random.default_rng(5)
+    image = rng.integers(0, 256, (WIDE.image_size, WIDE.image_size, 3), dtype=np.uint8)
+    out = tmp_path / "features.bin"
+    _run(native_cli, "image-features", "--model", str(directory), "--backend", backend,
+         "--images", _image_files(tmp_path, [image]), "--out", str(out))
+    got = np.fromfile(out, dtype=np.float32).reshape(WIDE.mm_tokens_per_image, WIDE.text.hidden_size)
+    expected = oracle.encode(preprocess(image))
+    tolerance = 1e-5 if backend == "cpu" else 1e-3
+    np.testing.assert_allclose(got, expected, atol=tolerance * np.abs(expected).max(), rtol=0)
 
 
 # Chunks of 5 and 4 would cut an image block (positions 4-7 and 13-16); the
