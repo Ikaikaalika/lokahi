@@ -164,7 +164,7 @@ def fixture_model(request, tmp_path_factory):
     return directory, LlamaFamilyReference.load(directory)
 
 
-CPU_ONLY = ("glm4_moe",)  # the Metal backend refuses these for now
+CPU_ONLY: tuple[str, ...] = ()  # architectures the Metal backend refuses (none today)
 
 
 def _dense_mxfp4(config: dict) -> bool:
@@ -396,12 +396,9 @@ def test_gemma4_missing_layer_scalar_fails_closed(native_cli, tmp_path):
     assert "layers.3.layer_scalar" in _load_error(native_cli, directory)
 
 
-@pytest.mark.parametrize("architecture", ["glm4_moe", "llama-mxfp4"])
+@pytest.mark.parametrize("architecture", ["llama-mxfp4"])
 def test_cpu_only_models_fall_back_to_the_cpu(native_cli, tmp_path, architecture):
-    if architecture == "glm4_moe":
-        directory = write_tiny_dense(tmp_path / "model", DENSE_VARIANTS["glm4-moe-air"])
-    else:
-        directory = write_tiny_dense(tmp_path / "model", TinyDenseSpec(mxfp4_mlp=True, eight_bit_mlp_layers=()))
+    directory = write_tiny_dense(tmp_path / "model", TinyDenseSpec(mxfp4_mlp=True, eight_bit_mlp_layers=()))
     # auto falls back to the CPU backend, which implements every architecture and format.
     info = _run(native_cli, "info", "--model", str(directory), "--backend", "auto")
     assert (info["architecture"], info["backend"]) == (architecture.split("-")[0], "cpu")

@@ -6,8 +6,8 @@
 // scaling and partial rotation, sliding windows, logit soft-capping, and
 // Gemma 4's per-layer geometry, KV sharing and per-layer inputs, and
 // mixture-of-experts layers), so a family
-// is a config parser rather than a fork. Backends that lack a feature refuse
-// the config (see metal_implements()).
+// is a config parser rather than a fork. Both backends implement every
+// option; the Metal backend refuses only matrix formats its kernels lack.
 #pragma once
 
 #include <memory>
@@ -131,12 +131,6 @@ struct DecoderConfig {
   bool shares_kv(int layer) const { return kv_source(layer) != layer; }
   bool k_eq_v(int layer) const { return !layer_k_eq_v.empty() && layer_k_eq_v[static_cast<size_t>(layer)]; }
   bool is_moe(int layer) const { return !layer_moe.empty() && layer_moe[static_cast<size_t>(layer)]; }
-  // What the Metal backend implements: every option but GLM-4.5's grouped
-  // sigmoid router, shared experts and classic partial RoPE. (MXFP4 outside
-  // experts and expert counts are checked by the backend.)
-  bool metal_implements() const {
-    return router != Router::SigmoidGrouped && shared_intermediate == 0 && rotary_dim == 0;
-  }
 };
 
 bool is_supported_decoder(const Json& raw);

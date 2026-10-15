@@ -495,7 +495,7 @@ static const char* kGemma4E2BConfig = R"({
 
 void test_gemma4_config() {
   const DecoderConfig c = DecoderConfig::from_json(Json::parse(kGemma4E2BConfig));
-  EXPECT(c.architecture == "gemma4" && c.num_layers == 35 && c.metal_implements());
+  EXPECT(c.architecture == "gemma4" && c.num_layers == 35);
   EXPECT(c.per_layer_embed_scale == 16.0f && c.per_layer_input_scale == 0.70703125f);  // BF16-rounded 2^-0.5
   EXPECT(c.eos_token_ids == std::vector<int32_t>({1, 106, 50}));
   EXPECT(c.embed_scale == 39.25f);  // sqrt(1536) rounded to BF16
@@ -559,7 +559,7 @@ void test_gpt_oss_config() {
   EXPECT(c.architecture == "gpt_oss" && c.num_layers == 24 && c.num_experts == 32 && c.experts_per_token == 4);
   EXPECT(c.moe_intermediate == 2880 && c.sliding_window == 128 && c.qkv_bias && c.o_bias && c.attention_sinks);
   EXPECT(c.router == DecoderConfig::Router::TopKSoftmax && c.router_module == "mlp.router" && c.expert_bias);
-  EXPECT(c.activation == Activation::ClampedSwiglu && c.swiglu_limit == 7.0f && c.metal_implements());
+  EXPECT(c.activation == Activation::ClampedSwiglu && c.swiglu_limit == 7.0f);
   for (int l = 0; l < 24; ++l) EXPECT(c.layer_is_sliding[static_cast<size_t>(l)] == (l % 2 == 0) && c.is_moe(l));
   EXPECT(c.eos_token_ids == std::vector<int32_t>({200002}));
   // YaRN's attention factor 0.1 ln 32 + 1, squared into the logit scale.
@@ -598,7 +598,7 @@ void test_glm_config() {
   EXPECT(c.architecture == "glm4_moe" && c.num_layers == 46 && c.num_experts == 128 && c.experts_per_token == 8);
   EXPECT(c.router == DecoderConfig::Router::SigmoidGrouped && c.n_group == 1 && c.routed_scaling == 1.0f);
   EXPECT(c.shared_intermediate == 1408 && c.moe_intermediate == 1408 && c.norm_topk_prob);
-  EXPECT(c.qkv_bias && !c.o_bias && !c.qk_norm && c.rotary_dim == 64 && !c.metal_implements());
+  EXPECT(c.qkv_bias && !c.o_bias && !c.qk_norm && c.rotary_dim == 64);
   EXPECT(!c.is_moe(0) && c.is_moe(1) && c.is_moe(45) && c.intermediate_size == 10944);
   EXPECT(c.eos_token_ids == std::vector<int32_t>({151329, 151336, 151338}));
   // RoPE over the first 64 of 128 dimensions, exponents over 64.

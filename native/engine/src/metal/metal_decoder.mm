@@ -77,9 +77,19 @@ struct GpuExperts {
   }
 };
 
+// A dense matrix (GLM's unquantized router): dtype 0 F32, 1 BF16, 2 F16.
+struct GpuDense {
+  BufRef data;
+  int rows = 0, cols = 0, dtype = 0;
+};
+
 struct GpuLayer {
   GpuLinear q, k, v, o, gate, up, down;
   GpuLinear router;                          // mixture-of-experts layers
+  GpuDense dense_router;                     // when the router is not quantized
+  bool router_dense = false;
+  GpuLinear shared_gate, shared_up, shared_down;  // GLM's shared expert
+  BufRef router_correction;                  // GLM's selection bias, or the placeholder
   GpuExperts expert_gate, expert_up, expert_down;
   bool moe = false;
   BufRef o_bias, sinks, router_bias;          // GPT-OSS, or the placeholder
@@ -163,13 +173,15 @@ struct ElementwiseParams { int count; };
 struct GluMulParams { int count; int silu; };
 struct RopeParams {
   int heads; int kv_heads; int head_dim; int start_pos; int capacity; float eps; float offset; int qk_norm;
-  int qkv_bias; int v_norm;
+  int qkv_bias; int v_norm; int rotary;
 };
 struct PerLayerCombineParams { int size; int layers; float eps; float offset; float proj_scale; float input_scale; };
 struct PerLayerGateParams { int size; int layers; int layer; int count; };
 struct MoeRouteParams { int experts; int k; int topk_softmax; int norm_topk; int has_bias; };
 struct GatherParams { int rows; int cols; int k; int input_rows; int act; int has_bias; float limit; };
-struct MoeCombineParams { int cols; int k; int count; };
+struct MoeCombineParams { int cols; int k; int count; int has_shared; };
+struct MoeGroupedParams { int experts; int k; int groups; int topk_groups; int norm_topk; float scaling; };
+struct DenseParams { int rows; int cols; int dtype; };
 struct AttnParams {
   int heads; int kv_heads; int head_dim; int start_pos; int window; int capacity; int block; int n_blocks;
   float scale; float softcap;
@@ -334,7 +346,16 @@ class DecoderMetal final : public Model {
       const DecoderLayer& L = w_->layers[static_cast<size_t>(i)];
       for (const Linear* l : {&L.q_proj, &L.o_proj}) check(*l);
       if (c_.is_moe(i)) {
-        check(L.router);
+        if (L.router.quant.quantized()) {
+          check(L.router);
+        } else {
+          LK_CHECK(L.router.dense_dtype == DType::F32 || L.router.dense_dtype == DType::BF16 ||
+                       L.router.dense_dtype == DType::F16,
+                   "metal: " + L.router.name + " has an unsupported dense dtype");
+        }
+        if (c_.shared_intermediate > 0) {
+          for (const Linear* l : {&L.shared_gate, &L.shared_up, &L.shared_down}) check(*l);
+        }
         for (const auto* experts : {&L.expert_gate, &L.expert_up, &L.expert_down}) {
           for (const Linear& e : *experts) check_any(e);
         }
@@ -460,12 +481,27 @@ class DecoderMetal final : public Model {
       G.o = add_linear(arena, L.o_proj, linear_fix, &G.o);
       G.moe = c_.is_moe(layer);
       if (G.moe) {
-        G.router = add_linear(arena, L.router, linear_fix, &G.router);
+        G.router_dense = !L.router.quant.quantized();
+        if (G.router_dense) {
+          G.dense_router.rows = static_cast<int>(L.router.rows);
+          G.dense_router.cols = static_cast<int>(L.router.cols);
+          G.dense_router.dtype = L.router.dense_dtype == DType::BF16 ? 1 : L.router.dense_dtype == DType::F16 ? 2 : 0;
+          const size_t bytes = static_cast<size_t>(L.router.rows * L.router.cols) * dtype_size(L.router.dense_dtype);
+          dense_fix_.push_back({&G.dense_router.data, arena.add(L.router.dense, bytes)});
+        } else {
+          G.router = add_linear(arena, L.router, linear_fix, &G.router);
+        }
+        if (c_.shared_intermediate > 0) {
+          G.shared_gate = add_linear(arena, L.shared_gate, linear_fix, &G.shared_gate);
+          G.shared_up = add_linear(arena, L.shared_up, linear_fix, &G.shared_up);
+          G.shared_down = add_linear(arena, L.shared_down, linear_fix, &G.shared_down);
+        }
         add_experts(arena, L.expert_gate, &G.expert_gate);
         add_experts(arena, L.expert_up, &G.expert_up);
         add_experts(arena, L.expert_down, &G.expert_down);
       }
       add_optional(L.router_bias, &G.router_bias);
+      add_optional(L.router_correction, &G.router_correction);
       add_optional(L.expert_gate_bias, &G.expert_gate.bias);
       add_optional(L.expert_up_bias, &G.expert_up.bias);
       add_optional(L.expert_down_bias, &G.expert_down.bias);
@@ -499,6 +535,8 @@ class DecoderMetal final : public Model {
       target->biases = arena.get(ids[2]);
     }
     expert_fix_.clear();
+    for (auto& [target, id] : dense_fix_) *target = arena.get(id);
+    dense_fix_.clear();
     for (auto& [target, ids] : linear_fix) {
       target->words = arena.get(ids[0]);
       target->scales = arena.get(ids[1]);
@@ -553,8 +591,10 @@ class DecoderMetal final : public Model {
     kt_ = private_buffer(chunk * static_cast<size_t>(max_kv_width_) * f);
     vt_ = private_buffer(chunk * static_cast<size_t>(max_kv_width_) * f);
     attn_ = private_buffer(chunk * H * D * f);
-    gate_ = private_buffer(chunk * static_cast<size_t>(max_inter_) * f);
-    up_ = private_buffer(chunk * static_cast<size_t>(max_inter_) * f);
+    const size_t widest = static_cast<size_t>(std::max(max_inter_, c_.shared_intermediate));
+    gate_ = private_buffer(chunk * widest * f);
+    up_ = private_buffer(chunk * widest * f);
+    if (c_.shared_intermediate > 0) shared_out_ = private_buffer(chunk * hidden * f);
     if (c_.num_experts > 0) {
       const size_t slots = chunk * static_cast<size_t>(c_.experts_per_token);
       route_ = private_buffer(chunk * static_cast<size_t>(c_.num_experts) * f);
@@ -732,7 +772,8 @@ class DecoderMetal final : public Model {
     bind(enc, G.k_norm, 6);
     bind(enc, G.sliding ? inv_freq_local_buf_ : inv_freq_global_buf_, 7);
     bytes(enc, RopeParams{c_.num_heads, G.kv_heads, G.head_dim, start, G.capacity, c_.rms_norm_eps,
-                          c_.norm_offset, c_.qk_norm ? 1 : 0, c_.qkv_bias ? 1 : 0, c_.v_norm ? 1 : 0},
+                          c_.norm_offset, c_.qk_norm ? 1 : 0, c_.qkv_bias ? 1 : 0, c_.v_norm ? 1 : 0,
+                          c_.rotary_dim > 0 ? c_.rotary_dim : G.head_dim},
           8);
     bind(enc, G.q_bias, 9);
     bind(enc, G.k_bias, 10);
@@ -820,7 +861,31 @@ class DecoderMetal final : public Model {
   // r_ = the mixture-of-experts output for the normed rows in h_. Routing
   // runs on the GPU, so the host never waits for the chosen experts.
   void encode_router(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n) {
-    encode_qmm(enc, G.router, h_, n, route_);
+    if (G.router_dense) {
+      [enc setComputePipelineState:pipeline("dense_rows")];
+      bind(enc, G.dense_router.data, 0);
+      bind(enc, h_, 0, 1);
+      bind(enc, route_, 0, 2);
+      bytes(enc, DenseParams{G.dense_router.rows, G.dense_router.cols, G.dense_router.dtype}, 3);
+      [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((G.dense_router.rows + 1) / 2),
+                                            static_cast<NSUInteger>(n), 1)
+          threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    } else {
+      encode_qmm(enc, G.router, h_, n, route_);
+    }
+    if (c_.router == DecoderConfig::Router::SigmoidGrouped) {
+      [enc setComputePipelineState:pipeline("moe_route_grouped")];
+      bind(enc, route_, 0, 0);
+      bind(enc, chosen_, 0, 1);
+      bind(enc, expert_weights_, 0, 2);
+      bytes(enc, MoeGroupedParams{c_.num_experts, c_.experts_per_token, c_.n_group, c_.topk_group,
+                                  c_.norm_topk_prob ? 1 : 0, c_.routed_scaling},
+            3);
+      bind(enc, G.router_correction, 4);
+      [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(n), 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+      return;
+    }
     [enc setComputePipelineState:pipeline("moe_route")];
     bind(enc, route_, 0, 0);
     bind(enc, chosen_, 0, 1);
@@ -863,13 +928,41 @@ class DecoderMetal final : public Model {
     bind(enc, G.expert_down.bias, 7);
     [enc dispatchThreadgroups:MTLSizeMake(qmv_groups(c_.hidden_size), static_cast<NSUInteger>(pairs), 1)
         threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    const bool shared = c_.shared_intermediate > 0;
+    if (shared) encode_shared_expert(enc, G, n);
     [enc setComputePipelineState:pipeline("moe_combine")];
     bind(enc, expert_out_, 0, 0);
     bind(enc, expert_weights_, 0, 1);
     bind(enc, r_, 0, 2);
     const int count = n * c_.hidden_size;
-    bytes(enc, MoeCombineParams{c_.hidden_size, K, count}, 3);
+    bytes(enc, MoeCombineParams{c_.hidden_size, K, count, shared ? 1 : 0}, 3);
+    bind(enc, shared ? shared_out_ : r_, 0, 4);
     encode_elementwise(enc, count);
+  }
+
+  // shared_out_ = the shared expert (a dense SiLU-gated MLP) of h_.
+  void encode_shared_expert(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n) {
+    const int silu = c_.activation == Activation::Silu ? 1 : 0;
+    if (n == 1 && G.shared_gate.same_format(G.shared_up)) {
+      [enc setComputePipelineState:quant_pipeline("qmv_glu", G.shared_gate)];
+      bind_weights(enc, G.shared_gate, 0);
+      bind_weights(enc, G.shared_up, 3);
+      bind(enc, h_, 0, 6);
+      bind(enc, gate_, 0, 7);
+      bytes(enc, GluParams{G.shared_gate.rows, G.shared_gate.cols, silu}, 8);
+      [enc dispatchThreadgroups:MTLSizeMake(qmv_groups(G.shared_gate.rows), 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    } else {
+      encode_qmm(enc, G.shared_gate, h_, n, gate_);
+      encode_qmm(enc, G.shared_up, h_, n, up_);
+      [enc setComputePipelineState:pipeline("glu_mul")];
+      bind(enc, gate_, 0, 0);
+      bind(enc, up_, 0, 1);
+      const int count = n * c_.shared_intermediate;
+      bytes(enc, GluMulParams{count, silu}, 2);
+      encode_elementwise(enc, count);
+    }
+    encode_qmm(enc, G.shared_down, gate_, n, shared_out_);
   }
 
   // Bytes the experts of this pass read: each distinct routed expert once
@@ -887,6 +980,9 @@ class DecoderMetal final : public Model {
       bytes += traffic::linear(L.expert_gate[static_cast<size_t>(e)], m) +
                traffic::linear(L.expert_up[static_cast<size_t>(e)], m) +
                traffic::linear(L.expert_down[static_cast<size_t>(e)], m);
+    }
+    if (c_.shared_intermediate > 0) {
+      bytes += traffic::linear(L.shared_gate, n) + traffic::linear(L.shared_up, n) + traffic::linear(L.shared_down, n);
     }
     return bytes + traffic::rows(c_.hidden_size, n, 1);
   }
@@ -1107,6 +1203,8 @@ class DecoderMetal final : public Model {
   // Host copies of expert stacks, alive until the arena has copied them.
   std::deque<std::vector<uint8_t>> staged_;
   std::vector<std::pair<GpuExperts*, std::array<size_t, 3>>> expert_fix_;
+  std::vector<std::pair<BufRef*, size_t>> dense_fix_;
+  id<MTLBuffer> shared_out_ = nil;  // GLM's shared expert output [chunk, hidden]
   // Gemma 4's per-layer inputs [chunk, layers * P], their two parts, and one
   // layer's gate [chunk, P].
   id<MTLBuffer> per_layer_ = nil, per_layer_lookup_ = nil, per_layer_proj_ = nil, per_layer_gate_ = nil;
@@ -1135,9 +1233,6 @@ std::string metal_device_name() {
 }
 
 std::unique_ptr<Model> make_decoder_metal(std::shared_ptr<DecoderWeights> weights, const LoadOptions& options) {
-  LK_CHECK(weights->config.metal_implements(),
-           weights->config.architecture + ": the Metal backend does not implement this router, attention biases "
-           "and sinks, or classic partial RoPE yet; use --backend cpu");
   return std::make_unique<DecoderMetal>(std::move(weights), options);
 }
 
