@@ -15,11 +15,12 @@
 //                     [--stream [--stops-file S.json]]
 //   lokahi pretokenize --model DIR (--text TEXT | --texts-file F.json)
 //   lokahi run        --model DIR --prompt TEXT [--max-new N] [sampling flags]
+//   lokahi serve      --config SERVICE.json      # Lōkahi wire v1 as NDJSON on stdin/stdout
 //   lokahi chat-template (--model DIR | --template-file F [--config-file C]) --messages-file M.json [...] (raw text)
 //   lokahi wire-check [--roundtrip | --encode | --stream REQUEST_ID] (FILE... | --stdin)
 //
-// `run` streams generated text to stdout; every other command prints one
-// JSON object on stdout.
+// `run` streams generated text to stdout and `serve` writes one wire
+// document per line; every other command prints one JSON object on stdout.
 #include <sys/resource.h>
 
 #include <algorithm>
@@ -30,6 +31,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -41,6 +43,7 @@
 #include "json.h"
 #include "safetensors.h"
 #include "sampling.h"
+#include "service.h"
 #include "text_stream.h"
 #include "tokenizer.h"
 #include "wire.h"
@@ -385,6 +388,42 @@ int cmd_run(const Args& args) {
   return 0;
 }
 
+// Lōkahi wire v1 over stdin/stdout: each input line is a start or control
+// document, and each event or receipt is written as one line. Invalid input
+// is reported on stderr as {"error": ...} and answered with nothing, like a
+// failed XPC call. Exits once stdin closes and every admitted request has
+// its receipt.
+int cmd_serve(const Args& args) {
+  Service service(ServiceOptions::from_json(Json::parse(read_text_file(args.get("config")))));
+  std::mutex out;
+  auto sink = [&out](const std::string& envelope) {
+    std::lock_guard<std::mutex> lock(out);
+    std::fwrite(envelope.data(), 1, envelope.size(), stdout);
+    std::fputc('\n', stdout);
+    std::fflush(stdout);
+  };
+  std::string line;
+  while (std::getline(std::cin, line)) {
+    if (line.empty()) continue;
+    try {
+      const wire::MessageType type = wire::validate(line);
+      if (type == wire::MessageType::Start) {
+        service.start(line, sink);
+      } else if (type == wire::MessageType::Control) {
+        service.control(line);
+      } else {
+        fail("lokahi: serve accepts only start and control documents");
+      }
+    } catch (const std::exception& error) {
+      std::lock_guard<std::mutex> lock(out);
+      std::fprintf(stderr, "{\"error\":%s}\n", json_string(error.what()).c_str());
+      std::fflush(stderr);
+    }
+  }
+  service.wait_idle();
+  return 0;
+}
+
 int cmd_bench(const Args& args) {
   LoadOptions options = load_options(args);
   const double load_start = now_seconds();
@@ -704,7 +743,7 @@ int main(int argc, char** argv) {
     if (argc >= 2 && std::strcmp(argv[1], "wire-check") == 0) return cmd_wire_check(argc - 2, argv + 2);
     Args args = parse_args(argc, argv);
     if (args.command == "chat-template") return cmd_chat_template(args);
-    LK_CHECK(args.has("model") || args.command == "sample", "--model is required");
+    LK_CHECK(args.has("model") || args.command == "sample" || args.command == "serve", "--model is required");
     if (args.command == "tokenize") return cmd_tokenize(args);
     if (args.command == "detokenize") return cmd_detokenize(args);
     if (args.command == "pretokenize") return cmd_pretokenize(args);
@@ -713,6 +752,7 @@ int main(int argc, char** argv) {
     if (args.command == "logits") return cmd_logits(args);
     if (args.command == "generate") return cmd_generate(args);
     if (args.command == "sample") return cmd_sample(args);
+    if (args.command == "serve") return cmd_serve(args);
     if (args.command == "bench") return cmd_bench(args);
     if (args.command == "profile") return cmd_profile(args);
     fail("unknown command " + args.command);
