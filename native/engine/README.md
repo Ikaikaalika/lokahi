@@ -28,7 +28,7 @@ cmake --build build/engine -j
 | MLX affine 2/4/8-bit weights, BF16/F16 scales, per-module bit overrides | Implemented | Unit tests; MLX cross-check on Apple Silicon |
 | Tokenizer: SentencePiece-style BPE (Gemma, Llama 2, Mistral) from `tokenizer.json` | Implemented | Correctness: identical ids and text to Hugging Face `tokenizers` on trained fixtures (byte fallback, unknown fusion, added tokens, Metaspace) and a 262k-entry synthetic vocabulary (`tests/test_tokenizer.py`) |
 | Tokenizer: byte-level BPE (Llama 3, Qwen, GPT-OSS, DeepSeek, GLM) | Implemented | Correctness: identical words, ids and text to Hugging Face `tokenizers` for the Qwen 3, Llama 3, GLM, GPT-OSS o200k, DeepSeek V3 and GPT-2 configurations on text from every Unicode plane (`tests/test_tokenizer_bytelevel.py`); regex engine fuzzed against the reference's Oniguruma |
-| Streaming text output (`lokahi run`) | Implemented | Emits only text later tokens cannot rewrite; property-tested |
+| Streaming text with stop strings (`TextStream`, `lokahi run`) | Implemented | Emits only text later tokens cannot rewrite, cut at the earliest stop string, at constant cost per token. Correctness: equals Hugging Face `tokenizers`' full decode (cut at the stop) on every trained tokenizer configuration (`tests/test_text_stream.py`) |
 | Seeded sampling: temperature, top-p, top-k, min-p (CPU and a GPU kernel) | Implemented; GPU kernel awaiting first hardware run | Correctness: draws equal an independent float64 oracle (`oracles/sampling.py`) and follow the exact distribution (chi-square); Philox matches Random123's known answers (`tests/test_sampling.py`) |
 
 No throughput claim is made until the self-hosted runner records hardware
@@ -117,7 +117,10 @@ follows older data. `tools/gen_unicode_tables.py` therefore extracts the
 category, combining-class and composition tables from the pinned reference
 release, so new code points classify and normalize exactly as it does.
 Streaming holds back tokens that end inside a UTF-8 sequence or a
-byte-fallback run, so emitted text is never rewritten.
+byte-fallback run, so emitted text is never rewritten. It also holds back
+text that could still become a stop string. Each token re-decodes only a
+short window that starts at an earlier stable boundary, so the cost per
+token does not grow with the output.
 
 ## Profiling
 

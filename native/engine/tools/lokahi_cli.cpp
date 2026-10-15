@@ -14,7 +14,7 @@
 //   lokahi detokenize --model DIR (--tokens 1,2 | --ids-file F.json) [--keep-special]
 //                     [--stream [--stops-file S.json]]
 //   lokahi pretokenize --model DIR (--text TEXT | --texts-file F.json)
-//   lokahi run        --model DIR --prompt TEXT [--max-new N]
+//   lokahi run        --model DIR --prompt TEXT [--max-new N] [sampling flags]
 //
 // `run` streams generated text to stdout; every other command prints one
 // JSON object on stdout.
@@ -360,22 +360,19 @@ int cmd_run(const Args& args) {
   auto model = load_model(args.get("model"), load_options(args));
   std::vector<int32_t> prompt = tokenizer.encode(args.get("prompt"), true);
   std::vector<int32_t> generated;
-  size_t emitted = 0;
-  auto emit = [&](const std::string& text) {
-    LK_CHECK(text.size() >= emitted, "streaming decode went backwards");
-    std::fwrite(text.data() + emitted, 1, text.size() - emitted, stdout);
+  TextStream stream(tokenizer, {});
+  auto emit = [](const std::string& text) {
+    std::fwrite(text.data(), 1, text.size(), stdout);
     std::fflush(stdout);
-    emitted = text.size();
   };
   auto on_token = [&](int32_t token) {
     generated.push_back(token);
-    const size_t stable = tokenizer.stable_prefix(generated, true);
-    emit(tokenizer.decode(std::vector<int32_t>(generated.begin(), generated.begin() + static_cast<long>(stable)), true));
+    emit(stream.push(token));
     return true;
   };
   GenerationTiming timing;
-  model->generate_greedy(prompt, args.get_int("max-new", 256), true, &timing, on_token);
-  emit(tokenizer.decode(generated, true));
+  model->generate(prompt, args.get_int("max-new", 256), sampling_options(args), true, &timing, on_token);
+  emit(stream.finish());
   std::printf("\n");
   const double decode_rate = generated.size() > 1 ? (generated.size() - 1) / timing.decode_seconds : 0.0;
   std::fprintf(stderr, "[%s] prompt %zu tokens in %.1f ms; %zu tokens at %.1f tok/s\n", model->backend(),
