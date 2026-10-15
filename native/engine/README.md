@@ -23,9 +23,9 @@ cmake --build build/engine -j
 
 | Area | State | Evidence |
 |---|---|---|
-| Decoders on CPU: Gemma 3, Gemma 4 (dense; E2B/E4B and 31B layouts), Llama 3.x, Mistral, Qwen 2/2.5, Qwen 3, Qwen 3 MoE | Implemented | Correctness: matches the NumPy oracles (`oracles/gemma3.py`, `oracles/gemma4.py`, `oracles/llama.py`) within 2e-4 relative; greedy tokens exact (`tests/test_native_engine.py`). Qwen 3 MoE fixtures cover stacked (MLX) and per-expert (Transformers) weights, renormalized and raw top-k, dense layers between sparse ones, and route far from ties on the router's real inputs. Gemma 4 fixtures cover KV sharing of both layer kinds, `attention_k_eq_v`, partial RoPE, per-layer inputs and layer scalars, and every non-equivalent mutation of those features fails the suite. The published E2B config parses to the expected layer map (`tests/engine_tests.cpp`) |
-| Dense decoders on Metal (Gemma 3 and the dense Llama family) | Implemented, awaiting first hardware run | Builds on hosted macOS CI; execution and parity run on the self-hosted runner. Gemma 4 and Qwen 3 MoE are refused (`--backend auto` picks the CPU) until their kernels land |
-| Oracles vs MLX-LM (`gemma3_text`, `gemma4`, `llama`, `qwen2`, `qwen3`, `qwen3_moe`) | Written | Runs on the self-hosted Mac (`tests/test_mlx_crosscheck.py`) |
+| Decoders on CPU: Gemma 3, Gemma 4 (dense; E2B/E4B and 31B layouts), Llama 3.x, Mistral, Qwen 2/2.5, Qwen 3, Qwen 3 MoE, GPT-OSS | Implemented | Correctness: matches the NumPy oracles (`oracles/gemma3.py`, `oracles/gemma4.py`, `oracles/llama.py`) within 2e-4 relative; greedy tokens exact (`tests/test_native_engine.py`). Qwen 3 MoE fixtures cover stacked (MLX) and per-expert (Transformers) weights, renormalized and raw top-k, dense layers between sparse ones, and route far from ties on the router's real inputs. GPT-OSS fixtures mirror the 20B layout (MXFP4 experts behind affine overrides, sinks, alternating windows, untruncated YaRN) and are guarded so the SwiGLU clamps bind and the sinks move the logits; the published 20B config parses to the expected layer map, router and YaRN ramp. Gemma 4 fixtures cover KV sharing of both layer kinds, `attention_k_eq_v`, partial RoPE, per-layer inputs and layer scalars, and every non-equivalent mutation of those features fails the suite. The published E2B config parses to the expected layer map (`tests/engine_tests.cpp`) |
+| Dense decoders on Metal (Gemma 3 and the dense Llama family) | Implemented; correctness verified on a virtual GPU | Hosted macOS CI runs the Metal suites against the oracles on its paravirtual device (correctness only, no performance claims); hardware runs wait for the self-hosted runner. Gemma 4, mixture-of-experts models and MXFP4 weights are refused (`--backend auto` picks the CPU) until their kernels land |
+| Oracles vs MLX-LM (`gemma3_text`, `gemma4`, `llama`, `qwen2`, `qwen3`, `qwen3_moe`, `gpt_oss`) | Written | Runs on the self-hosted Mac (`tests/test_mlx_crosscheck.py`) |
 | MLX affine 2/4/8-bit weights, BF16/F16 scales, per-module bit overrides | Implemented | Unit tests; MLX cross-check on Apple Silicon |
 | MLX MXFP4 weights (E2M1 codes, E8M0 scale per 32; GPT-OSS's expert format), on CPU | Implemented | Correctness: unit tests against hand-computed rows, the OCP encodings, and oracle parity on MXFP4 MLPs and experts (`tests/test_native_engine.py`); `mx.dequantize` cross-check on Apple Silicon. Per-module overrides follow `mlx.nn.quantize`: keys an override omits take its mode's defaults. Metal refuses MXFP4 for now |
 | Tokenizer: SentencePiece-style BPE (Gemma, Llama 2, Mistral) from `tokenizer.json` | Implemented | Correctness: identical ids and text to Hugging Face `tokenizers` on trained fixtures (byte fallback, unknown fusion, added tokens, Metaspace) and a 262k-entry synthetic vocabulary (`tests/test_tokenizer.py`) |
@@ -52,16 +52,26 @@ implements every column but Gemma 4, and no mixture of experts yet:
 | Per-head Q/K norm | yes | yes, plus a scale-free V norm; attention scale 1 | no | no | no | yes |
 | q/k/v biases | no | no | no | no | yes | no |
 | Gated MLP | GELU (tanh) | GELU (tanh), twice as wide in KV-shared layers | SiLU | SiLU | SiLU | SiLU |
-| RoPE | local and global bases, linear scaling | per layer kind; "proportional" partial rotation on full layers | `llama3` or linear scaling | linear scaling | default | default |
+| RoPE | local and global bases, linear scaling | per layer kind; "proportional" partial rotation on full layers | `llama3` or linear scaling | linear scaling | default or YaRN | default or YaRN |
 | Sliding window | 5 of every 6 layers | 4 of every 5 layers | no | every layer, when set | no | no |
 | Per-layer geometry | no | full layers' own head size; with `attention_k_eq_v`, values are the raw keys and full layers have their own kv head count | no | no | no | no |
 | KV sharing | no | the last `num_kv_shared_layers` layers attend over the last unshared layer of their kind | no | no | no | no |
 | Per-layer inputs | no | a per-layer token embedding plus a projection of the embedding, gated into each layer; each layer's output times its `layer_scalar` | no | no | no | no |
 | Mixture of experts | no | not yet (26B-A4B fails at load) | no | no | no | Qwen 3 MoE: a softmax router picks the top `num_experts_per_tok` SiLU-gated experts, renormalized with `norm_topk_prob`, in the layers `decoder_sparse_step` and `mlp_only_layers` select; MLX's stacked `switch_mlp` or per-expert weights |
 
+GPT-OSS is the Llama-family parser plus: q/k/v/o biases; a learned sink
+logit per head in every softmax; alternating sliding (128) and full layers;
+YaRN as Transformers computes it, honoring `truncate: false` (MLX-LM always
+rounds the correction range); and in every layer a biased router whose top-4
+logits are softmaxed over 32 biased experts with the clamped SwiGLU
+`min(g, 7)·σ(1.702·min(g, 7))·(clip(u, −7, 7) + 1)`. YaRN's attention factor
+scales q and k in the references; the engine folds its square into the
+attention scale, which gives the same logits on every backend.
+
 A family is a config parser in `decoder.cpp`. Options outside this table
-(o_proj or MLP biases, YaRN, partial rotary outside Gemma 4, other
-activations, Gemma 4's mixture-of-experts blocks) fail at load.
+(o_proj or MLP biases outside GPT-OSS, longrope and other RoPE types,
+partial rotary outside Gemma 4, other activations, Gemma 4's
+mixture-of-experts blocks) fail at load.
 
 Gemma 4's scalar constants (the embedding scale and the per-layer input
 scales) are rounded to BF16, as MLX-LM applies them to BF16 activations.
