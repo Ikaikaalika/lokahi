@@ -189,8 +189,6 @@ def _dense_mxfp4(config: dict) -> bool:
 
 def _skip_unsupported(directory: Path, backend: str) -> None:
     config = json.loads((directory / "config.json").read_text())
-    if backend == "metal" and (config.get("text_config") or config).get("enable_moe_block"):
-        pytest.skip("the Metal backend runs Gemma 4's mixture of experts in a later commit")
     if backend == "metal" and (config.get("text_config") or config)["model_type"] in CPU_ONLY:
         pytest.skip("the Metal backend does not implement this architecture yet")
     if backend == "metal" and _dense_mxfp4(config):
