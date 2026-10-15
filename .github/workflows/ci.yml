@@ -69,6 +69,24 @@ jobs:
           python3 -m venv .venv
           .venv/bin/pip install numpy pytest tokenizers==0.23.3
           PYTHONPATH=src .venv/bin/python -m pytest -q tests/test_native_engine.py tests/test_tokenizer.py tests/test_tokenizer_bytelevel.py tests/test_c_abi.py tests/test_sampling.py
+      - name: Metal backend vs oracles (when the runner exposes a Metal device)
+        env:
+          LOKAHI_NATIVE_BUILD_DIR: build/engine
+        run: |
+          # Correctness evidence only: hosted runners are virtual machines, so
+          # nothing here is a throughput number. A runner without a Metal
+          # device skips; any other Metal failure fails the step.
+          PYTHONPATH=src .venv/bin/python -c 'import sys; from lokahi.fixtures import write_tiny_gemma3; write_tiny_gemma3(sys.argv[1])' build/metal-probe
+          if ! ./build/engine/lokahi info --model build/metal-probe --backend metal 2>build/metal-probe.err; then
+            cat build/metal-probe.err
+            if grep -q "no Metal device" build/metal-probe.err; then
+              echo "::notice::this runner exposes no Metal device; Metal execution stays on the self-hosted Mac"
+              exit 0
+            fi
+            exit 1
+          fi
+          system_profiler SPDisplaysDataType | sed -n '1,20p'
+          LOKAHI_TEST_BACKENDS=metal PYTHONPATH=src .venv/bin/python -m pytest -q tests/test_native_engine.py tests/test_sampling.py
       - name: Wire v1 service across a real XPC boundary (gate B, CPU backend)
         run: |
           PYTHONPATH=src .venv/bin/python -c 'import sys; from lokahi.fixtures import write_tiny_chat_model; write_tiny_chat_model(sys.argv[1])' build/xpc-model

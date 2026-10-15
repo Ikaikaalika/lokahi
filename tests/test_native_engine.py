@@ -73,10 +73,11 @@ DENSE_VARIANTS = {
     # Qwen 2.5 0.5B shape: q/k/v biases and 7 query heads per kv head.
     "qwen2-bias-group7": TinyDenseSpec(model_type="qwen2", hidden_size=448, num_attention_heads=7,
                                        num_key_value_heads=1, group_size=64, rope_theta=1e6, seed=5),
-    # Mistral: untied head and a sliding window on every layer.
-    "mistral-sliding-untied": TinyDenseSpec(model_type="mistral", sliding_window=8, tie_word_embeddings=False,
-                                            rope_theta=1e6, rope_scaling={"rope_type": "linear", "factor": 2.0},
-                                            seed=6),
+    # Mistral: untied head and a sliding window on every layer (64-wide heads,
+    # which the Metal kernels cover; 32-wide heads fail closed there).
+    "mistral-sliding-untied": TinyDenseSpec(model_type="mistral", hidden_size=256, sliding_window=8,
+                                            tie_word_embeddings=False, rope_theta=1e6,
+                                            rope_scaling={"rope_type": "linear", "factor": 2.0}, seed=6),
 }
 GEMMA4_VARIANTS = {
     # E2B's shape: sliding and full head sizes, proportional partial RoPE on
@@ -273,6 +274,16 @@ def _gemma4_error(native_cli: Path, directory: Path, backend: str = "cpu") -> st
     )
     assert result.returncode != 0
     return result.stderr
+
+
+@pytest.mark.skipif("metal" not in _backends(), reason="needs the Metal backend")
+def test_metal_refuses_head_sizes_its_kernels_lack(native_cli, tmp_path):
+    directory = write_tiny_dense(tmp_path / "model", TinyDenseSpec())  # 128 / 4 heads = 32-wide heads
+    result = subprocess.run(
+        [str(native_cli), "info", "--model", str(directory), "--backend", "metal"], capture_output=True, text=True
+    )
+    assert result.returncode != 0
+    assert "metal: head_dim must be 64, 128 or 256" in result.stderr
 
 
 def test_gemma4_fixtures_exercise_every_feature(tmp_path):
