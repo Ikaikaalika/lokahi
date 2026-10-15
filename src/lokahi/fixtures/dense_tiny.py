@@ -1,16 +1,17 @@
 """Write tiny, randomly initialized Llama-family checkpoints in MLX layout.
 
-One writer covers Llama 3.x, Mistral, Qwen 2/2.5, Qwen 3, Qwen 3 MoE and
-GPT-OSS with the same shapes and tensor names as their ``mlx-community``
-checkpoints:
+One writer covers Llama 3.x, Mistral, Qwen 2/2.5, Qwen 3, Qwen 3 MoE,
+GPT-OSS and GLM-4.5 with the same shapes and tensor names as their
+``mlx-community`` checkpoints:
 affine-quantized embeddings and projections with BF16 scales and biases,
 BF16 norm weights, grouped-query attention, optional ``llama3`` or linear
 RoPE scaling, Qwen 3's per-head q/k norms, Qwen 2's q/k/v biases, Mistral's
 optional sliding window, tied or untied ``lm_head``, per-module
 quantization overrides, Qwen 3 MoE's stacked ``switch_mlp`` experts with
 an 8-bit router, and GPT-OSS's biased attention with sinks, alternating
-windows and biased MXFP4 experts behind a biased router. It is correctness
-evidence only.
+windows and biased MXFP4 experts behind a biased router, and GLM-4.5's
+partial RoPE, leading dense layers, dense sigmoid router with its correction
+bias, and shared expert. It is correctness evidence only.
 """
 from __future__ import annotations
 
@@ -31,6 +32,7 @@ ARCHITECTURES = {
     "qwen3": "Qwen3ForCausalLM",
     "qwen3_moe": "Qwen3MoeForCausalLM",
     "gpt_oss": "GptOssForCausalLM",
+    "glm4_moe": "Glm4MoeForCausalLM",
 }
 QK_NORM = ("qwen3", "qwen3_moe")
 
@@ -62,6 +64,14 @@ class TinyDenseSpec:
     norm_topk_prob: bool = True
     stacked_experts: bool = True  # MLX's switch_mlp stacks; False writes Transformers' experts.{e}
     mxfp4_mlp: bool = False  # MLP and expert projections in MXFP4, as GPT-OSS ships its experts
+    # GLM-4.5
+    first_k_dense_replace: int = 1
+    n_group: int = 1
+    topk_group: int = 1
+    routed_scaling_factor: float = 1.0
+    n_shared_experts: int = 1
+    use_qk_norm: bool = False
+    partial_rotary_factor: float = 0.5
     seed: int = 0
     extra: dict = field(default_factory=dict)
 
@@ -85,6 +95,8 @@ class TinyDenseSpec:
     def sparse(self, layer: int) -> bool:
         if self.model_type == "gpt_oss":
             return True
+        if self.model_type == "glm4_moe":
+            return layer >= self.first_k_dense_replace
         return (
             self.model_type == "qwen3_moe"
             and layer not in self.mlp_only_layers
@@ -101,6 +113,8 @@ class TinyDenseSpec:
             raise ValueError(f"unknown model_type {self.model_type!r}")
         if self.model_type == "gpt_oss":
             return self._gpt_oss_config()
+        if self.model_type == "glm4_moe":
+            return self._glm4_moe_config()
         quant: dict = {"group_size": self.group_size, "bits": self.bits}
         for layer in self.eight_bit_mlp_layers:
             for proj in ("gate_proj", "up_proj", "down_proj"):
@@ -155,6 +169,44 @@ class TinyDenseSpec:
                 output_router_logits=False,
                 router_aux_loss_coef=0.001,
             )
+        config.update(self.extra)
+        return config
+
+    def _glm4_moe_config(self) -> dict:
+        quant = {"group_size": self.group_size, "bits": self.bits}
+        config = {
+            "architectures": [ARCHITECTURES["glm4_moe"]],
+            "model_type": "glm4_moe",
+            "vocab_size": self.vocab_size,
+            "hidden_size": self.hidden_size,
+            "intermediate_size": self.intermediate_size,
+            "moe_intermediate_size": self.moe_intermediate_size,
+            "num_hidden_layers": self.num_hidden_layers,
+            "num_attention_heads": self.num_attention_heads,
+            "num_key_value_heads": self.num_key_value_heads,
+            "head_dim": self.resolved_head_dim,
+            "hidden_act": "silu",
+            "rms_norm_eps": 1e-5,
+            "rope_theta": self.rope_theta,
+            "rope_scaling": self.rope_scaling,
+            "partial_rotary_factor": self.partial_rotary_factor,
+            "attention_bias": True,
+            "use_qk_norm": self.use_qk_norm,
+            "n_routed_experts": self.num_experts,
+            "num_experts_per_tok": self.num_experts_per_tok,
+            "n_shared_experts": self.n_shared_experts,
+            "n_group": self.n_group,
+            "topk_group": self.topk_group,
+            "first_k_dense_replace": self.first_k_dense_replace,
+            "routed_scaling_factor": self.routed_scaling_factor,
+            "norm_topk_prob": self.norm_topk_prob,
+            "num_nextn_predict_layers": 1,
+            "max_position_embeddings": 131072,
+            "eos_token_id": [2, 3],
+            "tie_word_embeddings": self.tie_word_embeddings,
+            "quantization": quant,
+            "quantization_config": quant,
+        }
         config.update(self.extra)
         return config
 
@@ -245,13 +297,13 @@ def write_tiny_dense(directory: Path, spec: TinyDenseSpec = TinyDenseSpec()) -> 
         base = f"model.layers.{layer}"
         vector(f"{base}.input_layernorm.weight", hidden, 1.0, 0.2)
         vector(f"{base}.post_attention_layernorm.weight", hidden, 1.0, 0.2)
-        if spec.model_type in QK_NORM:
+        if spec.model_type in QK_NORM or (spec.model_type == "glm4_moe" and spec.use_qk_norm):
             vector(f"{base}.self_attn.q_norm.weight", head_dim, 1.0, 0.2)
             vector(f"{base}.self_attn.k_norm.weight", head_dim, 1.0, 0.2)
         linear(f"{base}.self_attn.q_proj", q_out, hidden, hidden**-0.5)
         linear(f"{base}.self_attn.k_proj", kv_out, hidden, hidden**-0.5)
         linear(f"{base}.self_attn.v_proj", kv_out, hidden, hidden**-0.5)
-        if spec.model_type == "qwen2":
+        if spec.model_type in ("qwen2", "glm4_moe"):
             vector(f"{base}.self_attn.q_proj.bias", q_out, 0.0, 0.5)
             vector(f"{base}.self_attn.k_proj.bias", kv_out, 0.0, 0.5)
             vector(f"{base}.self_attn.v_proj.bias", kv_out, 0.0, 0.5)
@@ -271,6 +323,22 @@ def write_tiny_dense(directory: Path, spec: TinyDenseSpec = TinyDenseSpec()) -> 
                 linear(f"{base}.mlp.experts.{name}", rows, cols, std, experts)
                 tensors[f"{base}.mlp.experts.{name}.bias"] = (
                     "BF16", f32_to_bf16(rng.normal(0.0, bias, (experts, rows)).astype(np.float32)))
+            continue
+        if spec.model_type == "glm4_moe" and spec.sparse(layer):
+            experts, moe = spec.num_experts, spec.moe_intermediate_size
+            # The router is a plain (unquantized) matrix with a float32
+            # correction bias that only steers selection.
+            tensors[f"{base}.mlp.gate.weight"] = (
+                "BF16", f32_to_bf16(rng.normal(0.0, hidden**-0.5 * 4.0, (experts, hidden)).astype(np.float32)))
+            tensors[f"{base}.mlp.gate.e_score_correction_bias"] = (
+                "F32", rng.normal(0.0, 0.3, experts).astype(np.float32))
+            linear(f"{base}.mlp.switch_mlp.gate_proj", moe, hidden, hidden**-0.5, experts)
+            linear(f"{base}.mlp.switch_mlp.up_proj", moe, hidden, hidden**-0.5, experts)
+            linear(f"{base}.mlp.switch_mlp.down_proj", hidden, moe, moe**-0.5, experts)
+            shared = moe * spec.n_shared_experts
+            linear(f"{base}.mlp.shared_experts.gate_proj", shared, hidden, hidden**-0.5)
+            linear(f"{base}.mlp.shared_experts.up_proj", shared, hidden, hidden**-0.5)
+            linear(f"{base}.mlp.shared_experts.down_proj", hidden, shared, shared**-0.5)
             continue
         if spec.sparse(layer):
             experts, moe = spec.num_experts, spec.moe_intermediate_size

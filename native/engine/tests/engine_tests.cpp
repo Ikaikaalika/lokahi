@@ -578,6 +578,34 @@ void test_gpt_oss_config() {
   EXPECT(std::fabs(inv[12] / (plain(12) / 32 * ramp + plain(12) * (1 - ramp)) - 1.0) < 1e-12);
 }
 
+// mlx-community/GLM-4.5-Air-4bit's config.json, as published.
+static const char* kGlm45AirConfig = R"({
+  "architectures": ["Glm4MoeForCausalLM"], "attention_bias": true, "attention_dropout": 0.0,
+  "eos_token_id": [151329, 151336, 151338], "first_k_dense_replace": 1, "head_dim": 128, "hidden_act": "silu",
+  "hidden_size": 4096, "initializer_range": 0.02, "intermediate_size": 10944, "max_position_embeddings": 131072,
+  "model_type": "glm4_moe", "moe_intermediate_size": 1408, "n_group": 1, "n_routed_experts": 128,
+  "n_shared_experts": 1, "norm_topk_prob": true, "num_attention_heads": 96, "num_experts_per_tok": 8,
+  "num_hidden_layers": 46, "num_key_value_heads": 8, "num_nextn_predict_layers": 1, "pad_token_id": 151329,
+  "partial_rotary_factor": 0.5, "quantization": {"group_size": 64, "bits": 4},
+  "quantization_config": {"group_size": 64, "bits": 4}, "rms_norm_eps": 1e-05, "rope_scaling": null,
+  "rope_theta": 1000000, "routed_scaling_factor": 1.0, "tie_word_embeddings": false, "topk_group": 1,
+  "torch_dtype": "bfloat16", "transformers_version": "4.54.0", "use_cache": true, "use_qk_norm": false,
+  "vocab_size": 151552
+})";
+
+void test_glm_config() {
+  const DecoderConfig c = DecoderConfig::from_json(Json::parse(kGlm45AirConfig));
+  EXPECT(c.architecture == "glm4_moe" && c.num_layers == 46 && c.num_experts == 128 && c.experts_per_token == 8);
+  EXPECT(c.router == DecoderConfig::Router::SigmoidGrouped && c.n_group == 1 && c.routed_scaling == 1.0f);
+  EXPECT(c.shared_intermediate == 1408 && c.moe_intermediate == 1408 && c.norm_topk_prob);
+  EXPECT(c.qkv_bias && !c.o_bias && !c.qk_norm && c.rotary_dim == 64 && !c.metal_implements());
+  EXPECT(!c.is_moe(0) && c.is_moe(1) && c.is_moe(45) && c.intermediate_size == 10944);
+  EXPECT(c.eos_token_ids == std::vector<int32_t>({151329, 151336, 151338}));
+  // RoPE over the first 64 of 128 dimensions, exponents over 64.
+  const std::vector<double> inv = c.rope_inv_freq(false);
+  EXPECT(inv.size() == 32 && inv[0] == 1.0 && std::fabs(inv[1] / std::pow(1e6, -2.0 / 64) - 1.0) < 1e-12);
+}
+
 int main() {
   test_json();
   test_half();
@@ -593,6 +621,7 @@ int main() {
   test_sampling();
   test_gemma4_config();
   test_gpt_oss_config();
+  test_glm_config();
   if (g_failures) {
     std::fprintf(stderr, "%d expectation(s) failed\n", g_failures);
     return 1;

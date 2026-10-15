@@ -23,9 +23,9 @@ cmake --build build/engine -j
 
 | Area | State | Evidence |
 |---|---|---|
-| Decoders on CPU: Gemma 3, Gemma 4 (dense; E2B/E4B and 31B layouts), Llama 3.x, Mistral, Qwen 2/2.5, Qwen 3, Qwen 3 MoE, GPT-OSS | Implemented | Correctness: matches the NumPy oracles (`oracles/gemma3.py`, `oracles/gemma4.py`, `oracles/llama.py`) within 2e-4 relative; greedy tokens exact (`tests/test_native_engine.py`). Qwen 3 MoE fixtures cover stacked (MLX) and per-expert (Transformers) weights, renormalized and raw top-k, dense layers between sparse ones, and route far from ties on the router's real inputs. GPT-OSS fixtures mirror the 20B layout (MXFP4 experts behind affine overrides, sinks, alternating windows, untruncated YaRN) and are guarded so the SwiGLU clamps bind and the sinks move the logits; the published 20B config parses to the expected layer map, router and YaRN ramp. Gemma 4 fixtures cover KV sharing of both layer kinds, `attention_k_eq_v`, partial RoPE, per-layer inputs and layer scalars, and every non-equivalent mutation of those features fails the suite. The published E2B config parses to the expected layer map (`tests/engine_tests.cpp`) |
+| Decoders on CPU: Gemma 3, Gemma 4 (dense; E2B/E4B and 31B layouts), Llama 3.x, Mistral, Qwen 2/2.5, Qwen 3, Qwen 3 MoE, GPT-OSS, GLM-4.5 | Implemented | Correctness: matches the NumPy oracles (`oracles/gemma3.py`, `oracles/gemma4.py`, `oracles/llama.py`) within 2e-4 relative; greedy tokens exact (`tests/test_native_engine.py`). Qwen 3 MoE fixtures cover stacked (MLX) and per-expert (Transformers) weights, renormalized and raw top-k, dense layers between sparse ones, and route far from ties on the router's real inputs. GPT-OSS fixtures mirror the 20B layout (MXFP4 experts behind affine overrides, sinks, alternating windows, untruncated YaRN) and are guarded so the SwiGLU clamps bind and the sinks move the logits; the published 20B config parses to the expected layer map, router and YaRN ramp. GLM-4.5 fixtures cover the Air layout and DeepSeek V3-style group-limited routing, and are guarded so the groups and the correction bias each change some token's experts. Gemma 4 fixtures cover KV sharing of both layer kinds, `attention_k_eq_v`, partial RoPE, per-layer inputs and layer scalars, and every non-equivalent mutation of those features fails the suite. The published E2B config parses to the expected layer map (`tests/engine_tests.cpp`) |
 | Dense decoders on Metal (Gemma 3, Gemma 4 and the dense Llama family) | Implemented; correctness verified on a virtual GPU | Hosted macOS CI runs the Metal suites against the oracles on its paravirtual device (correctness only, no performance claims); hardware runs wait for the self-hosted runner. Gemma 4 covers 512-wide heads, KV sharing, `attention_k_eq_v`, the V norm, partial RoPE, per-layer inputs and layer scalars. Mixture-of-experts models and MXFP4 weights are refused (`--backend auto` picks the CPU) until their kernels land |
-| Oracles vs MLX-LM (`gemma3_text`, `gemma4`, `llama`, `qwen2`, `qwen3`, `qwen3_moe`, `gpt_oss`) | Written | Runs on the self-hosted Mac (`tests/test_mlx_crosscheck.py`) |
+| Oracles vs MLX-LM (`gemma3_text`, `gemma4`, `llama`, `qwen2`, `qwen3`, `qwen3_moe`, `gpt_oss`, `glm4_moe`) | Written | Runs on the self-hosted Mac (`tests/test_mlx_crosscheck.py`) |
 | MLX affine 2/4/8-bit weights, BF16/F16 scales, per-module bit overrides | Implemented | Unit tests; MLX cross-check on Apple Silicon |
 | MLX MXFP4 weights (E2M1 codes, E8M0 scale per 32; GPT-OSS's expert format), on CPU | Implemented | Correctness: unit tests against hand-computed rows, the OCP encodings, and oracle parity on MXFP4 MLPs and experts (`tests/test_native_engine.py`); `mx.dequantize` cross-check on Apple Silicon. Per-module overrides follow `mlx.nn.quantize`: keys an override omits take its mode's defaults. Metal refuses MXFP4 for now |
 | Tokenizer: SentencePiece-style BPE (Gemma, Llama 2, Mistral) from `tokenizer.json` | Implemented | Correctness: identical ids and text to Hugging Face `tokenizers` on trained fixtures (byte fallback, unknown fusion, added tokens, Metaspace) and a 262k-entry synthetic vocabulary (`tests/test_tokenizer.py`) |
@@ -67,6 +67,14 @@ logits are softmaxed over 32 biased experts with the clamped SwiGLU
 `min(g, 7)·σ(1.702·min(g, 7))·(clip(u, −7, 7) + 1)`. YaRN's attention factor
 scales q and k in the references; the engine folds its square into the
 attention scale, which gives the same logits on every backend.
+
+GLM-4.5 (`glm4_moe`, the Air and full models) is the Llama-family parser plus
+q/k/v biases, optional q/k norms, RoPE on the first half of each head
+(rotate-half within it), `first_k_dense_replace` dense layers, and MoE layers
+whose dense sigmoid router chooses experts by score plus
+`e_score_correction_bias` within the best `topk_group` of `n_group` groups
+(DeepSeek V3's `noaux_tc`) but weights them by the raw scores, renormalized
+and times `routed_scaling_factor`, next to an always-on shared expert.
 
 A family is a config parser in `decoder.cpp`. Options outside this table
 (o_proj or MLP biases outside GPT-OSS, longrope and other RoPE types,

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <functional>
 #include <limits>
 #include <utility>
 
@@ -39,7 +40,7 @@ bool is_gemma4(const Json& raw) {
 bool is_llama_family(const Json& raw) {
   const std::string type = model_type(raw);
   return type == "llama" || type == "mistral" || type == "qwen2" || type == "qwen3" || type == "qwen3_moe" ||
-         type == "gpt_oss";
+         type == "gpt_oss" || type == "glm4_moe";
 }
 
 bool flag(const Json& cfg, const char* key) {
@@ -219,8 +220,10 @@ DecoderConfig gemma4_config(const Json& raw) {
 // window on every layer, and Qwen 3 MoE replaces the MLP of its sparse layers
 // with routed experts. GPT-OSS adds attention biases and sinks, alternating
 // sliding and full layers, a top-k-then-softmax router over biased experts
-// with a clamped SwiGLU, and YaRN. Options these checkpoints do not use fail
-// closed.
+// with a clamped SwiGLU, and YaRN. GLM-4.5 adds q/k/v biases, optional q/k
+// norms, classic partial RoPE, leading dense layers, and a grouped sigmoid
+// router over routed experts plus a shared expert. Options these checkpoints
+// do not use fail closed.
 DecoderConfig llama_family_config(const Json& cfg) {
   DecoderConfig c;
   c.architecture = model_type(cfg);
@@ -235,8 +238,8 @@ DecoderConfig llama_family_config(const Json& cfg) {
   c.head_dim = head_dim != nullptr && head_dim->is_number() ? static_cast<int>(head_dim->as_int())
                                                              : c.hidden_size / c.num_heads;
   c.rms_norm_eps = static_cast<float>(cfg.number_or("rms_norm_eps", 1e-6));
-  c.qk_norm = arch == "qwen3" || arch == "qwen3_moe";
-  c.qkv_bias = arch == "qwen2" || arch == "gpt_oss";
+  c.qk_norm = arch == "qwen3" || arch == "qwen3_moe" || (arch == "glm4_moe" && flag(cfg, "use_qk_norm"));
+  c.qkv_bias = arch == "qwen2" || arch == "gpt_oss" || (arch == "glm4_moe" && flag(cfg, "attention_bias"));
   c.o_bias = arch == "gpt_oss";
   c.attention_sinks = arch == "gpt_oss";
   c.attn_scale = 1.0f / std::sqrt(static_cast<float>(c.head_dim));
@@ -244,11 +247,17 @@ DecoderConfig llama_family_config(const Json& cfg) {
 
   const std::string activation = cfg.string_or("hidden_act", "silu");
   LK_CHECK(activation == "silu", arch + ": unsupported activation " + activation);
-  // These add o_proj or MLP biases, which only GPT-OSS uses.
-  LK_CHECK(arch == "gpt_oss" || !flag(cfg, "attention_bias"), arch + ": attention_bias is not supported");
+  // These add attention or MLP biases, which only GPT-OSS and GLM use.
+  LK_CHECK(arch == "gpt_oss" || arch == "glm4_moe" || !flag(cfg, "attention_bias"),
+           arch + ": attention_bias is not supported");
   LK_CHECK(!flag(cfg, "mlp_bias"), arch + ": mlp_bias is not supported");
   const double rotary = cfg.number_or("partial_rotary_factor", 1.0);
-  LK_CHECK(rotary == 1.0, arch + ": partial_rotary_factor is not supported");
+  LK_CHECK(rotary == 1.0 || arch == "glm4_moe", arch + ": partial_rotary_factor is not supported");
+  if (rotary != 1.0) {
+    c.rotary_dim = static_cast<int>(c.head_dim * rotary);
+    LK_CHECK(c.rotary_dim > 0 && c.rotary_dim <= c.head_dim && c.rotary_dim % 2 == 0,
+             arch + ": partial_rotary_factor must rotate an even number of dimensions");
+  }
 
   if (const Json* scaling = cfg.find("rope_scaling"); scaling != nullptr && scaling->is_object()) {
     const std::string kind = scaling->string_or("rope_type", scaling->string_or("type", "default"));
@@ -300,6 +309,26 @@ DecoderConfig llama_family_config(const Json& cfg) {
   if (sliding) c.sliding_window = static_cast<int>(window->as_int());
   c.layer_is_sliding.assign(static_cast<size_t>(c.num_layers), sliding);
   c.eos_token_ids = eos_ids(cfg, cfg);
+
+  if (arch == "glm4_moe") {
+    LK_CHECK(cfg.string_or("scoring_func", "sigmoid") == "sigmoid", arch + ": only sigmoid routing is supported");
+    LK_CHECK(cfg.string_or("topk_method", "noaux_tc") == "noaux_tc", arch + ": only noaux_tc routing is supported");
+    c.num_experts = static_cast<int>(cfg.at("n_routed_experts").as_int());
+    c.experts_per_token = static_cast<int>(cfg.at("num_experts_per_tok").as_int());
+    c.moe_intermediate = static_cast<int>(cfg.at("moe_intermediate_size").as_int());
+    c.norm_topk_prob = flag(cfg, "norm_topk_prob");
+    c.n_group = static_cast<int>(cfg.int_or("n_group", 1));
+    c.topk_group = static_cast<int>(cfg.int_or("topk_group", 1));
+    c.routed_scaling = static_cast<float>(cfg.number_or("routed_scaling_factor", 1.0));
+    c.shared_intermediate = c.moe_intermediate * static_cast<int>(cfg.int_or("n_shared_experts", 0));
+    LK_CHECK(c.num_experts > 0 && c.experts_per_token > 0 && c.experts_per_token <= c.num_experts &&
+                 c.n_group > 0 && c.num_experts % c.n_group == 0 && c.topk_group > 0 && c.topk_group <= c.n_group &&
+                 c.experts_per_token <= c.topk_group * (c.num_experts / c.n_group),
+             arch + ": invalid expert configuration");
+    const int dense = static_cast<int>(cfg.int_or("first_k_dense_replace", 0));
+    for (int i = 0; i < c.num_layers; ++i) c.layer_moe.push_back(i >= dense);
+    c.router = DecoderConfig::Router::SigmoidGrouped;
+  }
 
   if (arch == "gpt_oss") {
     // Alternating sliding and full layers by layer_types.
@@ -393,6 +422,7 @@ std::vector<double> DecoderConfig::rope_inv_freq(bool sliding) const {
       break;
     }
   }
+  if (rotary_dim > 0) dims = rotary_dim;  // classic partial RoPE rotates a prefix of the head
   const size_t rotated = sliding ? static_cast<size_t>(dims / 2)
                                  : static_cast<size_t>(static_cast<int>(dims * global_partial_rotary) / 2);
   std::vector<double> inv_freq(static_cast<size_t>(dims / 2), 0.0);
@@ -456,6 +486,20 @@ void bind_experts(const DecoderWeights& w, DecoderLayer& layer, const std::strin
   if (c.router_bias) {
     layer.router_bias.resize(static_cast<size_t>(c.num_experts));
     load_vector(ck, router + ".bias", c.num_experts, layer.router_bias.data());
+  }
+  if (c.router == DecoderConfig::Router::SigmoidGrouped) {
+    layer.router_correction.resize(static_cast<size_t>(c.num_experts));
+    load_vector(ck, router + ".e_score_correction_bias", c.num_experts, layer.router_correction.data());
+  }
+  if (c.shared_intermediate > 0) {
+    const std::string shared = p + base + ".mlp.shared_experts.";
+    layer.shared_gate = bind_linear(ck, w.raw_config, shared + "gate_proj", shared + "gate_proj");
+    layer.shared_up = bind_linear(ck, w.raw_config, shared + "up_proj", shared + "up_proj");
+    layer.shared_down = bind_linear(ck, w.raw_config, shared + "down_proj", shared + "down_proj");
+    LK_CHECK(layer.shared_gate.rows == c.shared_intermediate && layer.shared_gate.cols == c.hidden_size &&
+                 layer.shared_up.rows == c.shared_intermediate && layer.shared_up.cols == c.hidden_size &&
+                 layer.shared_down.rows == c.hidden_size && layer.shared_down.cols == c.shared_intermediate,
+             base + ": shared expert shape");
   }
   std::vector<Linear>* stacks[] = {&layer.expert_gate, &layer.expert_up, &layer.expert_down};
   std::vector<float>* biases[] = {&layer.expert_gate_bias, &layer.expert_up_bias, &layer.expert_down_bias};
@@ -642,7 +686,8 @@ size_t DecoderWeights::matrix_bytes() const {
     total += l.q_proj.weight_bytes() + l.k_proj.weight_bytes() + l.v_proj.weight_bytes() +
              l.o_proj.weight_bytes() + l.gate_proj.weight_bytes() + l.up_proj.weight_bytes() +
              l.down_proj.weight_bytes() + l.per_layer_gate.weight_bytes() + l.per_layer_proj.weight_bytes() +
-             l.router.weight_bytes();
+             l.router.weight_bytes() + l.shared_gate.weight_bytes() + l.shared_up.weight_bytes() +
+             l.shared_down.weight_bytes();
     for (const auto* experts : {&l.expert_gate, &l.expert_up, &l.expert_down}) {
       for (const Linear& expert : *experts) total += expert.weight_bytes();
     }
@@ -657,7 +702,8 @@ bool DecoderWeights::uses_mxfp4() const {
   }
   for (const auto& l : layers) {
     for (const Linear* m : {&l.q_proj, &l.k_proj, &l.v_proj, &l.o_proj, &l.gate_proj, &l.up_proj, &l.down_proj,
-                            &l.per_layer_gate, &l.per_layer_proj, &l.router}) {
+                            &l.per_layer_gate, &l.per_layer_proj, &l.router, &l.shared_gate, &l.shared_up,
+                            &l.shared_down}) {
       if (m->quant.mxfp4()) return true;
     }
     for (const auto* experts : {&l.expert_gate, &l.expert_up, &l.expert_down}) {
@@ -946,17 +992,18 @@ class DecoderCpu final : public Model {
           }
         }
         const auto& inv_freq = sliding ? inv_freq_local_ : inv_freq_global_;
+        const int rotated = c_.rotary_dim > 0 ? c_.rotary_dim : D;
         for (int t = 0; t < n; ++t) {
           for (int hh = 0; hh < H; ++hh) {
             float* qv = q_.data() + (static_cast<size_t>(t) * H + hh) * D;
             if (c_.qk_norm) norm(qv, L.q_norm, D, qv);
-            apply_rope(qv, D, start + t, inv_freq);
+            apply_rope(qv, rotated, start + t, inv_freq);
           }
           if (!own_kv) continue;
           for (int kv = 0; kv < KV; ++kv) {
             float* kvec = k_.data() + (static_cast<size_t>(t) * KV + kv) * D;
             if (c_.qk_norm) norm(kvec, L.k_norm, D, kvec);
-            apply_rope(kvec, D, start + t, inv_freq);
+            apply_rope(kvec, rotated, start + t, inv_freq);
             if (c_.v_norm) {
               float* vvec = v_.data() + (static_cast<size_t>(t) * KV + kv) * D;
               rms_norm(vvec, nullptr, D, c_.rms_norm_eps, 0.0f, vvec);
@@ -1040,6 +1087,48 @@ class DecoderCpu final : public Model {
     }
   }
 
+  // GLM-4.5 / DeepSeek V3 (noaux_tc) routing of one token: sigmoid scores
+  // plus the correction bias choose the top k within the best topk_group
+  // groups (by the sum of each group's two best); the chosen experts' raw
+  // scores, renormalized when norm_topk_prob, times routed_scaling, weight
+  // them. Ties go to the lower group or expert index.
+  void route_sigmoid_grouped(const DecoderLayer& L, const float* logits, int* chosen, float* weights) const {
+    const int E = c_.num_experts, K = c_.experts_per_token, groups = c_.n_group, per_group = E / groups;
+    std::vector<double> scores(static_cast<size_t>(E)), selection(static_cast<size_t>(E));
+    for (int e = 0; e < E; ++e) {
+      scores[static_cast<size_t>(e)] = 1.0 / (1.0 + std::exp(-static_cast<double>(logits[e])));
+      selection[static_cast<size_t>(e)] = scores[static_cast<size_t>(e)] + L.router_correction[static_cast<size_t>(e)];
+    }
+    if (groups > 1) {
+      std::vector<std::pair<double, int>> group_scores;
+      for (int g = 0; g < groups; ++g) {
+        std::vector<double> member(selection.begin() + g * per_group, selection.begin() + (g + 1) * per_group);
+        std::partial_sort(member.begin(), member.begin() + std::min(2, per_group), member.end(), std::greater<>());
+        group_scores.push_back({member[0] + (per_group > 1 ? member[1] : 0.0), g});
+      }
+      // The references zero the n_group - topk_group lowest groups.
+      std::stable_sort(group_scores.begin(), group_scores.end(),
+                       [](const auto& a, const auto& b) { return a.first < b.first; });
+      for (int j = 0; j < groups - c_.topk_group; ++j) {
+        const int g = group_scores[static_cast<size_t>(j)].second;
+        std::fill(selection.begin() + g * per_group, selection.begin() + (g + 1) * per_group, 0.0);
+      }
+    }
+    std::vector<int> order(static_cast<size_t>(E));
+    for (int e = 0; e < E; ++e) order[static_cast<size_t>(e)] = e;
+    std::partial_sort(order.begin(), order.begin() + K, order.end(), [&](int a, int b) {
+      const double sa = selection[static_cast<size_t>(a)], sb = selection[static_cast<size_t>(b)];
+      return sa > sb || (sa == sb && a < b);
+    });
+    double total = 0.0;
+    for (int j = 0; j < K; ++j) total += scores[static_cast<size_t>(order[static_cast<size_t>(j)])];
+    const double scale = (K > 1 && c_.norm_topk_prob ? 1.0 / total : 1.0) * c_.routed_scaling;
+    for (int j = 0; j < K; ++j) {
+      chosen[j] = order[static_cast<size_t>(j)];
+      weights[j] = static_cast<float>(scores[static_cast<size_t>(chosen[j])] * scale);
+    }
+  }
+
   // rows[t] += bias[e * width ...] for each of n rows of `width` values.
   static void add_expert_bias(float* rows, int n, int64_t width, const std::vector<float>& bias, int e) {
     if (bias.empty()) return;
@@ -1069,6 +1158,11 @@ class DecoderCpu final : public Model {
       std::vector<double> probs(static_cast<size_t>(E));
       for (int t = 0; t < n; ++t) {
         float* logits = route_.data() + static_cast<size_t>(t) * E;
+        if (c_.router == DecoderConfig::Router::SigmoidGrouped) {
+          route_sigmoid_grouped(L, logits, chosen_.data() + static_cast<size_t>(t) * K,
+                                weight_.data() + static_cast<size_t>(t) * K);
+          continue;
+        }
         if (!L.router_bias.empty()) add_bias(logits, L.router_bias);
         const float top = *std::max_element(logits, logits + E);
         double total = 0.0;
@@ -1110,8 +1204,20 @@ class DecoderCpu final : public Model {
                  traffic::rows(hidden, m, 2);
       }
     }
+    if (profiler_ && c_.shared_intermediate > 0) {
+      bytes += traffic::linear(L.shared_gate, n) + traffic::linear(L.shared_up, n) +
+               traffic::linear(L.shared_down, n) + traffic::rows(c_.shared_intermediate, n, 1);
+    }
     Section section(profiler_, "experts", bytes);
     std::fill(r_.begin(), r_.begin() + static_cast<std::ptrdiff_t>(sn * hidden), 0.0f);
+    if (c_.shared_intermediate > 0) {  // the shared expert sees every token
+      expert_gate_.resize(sn * c_.shared_intermediate);
+      expert_up_.resize(sn * c_.shared_intermediate);
+      matmul(L.shared_gate, h_.data(), n, expert_gate_.data(), pool_);
+      matmul(L.shared_up, h_.data(), n, expert_up_.data(), pool_);
+      gated_activation(expert_gate_.data(), expert_up_.data(), sn * c_.shared_intermediate);
+      matmul(L.shared_down, expert_gate_.data(), n, r_.data(), pool_);
+    }
     for (int e = 0; e < E; ++e) {
       const auto& tokens = routed[static_cast<size_t>(e)];
       const int m = static_cast<int>(tokens.size());
