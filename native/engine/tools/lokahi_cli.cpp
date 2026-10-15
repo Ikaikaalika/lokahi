@@ -15,6 +15,7 @@
 //                     [--stream [--stops-file S.json]]
 //   lokahi pretokenize --model DIR (--text TEXT | --texts-file F.json)
 //   lokahi run        --model DIR --prompt TEXT [--max-new N] [sampling flags]
+//   lokahi wire-check [--roundtrip | --encode | --stream REQUEST_ID] (FILE... | --stdin)
 //
 // `run` streams generated text to stdout; every other command prints one
 // JSON object on stdout.
@@ -28,6 +29,7 @@
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -39,6 +41,7 @@
 #include "sampling.h"
 #include "text_stream.h"
 #include "tokenizer.h"
+#include "wire.h"
 
 #if defined(LOKAHI_WITH_METAL)
 #include "metal/metal_decoder.h"
@@ -486,10 +489,157 @@ int cmd_profile(const Args& args) {
   return 0;
 }
 
+// Checks wire v1 documents, one per FILE or per --stdin line, and prints one
+// JSON verdict per document: {"file" or "line", "valid", "type", "error"}.
+//   --roundtrip   decodes and re-encodes; a single FILE prints the encoding
+//                 itself, --stdin adds it to each verdict as "encoded".
+//   --stream ID   feeds the documents in order to one StreamValidator and adds
+//                 "terminated" and "next_sequence".
+//   --encode      reads each event or receipt into the structs without
+//                 validation, so tests can show the encoders refuse bad values.
+int cmd_wire_check(int argc, char** argv) {
+  const std::string usage =
+      "usage: lokahi wire-check [--roundtrip | --encode | --stream REQUEST_ID] (FILE... | --stdin)";
+  enum class Mode { Check, Roundtrip, Encode, Stream } mode = Mode::Check;
+  std::optional<wire::StreamValidator> stream;
+  bool from_stdin = false;
+  std::vector<std::string> files;
+  for (int i = 0; i < argc; ++i) {
+    const std::string arg = argv[i];
+    if (arg == "--stdin") {
+      from_stdin = true;
+    } else if (arg == "--roundtrip") {
+      mode = Mode::Roundtrip;
+    } else if (arg == "--encode") {
+      mode = Mode::Encode;
+    } else if (arg == "--stream" && i + 1 < argc) {
+      mode = Mode::Stream;
+      stream.emplace(argv[++i]);
+    } else {
+      LK_CHECK(arg.rfind("--", 0) != 0, usage);
+      files.push_back(arg);
+    }
+  }
+  LK_CHECK(from_stdin == files.empty(), usage);
+
+  const auto reencode = [](const std::string& document) {
+    const wire::MessageType type = wire::validate(document);
+    if (type == wire::MessageType::Start) return wire::encode(wire::decode_start(document));
+    if (type == wire::MessageType::Control) return wire::encode(wire::decode_control(document));
+    if (type == wire::MessageType::Event) return wire::encode(wire::decode_event(document));
+    return wire::encode(wire::decode_receipt(document));
+  };
+  if (mode == Mode::Roundtrip && !from_stdin) {
+    LK_CHECK(files.size() == 1, "usage: lokahi wire-check --roundtrip FILE");
+    std::printf("%s\n", reencode(read_text_file(files[0])).c_str());
+    return 0;
+  }
+
+  const auto build_and_encode = [](const std::string& document) {
+    const Json j = Json::parse(document);
+    const auto text = [](const Json& o, const char* key) { return o.string_or(key, ""); };
+    const auto maybe_text = [](const Json& o, const char* key) -> std::optional<std::string> {
+      const Json* v = o.find(key);
+      return v ? std::optional<std::string>(v->as_string()) : std::nullopt;
+    };
+    const auto maybe_int = [](const Json& o, const char* key) -> std::optional<int64_t> {
+      const Json* v = o.find(key);
+      return v ? std::optional<int64_t>(v->as_int()) : std::nullopt;
+    };
+    const auto maybe_number = [](const Json& o, const char* key) -> std::optional<double> {
+      const Json* v = o.find(key);
+      return v && !v->is_null() ? std::optional<double>(v->as_number()) : std::nullopt;
+    };
+    if (text(j, "message_type") == "event") {
+      wire::Event e;
+      e.request_id = text(j, "request_id");
+      e.sequence = j.int_or("sequence", 0);
+      e.kind = text(j, "kind");
+      e.emitted_at_unix_ms = j.int_or("emitted_at_unix_ms", 0);
+      e.progress = maybe_number(j, "progress");
+      e.text_delta = maybe_text(j, "text_delta");
+      e.generated_tokens_delta = maybe_int(j, "generated_tokens_delta");
+      e.queue_position = maybe_int(j, "queue_position");
+      e.queue_depth = maybe_int(j, "queue_depth");
+      e.message = maybe_text(j, "message");
+      return wire::encode(e);
+    }
+    wire::Receipt r;
+    r.request_id = text(j, "request_id");
+    r.terminal_sequence = j.int_or("terminal_sequence", 0);
+    r.status = text(j, "status");
+    r.finish_reason = text(j, "finish_reason");
+    r.completed_at_unix_ms = j.int_or("completed_at_unix_ms", 0);
+    r.output_text = maybe_text(j, "output_text");
+    const Json& usage = j.at("usage");
+    r.usage = {usage.int_or("prompt_tokens", 0), usage.int_or("completion_tokens", 0),
+               usage.int_or("total_tokens", 0)};
+    const Json& metrics = j.at("metrics");
+    r.metrics.queue_ms = metrics.number_or("queue_ms", 0);
+    r.metrics.ttft_ms = maybe_number(metrics, "ttft_ms");
+    r.metrics.inter_token_latency_ms = maybe_number(metrics, "inter_token_latency_ms");
+    r.metrics.decode_tokens_per_second = maybe_number(metrics, "decode_tokens_per_second");
+    r.metrics.peak_memory_bytes = metrics.int_or("peak_memory_bytes", 0);
+    r.metrics.maximum_batch_size = metrics.int_or("maximum_batch_size", 1);
+    const Json& execution = j.at("execution");
+    r.execution.backend = text(execution, "backend");
+    r.execution.route = text(execution, "route");
+    r.execution.plan_id = text(execution, "plan_id");
+    for (const Json& id : execution.at("evidence_ids").as_array()) r.execution.evidence_ids.push_back(id.as_string());
+    r.execution.fallback_used = execution.at("fallback_used").as_bool();
+    r.execution.fallback_reason = maybe_text(execution, "fallback_reason");
+    if (const Json* f = j.find("failure")) {
+      r.failure = wire::Failure{text(*f, "code"), text(*f, "stage"), f->at("retryable").as_bool(), text(*f, "message")};
+    }
+    return wire::encode(r);
+  };
+
+  bool all_valid = true;
+  const auto report = [&](const std::string& label, const std::string& document) {
+    std::string type = "null", error = "null", encoded = "null";
+    try {
+      if (mode == Mode::Encode) {
+        const std::string out = build_and_encode(document);
+        type = json_string(std::string(wire::name(wire::validate(out))));
+        encoded = json_string(out);
+      } else {
+        const wire::MessageType kind = wire::validate(document);
+        type = json_string(std::string(wire::name(kind)));
+        if (mode == Mode::Roundtrip) encoded = json_string(reencode(document));
+        if (mode == Mode::Stream && kind == wire::MessageType::Event) stream->accept(wire::decode_event(document));
+        if (mode == Mode::Stream && kind == wire::MessageType::Receipt) stream->accept(wire::decode_receipt(document));
+        if (mode == Mode::Stream && kind != wire::MessageType::Event && kind != wire::MessageType::Receipt) {
+          throw wire::ContractError("wire: a stream carries only events and receipts");
+        }
+      }
+    } catch (const wire::ContractError& e) {
+      error = json_string(e.what());
+      all_valid = false;
+    }
+    std::string extra;
+    if (mode == Mode::Roundtrip || mode == Mode::Encode) extra = ",\"encoded\":" + encoded;
+    if (mode == Mode::Stream) {
+      extra = std::string(",\"terminated\":") + (stream->terminated() ? "true" : "false") +
+              ",\"next_sequence\":" + std::to_string(stream->next_sequence());
+    }
+    std::printf("{%s,\"valid\":%s,\"type\":%s,\"error\":%s%s}\n", label.c_str(), error == "null" ? "true" : "false",
+                type.c_str(), error.c_str(), extra.c_str());
+  };
+  if (from_stdin) {
+    std::ios::sync_with_stdio(false);
+    std::string line;
+    for (int64_t n = 1; std::getline(std::cin, line); ++n) report("\"line\":" + std::to_string(n), line);
+  } else {
+    for (const std::string& file : files) report("\"file\":" + json_string(file), read_text_file(file));
+  }
+  return all_valid ? 0 : 1;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   try {
+    if (argc >= 2 && std::strcmp(argv[1], "wire-check") == 0) return cmd_wire_check(argc - 2, argv + 2);
     Args args = parse_args(argc, argv);
     LK_CHECK(args.has("model") || args.command == "sample", "--model is required");
     if (args.command == "tokenize") return cmd_tokenize(args);
