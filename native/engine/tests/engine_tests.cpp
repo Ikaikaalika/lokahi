@@ -493,6 +493,31 @@ static const char* kGemma4E2BConfig = R"({
     "vocab_size_per_layer_input": 262144}
 })";
 
+// mlx-community/gemma-3-4b-it-4bit's config: the text fields not listed take
+// Transformers' Gemma3TextConfig defaults.
+static const char* kGemma3_4BConfig = R"({
+  "architectures": ["Gemma3ForConditionalGeneration"], "boi_token_index": 255999, "eoi_token_index": 256000,
+  "eos_token_id": [1, 106], "image_token_index": 262144, "initializer_range": 0.02, "mm_tokens_per_image": 256,
+  "model_type": "gemma3", "quantization": {"group_size": 64, "bits": 4},
+  "text_config": {"hidden_size": 2560, "intermediate_size": 10240, "model_type": "gemma3_text",
+                  "num_hidden_layers": 34, "rope_scaling": {"factor": 8.0, "rope_type": "linear"},
+                  "sliding_window": 1024},
+  "torch_dtype": "bfloat16", "transformers_version": "4.50.0.dev0",
+  "vision_config": {"hidden_size": 1152, "image_size": 896, "intermediate_size": 4304,
+                    "model_type": "siglip_vision_model", "num_attention_heads": 16, "num_hidden_layers": 27,
+                    "patch_size": 14, "vision_use_head": false, "skip_vision": true}
+})";
+
+void test_gemma3_config() {
+  const DecoderConfig c = DecoderConfig::from_json(Json::parse(kGemma3_4BConfig));
+  EXPECT(c.architecture == "gemma3" && c.num_layers == 34 && c.hidden_size == 2560);
+  EXPECT(c.vocab_size == 262208 && c.num_heads == 8 && c.num_kv_heads == 4 && c.head_dim == 256);
+  EXPECT(c.attn_scale == 0.0625f && c.sliding_window == 1024 && c.eos_token_ids == std::vector<int32_t>({1, 106}));
+  EXPECT(c.embed_scale == 50.5f);  // sqrt(2560) rounded to BF16
+  EXPECT(c.rope_scaling.kind == RopeScaling::Kind::Linear && c.rope_scaling.factor == 8.0);
+  for (int l = 0; l < c.num_layers; ++l) EXPECT(c.layer_is_sliding[static_cast<size_t>(l)] == (l % 6 != 5));
+}
+
 void test_gemma4_config() {
   const DecoderConfig c = DecoderConfig::from_json(Json::parse(kGemma4E2BConfig));
   EXPECT(c.architecture == "gemma4" && c.num_layers == 35);
@@ -619,6 +644,7 @@ int main() {
   test_tokenizer_stable_prefix();
   test_byte_level_stable_prefix();
   test_sampling();
+  test_gemma3_config();
   test_gemma4_config();
   test_gpt_oss_config();
   test_glm_config();

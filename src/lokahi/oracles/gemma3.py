@@ -71,20 +71,21 @@ class Gemma3Config:
                 raise NotImplementedError(f"rope_scaling type {kind!r}")
         if cfg.get("hidden_activation", "gelu_pytorch_tanh") != "gelu_pytorch_tanh":
             raise NotImplementedError(f"activation {cfg.get('hidden_activation')!r}")
-        head_dim = int(cfg.get("head_dim", 256))
+        # Multimodal checkpoints list only the text fields that differ from
+        # Transformers' Gemma3TextConfig; the rest take its defaults.
         return cls(
-            vocab_size=int(cfg["vocab_size"]),
+            vocab_size=int(cfg.get("vocab_size", 262208)),
             hidden_size=int(cfg["hidden_size"]),
             intermediate_size=int(cfg["intermediate_size"]),
             num_hidden_layers=layers,
-            num_attention_heads=int(cfg["num_attention_heads"]),
-            num_key_value_heads=int(cfg["num_key_value_heads"]),
-            head_dim=head_dim,
+            num_attention_heads=int(cfg.get("num_attention_heads", 8)),
+            num_key_value_heads=int(cfg.get("num_key_value_heads", 4)),
+            head_dim=int(cfg.get("head_dim", 256)),
             rms_norm_eps=float(cfg.get("rms_norm_eps", 1e-6)),
             rope_theta=float(cfg.get("rope_theta", 1_000_000.0)),
             rope_local_base_freq=float(cfg.get("rope_local_base_freq", 10_000.0)),
             rope_linear_factor=factor,
-            query_pre_attn_scalar=float(cfg.get("query_pre_attn_scalar", head_dim)),
+            query_pre_attn_scalar=float(cfg.get("query_pre_attn_scalar", 256)),
             sliding_window=int(cfg.get("sliding_window", 4096)),
             layer_is_sliding=sliding,
             final_logit_softcapping=cfg.get("final_logit_softcapping"),

@@ -60,16 +60,19 @@ std::vector<int32_t> eos_ids(const Json& raw, const Json& cfg) {
   return ids;
 }
 
+// Gemma 3. Multimodal checkpoints (Gemma3ForConditionalGeneration) list only
+// the text fields that differ from Transformers' Gemma3TextConfig, so the
+// rest take its defaults.
 DecoderConfig gemma3_config(const Json& raw) {
   const Json& cfg = text_config(raw);
   DecoderConfig c;
   c.architecture = "gemma3";
-  c.vocab_size = static_cast<int>(cfg.at("vocab_size").as_int());
+  c.vocab_size = static_cast<int>(cfg.int_or("vocab_size", 262208));
   c.hidden_size = static_cast<int>(cfg.at("hidden_size").as_int());
   c.intermediate_size = static_cast<int>(cfg.at("intermediate_size").as_int());
   c.num_layers = static_cast<int>(cfg.at("num_hidden_layers").as_int());
-  c.num_heads = static_cast<int>(cfg.at("num_attention_heads").as_int());
-  c.num_kv_heads = static_cast<int>(cfg.at("num_key_value_heads").as_int());
+  c.num_heads = static_cast<int>(cfg.int_or("num_attention_heads", 8));
+  c.num_kv_heads = static_cast<int>(cfg.int_or("num_key_value_heads", 4));
   c.head_dim = static_cast<int>(cfg.int_or("head_dim", 256));
   c.rms_norm_eps = static_cast<float>(cfg.number_or("rms_norm_eps", 1e-6));
   c.norm_offset = 1.0f;
@@ -77,7 +80,7 @@ DecoderConfig gemma3_config(const Json& raw) {
   c.qk_norm = true;
   // sqrt(hidden_size) rounded to BF16, as the reference implementations do.
   c.embed_scale = bf16_round(std::sqrt(static_cast<float>(c.hidden_size)));
-  c.attn_scale = 1.0f / std::sqrt(static_cast<float>(cfg.number_or("query_pre_attn_scalar", c.head_dim)));
+  c.attn_scale = 1.0f / std::sqrt(static_cast<float>(cfg.number_or("query_pre_attn_scalar", 256)));
   c.rope_theta = static_cast<float>(cfg.number_or("rope_theta", 1e6));
   c.local_rope = true;
   c.rope_local_theta = static_cast<float>(cfg.number_or("rope_local_base_freq", 1e4));
