@@ -97,6 +97,8 @@ class Gemma4VisionConfig:
         m = self.side_multiple
         if height % m or width % m or height * width > self.max_patches * self.patch_size**2:
             raise ValueError(f"a {height}x{width} image is not an accepted Gemma 4 size")
+        if max(height, width) // self.patch_size > self.position_embedding_size:
+            raise ValueError(f"a {height}x{width} image is wider than the position table")
         return (height // m) * (width // m)
 
     def target_size(self, height: int, width: int) -> tuple[int, int]:

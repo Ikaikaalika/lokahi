@@ -78,6 +78,7 @@ DecoderConfig gemma3_config(const Json& raw) {
   c.norm_offset = 1.0f;
   c.sandwich_norms = true;
   c.qk_norm = true;
+  c.image_blocks = DecoderConfig::ImageBlocks::AllLayers;
   // sqrt(hidden_size) rounded to BF16, as the reference implementations do.
   c.embed_scale = bf16_round(std::sqrt(static_cast<float>(c.hidden_size)));
   c.attn_scale = 1.0f / std::sqrt(static_cast<float>(cfg.number_or("query_pre_attn_scalar", 256)));
@@ -128,6 +129,11 @@ DecoderConfig gemma4_config(const Json& raw) {
   LK_CHECK(!flag(cfg, "enable_moe_block"), "gemma4: mixture-of-experts blocks are not supported yet");
   LK_CHECK(!flag(cfg, "attention_bias"), "gemma4: attention_bias is not supported");
   LK_CHECK(!flag(cfg, "use_bidirectional_attention"), "gemma4: bidirectional attention is not supported");
+  // "vision": image tokens see each other on sliding layers only
+  // (Transformers' create_masks_for_vision_model); otherwise they are causal.
+  if (cfg.string_or("use_bidirectional_attention", "") == "vision") {
+    c.image_blocks = DecoderConfig::ImageBlocks::SlidingLayers;
+  }
   c.vocab_size = static_cast<int>(cfg.at("vocab_size").as_int());
   c.hidden_size = static_cast<int>(cfg.at("hidden_size").as_int());
   c.intermediate_size = static_cast<int>(cfg.at("intermediate_size").as_int());
@@ -1318,6 +1324,7 @@ class DecoderCpu final : public Model {
     const int H = c_.num_heads, D = c_.head_dim_of(l);
     const int group = H / c_.kv_heads_of(l);
     const int source = c_.kv_source(l);
+    const bool blocks = c_.image_blocks_apply(sliding);
     pool_.parallel_for(static_cast<size_t>(n) * H, [&](size_t begin, size_t end) {
       std::vector<float> scores;
       for (size_t item = begin; item < end; ++item) {
@@ -1328,7 +1335,7 @@ class DecoderCpu final : public Model {
         // Keys [lo, hi]: causal, except that an image block's tokens also see
         // its later positions (all in this pass); the window still applies.
         const int lo = sliding ? std::max(0, pos - c_.sliding_window + 1) : 0;
-        const int hi = last_key(pos);
+        const int hi = blocks ? last_key(pos) : pos;
         const float* qv = q_.data() + (static_cast<size_t>(t) * H + hh) * D;
         scores.resize(static_cast<size_t>(hi - lo + 1));
         float max_score = -std::numeric_limits<float>::infinity();

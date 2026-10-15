@@ -46,11 +46,11 @@ const char* mm_variant(DType dtype) {
   }
 }
 
-class VisionMetal final : public VisionEncoder {
+class SiglipMetal final : public SiglipEncoder {
  public:
-  explicit VisionMetal(std::shared_ptr<const VisionWeights> weights) : VisionEncoder(std::move(weights)) {
+  explicit SiglipMetal(std::shared_ptr<const SiglipWeights> weights) : SiglipEncoder(std::move(weights)) {
     @autoreleasepool {
-      LK_CHECK(metal_vision_supports(*weights_), "metal: the vision tower has quantized matrices; use --backend cpu");
+      LK_CHECK(metal_siglip_supports(*weights_), "metal: the vision tower has quantized matrices; use --backend cpu");
       device_ = MTLCreateSystemDefaultDevice();
       LK_CHECK(device_ != nil, "metal: no Metal device");
       queue_ = [device_ newCommandQueue];
@@ -62,9 +62,10 @@ class VisionMetal final : public VisionEncoder {
 
   const char* backend() const override { return "metal"; }
 
-  std::vector<float> encode(const float* pixels) override {
+ protected:
+  std::vector<float> encode_pixels(const float* pixels) override {
     @autoreleasepool {
-      const VisionConfig& c = config();
+      const SiglipConfig& c = config();
       const std::vector<float> rows = patches(pixels);
       std::memcpy([patches_ contents], rows.data(), sizeof(float) * rows.size());
       id<MTLCommandBuffer> cb = [queue_ commandBuffer];
@@ -106,11 +107,11 @@ class VisionMetal final : public VisionEncoder {
   }
 
   void upload() {
-    const VisionWeights& w = *weights_;
+    const SiglipWeights& w = *weights_;
     patch_ = GpuMatrix{buffer_of(w.patch_weight), "f32"};
     patch_bias_ = buffer_of(w.patch_bias);
     positions_ = buffer_of(w.positions);
-    for (const VisionWeights::Layer& L : w.layers) {
+    for (const SiglipWeights::Layer& L : w.layers) {
       Layer G;
       G.ln1_weight = buffer_of(L.ln1_weight);
       G.ln1_bias = buffer_of(L.ln1_bias);
@@ -137,7 +138,7 @@ class VisionMetal final : public VisionEncoder {
   }
 
   void allocate() {
-    const VisionConfig& c = config();
+    const SiglipConfig& c = config();
     const size_t f = sizeof(float), N = static_cast<size_t>(c.patches());
     const size_t hidden = static_cast<size_t>(c.hidden_size), T = static_cast<size_t>(c.tokens_per_image);
     const size_t width = static_cast<size_t>(c.patch_size) * c.patch_size * 3;
@@ -197,7 +198,7 @@ class VisionMetal final : public VisionEncoder {
 
   void layer_norm(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> in, id<MTLBuffer> weight, id<MTLBuffer> bias,
                   id<MTLBuffer> out, int rows) {
-    const VisionConfig& c = config();
+    const SiglipConfig& c = config();
     [enc setComputePipelineState:pipeline("layer_norm_rows")];
     [enc setBuffer:in offset:0 atIndex:0];
     [enc setBuffer:weight offset:0 atIndex:1];
@@ -215,7 +216,7 @@ class VisionMetal final : public VisionEncoder {
   }
 
   void encode_tower(id<MTLComputeCommandEncoder> enc) {
-    const VisionConfig& c = config();
+    const SiglipConfig& c = config();
     const int N = c.patches(), hidden = c.hidden_size, inter = c.intermediate_size;
     const int heads = c.num_heads, D = hidden / heads, T = c.tokens_per_image;
     const int width = c.patch_size * c.patch_size * 3;
@@ -287,8 +288,8 @@ class VisionMetal final : public VisionEncoder {
 
 }  // namespace
 
-bool metal_vision_supports(const VisionWeights& weights) {
-  for (const VisionWeights::Layer& L : weights.layers) {
+bool metal_siglip_supports(const SiglipWeights& weights) {
+  for (const SiglipWeights::Layer& L : weights.layers) {
     for (const Linear* l : {&L.q_proj, &L.k_proj, &L.v_proj, &L.out_proj, &L.fc1, &L.fc2}) {
       if (l->quant.quantized() || mm_variant(l->dense_dtype) == nullptr) return false;
     }
@@ -296,8 +297,8 @@ bool metal_vision_supports(const VisionWeights& weights) {
   return true;
 }
 
-std::unique_ptr<VisionEncoder> make_vision_metal(std::shared_ptr<const VisionWeights> weights) {
-  return std::make_unique<VisionMetal>(std::move(weights));
+std::unique_ptr<VisionEncoder> make_siglip_metal(std::shared_ptr<const SiglipWeights> weights) {
+  return std::make_unique<SiglipMetal>(std::move(weights));
 }
 
 }  // namespace lokahi

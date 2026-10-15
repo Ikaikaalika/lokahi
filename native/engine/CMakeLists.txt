@@ -22,12 +22,14 @@ set(LOKAHI_CORE_SOURCES
   src/c_api.cpp
   src/chat_template.cpp
   src/decoder.cpp
+  src/gemma4_vision.cpp
   src/json.cpp
   src/model.cpp
   src/quant.cpp
   src/regex.cpp
   src/safetensors.cpp
   src/sampling.cpp
+  src/siglip.cpp
   src/service.cpp
   src/text_stream.cpp
   src/thread_pool.cpp

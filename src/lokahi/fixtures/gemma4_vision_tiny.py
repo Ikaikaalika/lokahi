@@ -47,7 +47,7 @@ class TinyGemma4VisionSpec:
     patch_size: int = 4
     pooling_kernel_size: int = 3
     max_soft_tokens: int = 8
-    position_embedding_size: int = 16
+    position_embedding_size: int = 32
     rope_theta: float = 100.0
     standardize: bool = True
     image_token_id: int = 500

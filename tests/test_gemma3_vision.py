@@ -146,8 +146,7 @@ def test_image_features_match_oracle(native_cli, vlm, backend, tmp_path):
     out = tmp_path / "features.bin"
     report = _run(native_cli, "image-features", "--model", str(directory), "--backend", backend,
                   "--images", files, "--out", str(out))
-    assert report == {"backend": backend, "images": 2, "tokens_per_image": SPEC.mm_tokens_per_image,
-                      "width": SPEC.text.hidden_size}
+    assert report == {"backend": backend, "tokens": [SPEC.mm_tokens_per_image] * 2, "width": SPEC.text.hidden_size}
     got = np.fromfile(out, dtype=np.float32).reshape(2, SPEC.mm_tokens_per_image, SPEC.text.hidden_size)
     expected = np.stack([oracle.encode(preprocess(image)) for image in images])
     tolerance = 1e-5 if backend == "cpu" else 1e-3
@@ -216,8 +215,10 @@ def test_vision_checkpoint_runs_text_only_prompts(native_cli, vlm, tmp_path):
     expected = oracle.language.logits(tokens)[-1:]
     np.testing.assert_allclose(got, expected, atol=2e-4 * np.abs(expected).max(), rtol=0)
     info = _run(native_cli, "info", "--model", str(directory), "--backend", "cpu")
-    assert info["vision"] == {"image_size": SPEC.image_size, "tokens_per_image": SPEC.mm_tokens_per_image,
-                              "image_token_id": SPEC.image_token_index}
+    assert info["vision"] == {"image_size": SPEC.image_size, "image_token_id": SPEC.image_token_index}
+    geometry = _run(native_cli, "image-geometry", "--model", str(directory), "--width", "640", "--height", "480")
+    assert geometry == {"width": SPEC.image_size, "height": SPEC.image_size, "tokens": SPEC.mm_tokens_per_image,
+                        "image_token_id": SPEC.image_token_index}
 
 
 @pytest.mark.parametrize("backend", _backends())
@@ -236,6 +237,12 @@ def test_image_inputs_fail_closed(native_cli, vlm, backend, tmp_path):
     short = tmp_path / "short.rgb"
     short.write_bytes(b"\0" * 10)
     assert "RGB8 image" in _fails(native_cli, "logits", *model, *prompt, "--images", f"{short},{one}")
+    wrong = tmp_path / "wrong.ppm"
+    wrong.write_bytes(b"P6\n8 8\n255\n" + b"\0" * (8 * 8 * 3))
+    assert "takes 56x56 images, not 8x8" in _fails(native_cli, "logits", *model, *prompt, "--images", f"{wrong},{one}")
+    truncated = tmp_path / "truncated.ppm"
+    truncated.write_bytes(b"P6\n56 56\n255\n" + b"\0" * 10)
+    assert "does not match its size" in _fails(native_cli, "logits", *model, *prompt, "--images", f"{truncated},{one}")
     assert "cannot read image" in _fails(native_cli, "logits", *model, *prompt, "--images", f"{one},{tmp_path}/nope")
 
 
