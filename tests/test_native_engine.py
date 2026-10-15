@@ -78,6 +78,15 @@ DENSE_VARIANTS = {
     "mistral-sliding-untied": TinyDenseSpec(model_type="mistral", hidden_size=256, sliding_window=8,
                                             tie_word_embeddings=False, rope_theta=1e6,
                                             rope_scaling={"rope_type": "linear", "factor": 2.0}, seed=6),
+    # Qwen 3 MoE (30B-A3B layout): stacked experts, an 8-bit router, top-2 of 8
+    # renormalized, and a dense layer from mlp_only_layers.
+    "qwen3-moe-top2-of-8": TinyDenseSpec(model_type="qwen3_moe", head_dim=64, mlp_only_layers=(1,), seed=9),
+    # Every other layer sparse, top-3 of 6 unnormalized, Transformers'
+    # per-expert tensors, untied.
+    "qwen3-moe-top3-of-6-per-expert": TinyDenseSpec(
+        model_type="qwen3_moe", num_experts=6, num_experts_per_tok=3, decoder_sparse_step=2, norm_topk_prob=False,
+        stacked_experts=False, tie_word_embeddings=False, seed=10,
+    ),
 }
 GEMMA4_VARIANTS = {
     # E2B's shape: sliding and full head sizes, proportional partial RoPE on
@@ -116,10 +125,13 @@ def fixture_model(request, tmp_path_factory):
     return directory, LlamaFamilyReference.load(directory)
 
 
+CPU_ONLY = ("gemma4", "gemma4_text", "qwen3_moe")  # the Metal backend refuses these for now
+
+
 def _skip_unsupported(directory: Path, backend: str) -> None:
     config = json.loads((directory / "config.json").read_text())
-    if backend == "metal" and (config.get("text_config") or config)["model_type"].startswith("gemma4"):
-        pytest.skip("the Metal backend does not implement Gemma 4 yet")
+    if backend == "metal" and (config.get("text_config") or config)["model_type"] in CPU_ONLY:
+        pytest.skip("the Metal backend does not implement this architecture yet")
 
 
 @pytest.mark.parametrize("backend", _backends())
@@ -251,9 +263,10 @@ def test_profile_attributes_every_section_without_changing_tokens(native_cli, fi
         assert total <= report[phase]["wall_seconds"] * 1.05 + 1e-3
     # Every decode step reads every layer weight and the vocabulary projection;
     # with tied embeddings that is all of weight_bytes but the tables only
-    # gathered from (Gemma 4's per-layer embeddings).
+    # gathered from (Gemma 4's per-layer embeddings) and the experts a token
+    # may not use. CPU splits the MLP; Metal fuses it.
     decode = {section["name"]: section for section in report["decode"]["sections"]}
-    linear = ("qkv", "o_proj", "mlp_up", "down_proj", "mlp", "per_layer_input")  # CPU splits the MLP; Metal fuses it
+    linear = ("qkv", "o_proj", "mlp_up", "down_proj", "mlp", "per_layer_input", "router", "experts")
     linear_bytes = sum(decode[name]["bytes"] for name in linear if name in decode) + decode["lm_head"]["bytes"]
     tied = oracle.w["lm_head"] is oracle.w["model.embed_tokens"]
     read = report["weight_bytes"] - _gathered_table_bytes(directory)
@@ -262,13 +275,14 @@ def test_profile_attributes_every_section_without_changing_tokens(native_cli, fi
 
 def _gathered_table_bytes(directory: Path) -> int:
     total = 0
+    sparse = (".embed_tokens_per_layer.", ".switch_mlp.", ".experts.")
     for shard in directory.glob("*.safetensors"):
         tensors, _ = read_safetensors(shard)
-        total += sum(array.nbytes for name, (_, array) in tensors.items() if ".embed_tokens_per_layer." in name)
+        total += sum(array.nbytes for name, (_, array) in tensors.items() if any(s in name for s in sparse))
     return total
 
 
-def _gemma4_error(native_cli: Path, directory: Path, backend: str = "cpu") -> str:
+def _load_error(native_cli: Path, directory: Path, backend: str = "cpu") -> str:
     result = subprocess.run(
         [str(native_cli), "info", "--model", str(directory), "--backend", backend], capture_output=True, text=True
     )
@@ -319,7 +333,7 @@ def test_gemma4_fixtures_exercise_every_feature(tmp_path):
 )
 def test_unsupported_gemma4_configurations_fail_closed(native_cli, tmp_path, change, message):
     directory = write_tiny_gemma4(tmp_path / "model", TinyGemma4Spec(extra=change))
-    assert message in _gemma4_error(native_cli, directory)
+    assert message in _load_error(native_cli, directory)
 
 
 def test_gemma4_missing_layer_scalar_fails_closed(native_cli, tmp_path):
@@ -330,13 +344,52 @@ def test_gemma4_missing_layer_scalar_fails_closed(native_cli, tmp_path):
     from lokahi.formats.safetensors import write_safetensors
 
     write_safetensors(path, tensors, metadata=metadata)
-    assert "layers.3.layer_scalar" in _gemma4_error(native_cli, directory)
+    assert "layers.3.layer_scalar" in _load_error(native_cli, directory)
 
 
-def test_gemma4_runs_on_the_cpu_backend_only(native_cli, tmp_path):
-    directory = write_tiny_gemma4(tmp_path / "model", TinyGemma4Spec())
-    # auto falls back to the CPU backend, which implements Gemma 4.
+@pytest.mark.parametrize("architecture", ["gemma4", "qwen3_moe"])
+def test_cpu_only_architectures_fall_back_to_the_cpu(native_cli, tmp_path, architecture):
+    if architecture == "gemma4":
+        directory = write_tiny_gemma4(tmp_path / "model", TinyGemma4Spec())
+    else:
+        directory = write_tiny_dense(tmp_path / "model", TinyDenseSpec(model_type="qwen3_moe"))
+    # auto falls back to the CPU backend, which implements every architecture.
     info = _run(native_cli, "info", "--model", str(directory), "--backend", "auto")
-    assert (info["architecture"], info["backend"]) == ("gemma4", "cpu")
+    assert (info["architecture"], info["backend"]) == (architecture, "cpu")
     if "metal" in _backends():
-        assert "the Metal backend does not implement" in _gemma4_error(native_cli, directory, "metal")
+        assert "the Metal backend does not implement" in _load_error(native_cli, directory, "metal")
+
+
+def test_moe_fixtures_route_far_from_ties(tmp_path):
+    # Guards the fixtures: on the router's real inputs, the top-k choice must
+    # be stable under float32 error, and every expert must serve some token.
+    for name in ("qwen3-moe-top2-of-8", "qwen3-moe-top3-of-6-per-expert"):
+        oracle = LlamaFamilyReference.load(write_tiny_dense(tmp_path / name, DENSE_VARIANTS[name]))
+        k, route = oracle.config.num_experts_per_tok, oracle.route
+        gaps: list[float] = []
+        used: set[int] = set()
+
+        def traced(layer, x):
+            ordered = -np.sort(-(x @ oracle.w[f"model.layers.{layer}.mlp.gate"].T), axis=-1)
+            gaps.append(float((ordered[:, k - 1] - ordered[:, k]).min()))
+            chosen, weights = route(layer, x)
+            used.update(chosen.ravel().tolist())
+            return chosen, weights
+
+        oracle.route = traced
+        oracle.logits(TOKENS)
+        assert min(gaps) > 1e-3, name
+        assert len(used) == oracle.config.num_experts, name
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"shared_expert_intermediate_size": 64}, "qwen3_moe: shared experts are not supported"),
+        ({"num_experts_per_tok": 9}, "qwen3_moe: invalid expert configuration"),
+        ({"mlp_only_layers": [3]}, "qwen3_moe: mlp_only_layers entry out of range"),
+    ],
+)
+def test_unsupported_moe_configurations_fail_closed(native_cli, tmp_path, change, message):
+    directory = write_tiny_dense(tmp_path / "model", TinyDenseSpec(model_type="qwen3_moe", extra=change))
+    assert message in _load_error(native_cli, directory)

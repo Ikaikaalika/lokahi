@@ -1,9 +1,10 @@
-// Dense decoder-only transformers (Gemma 3, Gemma 4, Llama 3.x, Mistral,
-// Qwen 2/2.5, Qwen 3): configuration, weight binding, and the CPU backend.
+// Decoder-only transformers (Gemma 3, Gemma 4, Llama 3.x, Mistral, Qwen 2/2.5,
+// Qwen 3, Qwen 3 MoE): configuration, weight binding, and the CPU backend.
 // One configuration describes how the families differ (norm style and
 // placement, activation, per-head Q/K norm, q/k/v biases, RoPE bases,
 // scaling and partial rotation, sliding windows, logit soft-capping, and
-// Gemma 4's per-layer geometry, KV sharing and per-layer inputs), so a family
+// Gemma 4's per-layer geometry, KV sharing and per-layer inputs, and
+// mixture-of-experts layers), so a family
 // is a config parser rather than a fork. Backends that lack a feature refuse
 // the config (see uniform_layers()).
 #pragma once
@@ -78,6 +79,15 @@ struct DecoderConfig {
   int per_layer_input = 0;          // hidden_size_per_layer_input; 0 disables
   bool layer_scalars = false;       // each layer's output times its layer_scalar
 
+  // Mixture of experts (Qwen 3 MoE). In layers marked in layer_moe, a
+  // softmax router picks experts_per_token of num_experts gated experts
+  // (renormalizing their weights when norm_topk_prob) instead of the MLP.
+  int num_experts = 0;
+  int experts_per_token = 0;
+  int moe_intermediate = 0;
+  bool norm_topk_prob = false;
+  std::vector<bool> layer_moe;
+
   static DecoderConfig from_json(const Json& raw);
   // RoPE inverse frequencies (half the layer kind's head size); rotations a
   // partial layer kind skips have frequency 0.
@@ -91,12 +101,13 @@ struct DecoderConfig {
   int kv_source(int layer) const { return layer_kv_source.empty() ? layer : layer_kv_source[static_cast<size_t>(layer)]; }
   bool shares_kv(int layer) const { return kv_source(layer) != layer; }
   bool k_eq_v(int layer) const { return !layer_k_eq_v.empty() && layer_k_eq_v[static_cast<size_t>(layer)]; }
-  // True when every layer has the same geometry and none of Gemma 4's
-  // additions are used: what the Metal backend implements today.
+  bool is_moe(int layer) const { return !layer_moe.empty() && layer_moe[static_cast<size_t>(layer)]; }
+  // True when every layer has the same geometry and dense MLP, and none of
+  // Gemma 4's additions are used: what the Metal backend implements today.
   bool uniform_layers() const {
     return layer_head_dim.empty() && layer_kv_heads.empty() && layer_intermediate.empty() &&
            layer_kv_source.empty() && layer_k_eq_v.empty() && !v_norm && global_partial_rotary == 1.0f &&
-           per_layer_input == 0 && !layer_scalars;
+           per_layer_input == 0 && !layer_scalars && num_experts == 0;
   }
 };
 
@@ -107,8 +118,12 @@ struct DecoderLayer {
   // q_norm and k_norm only with qk_norm.
   std::vector<float> attn_norm, attn_post_norm, mlp_norm, mlp_post_norm, q_norm, k_norm;
   std::vector<float> q_bias, k_bias, v_bias;  // only with qkv_bias
-  // k_proj and v_proj are empty (rows 0) in KV-shared layers, v_proj with k_eq_v.
+  // k_proj and v_proj are empty (rows 0) in KV-shared layers, v_proj with k_eq_v;
+  // gate_proj, up_proj and down_proj in mixture-of-experts layers.
   Linear q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj;
+  // Mixture of experts: the router [experts, hidden] and one view per expert.
+  Linear router;
+  std::vector<Linear> expert_gate, expert_up, expert_down;
   // Per-layer inputs (Gemma 4): gate [P, hidden], projection [hidden, P].
   Linear per_layer_gate, per_layer_proj;
   std::vector<float> per_layer_norm;

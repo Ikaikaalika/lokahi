@@ -1,12 +1,13 @@
 """Write tiny, randomly initialized Llama-family checkpoints in MLX layout.
 
-One writer covers Llama 3.x, Mistral, Qwen 2/2.5 and Qwen 3 with the same
-shapes and tensor names as their ``mlx-community`` checkpoints:
+One writer covers Llama 3.x, Mistral, Qwen 2/2.5, Qwen 3 and Qwen 3 MoE with
+the same shapes and tensor names as their ``mlx-community`` checkpoints:
 affine-quantized embeddings and projections with BF16 scales and biases,
 BF16 norm weights, grouped-query attention, optional ``llama3`` or linear
 RoPE scaling, Qwen 3's per-head q/k norms, Qwen 2's q/k/v biases, Mistral's
-optional sliding window, tied or untied ``lm_head``, and per-module
-quantization overrides. It is correctness evidence only.
+optional sliding window, tied or untied ``lm_head``, per-module
+quantization overrides, and Qwen 3 MoE's stacked ``switch_mlp`` experts with
+an 8-bit router. It is correctness evidence only.
 """
 from __future__ import annotations
 
@@ -25,7 +26,9 @@ ARCHITECTURES = {
     "mistral": "MistralForCausalLM",
     "qwen2": "Qwen2ForCausalLM",
     "qwen3": "Qwen3ForCausalLM",
+    "qwen3_moe": "Qwen3MoeForCausalLM",
 }
+QK_NORM = ("qwen3", "qwen3_moe")
 
 
 @dataclass(frozen=True)
@@ -45,12 +48,28 @@ class TinyDenseSpec:
     group_size: int = 32
     bits: int = 4
     eight_bit_mlp_layers: tuple[int, ...] = (0,)
+    # Qwen 3 MoE: sparse layers are those with (layer + 1) % decoder_sparse_step
+    # == 0 that are not in mlp_only_layers.
+    num_experts: int = 8
+    num_experts_per_tok: int = 2
+    moe_intermediate_size: int = 64
+    decoder_sparse_step: int = 1
+    mlp_only_layers: tuple[int, ...] = ()
+    norm_topk_prob: bool = True
+    stacked_experts: bool = True  # MLX's switch_mlp stacks; False writes Transformers' experts.{e}
     seed: int = 0
     extra: dict = field(default_factory=dict)
 
     @property
     def resolved_head_dim(self) -> int:
         return self.head_dim or self.hidden_size // self.num_attention_heads
+
+    def sparse(self, layer: int) -> bool:
+        return (
+            self.model_type == "qwen3_moe"
+            and layer not in self.mlp_only_layers
+            and (layer + 1) % self.decoder_sparse_step == 0
+        )
 
     def config(self) -> dict:
         if self.model_type not in ARCHITECTURES:
@@ -59,6 +78,9 @@ class TinyDenseSpec:
         for layer in self.eight_bit_mlp_layers:
             for proj in ("gate_proj", "up_proj", "down_proj"):
                 quant[f"model.layers.{layer}.mlp.{proj}"] = {"group_size": self.group_size, "bits": 8}
+        for layer in range(self.num_hidden_layers):
+            if self.sparse(layer):  # mlx-lm quantizes the router to 8 bits, group 64
+                quant[f"model.layers.{layer}.mlp.gate"] = {"group_size": 64, "bits": 8}
         config = {
             "architectures": [ARCHITECTURES[self.model_type]],
             "model_type": self.model_type,
@@ -80,18 +102,29 @@ class TinyDenseSpec:
             "quantization": quant,
             "quantization_config": quant,
         }
-        if self.head_dim is not None or self.model_type == "qwen3":
+        if self.head_dim is not None or self.model_type in QK_NORM:
             config["head_dim"] = self.resolved_head_dim
-        if self.model_type in ("llama", "qwen3"):
+        if self.model_type in ("llama", "qwen3", "qwen3_moe"):
             config["attention_bias"] = False
         if self.model_type == "llama":
             config["mlp_bias"] = False
         if self.model_type == "mistral":
             config["sliding_window"] = self.sliding_window
-        if self.model_type in ("qwen2", "qwen3"):
+        if self.model_type in ("qwen2", "qwen3", "qwen3_moe"):
             config["use_sliding_window"] = False
-            config["sliding_window"] = None if self.model_type == "qwen3" else 32768
+            config["sliding_window"] = 32768 if self.model_type == "qwen2" else None
             config["max_window_layers"] = self.num_hidden_layers
+        if self.model_type == "qwen3_moe":
+            config.update(
+                num_experts=self.num_experts,
+                num_experts_per_tok=self.num_experts_per_tok,
+                moe_intermediate_size=self.moe_intermediate_size,
+                decoder_sparse_step=self.decoder_sparse_step,
+                mlp_only_layers=list(self.mlp_only_layers),
+                norm_topk_prob=self.norm_topk_prob,
+                output_router_logits=False,
+                router_aux_loss_coef=0.001,
+            )
         config.update(self.extra)
         return config
 
@@ -105,10 +138,14 @@ def write_tiny_dense(directory: Path, spec: TinyDenseSpec = TinyDenseSpec()) -> 
     rng = np.random.default_rng(spec.seed)
     tensors: dict[str, tuple[str, np.ndarray]] = {}
 
-    def linear(module: str, rows: int, cols: int, std: float) -> None:
+    def linear(module: str, rows: int, cols: int, std: float, experts: int = 0) -> None:
         override = config["quantization"].get(module)
-        bits = override["bits"] if isinstance(override, dict) else spec.bits
-        weight, scales, biases = _quantized(rng, rows, cols, QuantSpec(group_size=spec.group_size, bits=bits), std)
+        source = override if isinstance(override, dict) else config["quantization"]
+        qspec = QuantSpec(group_size=source["group_size"], bits=source["bits"])
+        if not experts:
+            weight, scales, biases = _quantized(rng, rows, cols, qspec, std)
+        else:  # stacked [experts, rows, ...], each expert quantized on its own
+            weight, scales, biases = map(np.stack, zip(*(_quantized(rng, rows, cols, qspec, std) for _ in range(experts))))
         tensors[f"{module}.weight"] = ("U32", weight)
         tensors[f"{module}.scales"] = ("BF16", scales)
         tensors[f"{module}.biases"] = ("BF16", biases)
@@ -124,7 +161,7 @@ def write_tiny_dense(directory: Path, spec: TinyDenseSpec = TinyDenseSpec()) -> 
         base = f"model.layers.{layer}"
         vector(f"{base}.input_layernorm.weight", hidden, 1.0, 0.2)
         vector(f"{base}.post_attention_layernorm.weight", hidden, 1.0, 0.2)
-        if spec.model_type == "qwen3":
+        if spec.model_type in QK_NORM:
             vector(f"{base}.self_attn.q_norm.weight", head_dim, 1.0, 0.2)
             vector(f"{base}.self_attn.k_norm.weight", head_dim, 1.0, 0.2)
         linear(f"{base}.self_attn.q_proj", q_out, hidden, hidden**-0.5)
@@ -135,6 +172,20 @@ def write_tiny_dense(directory: Path, spec: TinyDenseSpec = TinyDenseSpec()) -> 
             vector(f"{base}.self_attn.k_proj.bias", kv_out, 0.0, 0.5)
             vector(f"{base}.self_attn.v_proj.bias", kv_out, 0.0, 0.5)
         linear(f"{base}.self_attn.o_proj", hidden, q_out, q_out**-0.5)
+        if spec.sparse(layer):
+            experts, moe = spec.num_experts, spec.moe_intermediate_size
+            # A wide router keeps the top-k choice far from ties.
+            linear(f"{base}.mlp.gate", experts, hidden, hidden**-0.5 * 4.0)
+            if spec.stacked_experts:
+                linear(f"{base}.mlp.switch_mlp.gate_proj", moe, hidden, hidden**-0.5, experts)
+                linear(f"{base}.mlp.switch_mlp.up_proj", moe, hidden, hidden**-0.5, experts)
+                linear(f"{base}.mlp.switch_mlp.down_proj", hidden, moe, moe**-0.5, experts)
+                continue
+            for e in range(experts):
+                linear(f"{base}.mlp.experts.{e}.gate_proj", moe, hidden, hidden**-0.5)
+                linear(f"{base}.mlp.experts.{e}.up_proj", moe, hidden, hidden**-0.5)
+                linear(f"{base}.mlp.experts.{e}.down_proj", hidden, moe, moe**-0.5)
+            continue
         linear(f"{base}.mlp.gate_proj", inter, hidden, hidden**-0.5)
         linear(f"{base}.mlp.up_proj", inter, hidden, hidden**-0.5)
         linear(f"{base}.mlp.down_proj", hidden, inter, inter**-0.5)

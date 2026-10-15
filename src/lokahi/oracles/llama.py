@@ -1,7 +1,8 @@
-"""NumPy reference for the Llama family: Llama 3.x, Mistral, Qwen 2/2.5, Qwen 3.
+"""NumPy reference for the Llama family: Llama 3.x, Mistral, Qwen 2/2.5, Qwen 3, Qwen 3 MoE.
 
 Semantics follow the Hugging Face ``LlamaForCausalLM``, ``MistralForCausalLM``,
-``Qwen2ForCausalLM`` and ``Qwen3ForCausalLM`` implementations:
+``Qwen2ForCausalLM``, ``Qwen3ForCausalLM`` and ``Qwen3MoeForCausalLM``
+implementations:
 
 * pre-norm blocks: ``x += attn(norm(x))`` then ``x += mlp(norm(x))``, where
   the norm before the MLP is named ``post_attention_layernorm``;
@@ -12,7 +13,11 @@ Semantics follow the Hugging Face ``LlamaForCausalLM``, ``MistralForCausalLM``,
 * Qwen 2 adds biases to the q, k and v projections;
 * Mistral restricts every layer to the last ``sliding_window`` positions
   when the window is set;
-* attention scale is ``head_dim ** -0.5`` and the MLP is SiLU-gated.
+* attention scale is ``head_dim ** -0.5`` and the MLP is SiLU-gated;
+* Qwen 3 MoE replaces the MLP of sparse layers with ``num_experts`` SiLU-gated
+  experts: a softmax over the router logits picks the top
+  ``num_experts_per_tok`` (renormalized when ``norm_topk_prob``), and the
+  layer outputs the probability-weighted sum of those experts.
 
 Quantized MLX checkpoints are dequantized to float32 on load.
 """
@@ -27,7 +32,8 @@ import numpy as np
 
 from .gemma3 import load_dense_weights
 
-FAMILIES = ("llama", "mistral", "qwen2", "qwen3")
+FAMILIES = ("llama", "mistral", "qwen2", "qwen3", "qwen3_moe")
+QK_NORM = ("qwen3", "qwen3_moe")
 
 
 @dataclass(frozen=True)
@@ -44,6 +50,11 @@ class LlamaFamilyConfig:
     rope_theta: float
     rope_scaling: Mapping[str, Any] | None
     sliding_window: int | None
+    num_experts: int = 0
+    num_experts_per_tok: int = 0
+    decoder_sparse_step: int = 1
+    mlp_only_layers: tuple[int, ...] = ()
+    norm_topk_prob: bool = False
 
     @classmethod
     def from_dict(cls, cfg: Mapping[str, Any]) -> "LlamaFamilyConfig":
@@ -71,6 +82,20 @@ class LlamaFamilyConfig:
             rope_theta=float(cfg.get("rope_theta", 10_000.0)),
             rope_scaling=scaling,
             sliding_window=int(window) if window else None,
+            num_experts=int(cfg.get("num_experts") or 0) if model_type == "qwen3_moe" else 0,
+            num_experts_per_tok=int(cfg.get("num_experts_per_tok") or 0),
+            decoder_sparse_step=int(cfg.get("decoder_sparse_step") or 1),
+            mlp_only_layers=tuple(cfg.get("mlp_only_layers") or ()),
+            norm_topk_prob=bool(cfg.get("norm_topk_prob", False)),
+        )
+
+    def sparse(self, layer: int) -> bool:
+        """Whether ``layer`` uses the mixture of experts instead of the MLP."""
+
+        return (
+            self.num_experts > 0
+            and layer not in self.mlp_only_layers
+            and (layer + 1) % self.decoder_sparse_step == 0
         )
 
     def inv_freq(self) -> np.ndarray:
@@ -146,7 +171,7 @@ class LlamaFamilyReference:
         q = self._project(f"{prefix}.q_proj", x).reshape(tokens, heads, dim)
         k = self._project(f"{prefix}.k_proj", x).reshape(tokens, kv_heads, dim)
         v = self._project(f"{prefix}.v_proj", x).reshape(tokens, kv_heads, dim)
-        if cfg.model_type == "qwen3":
+        if cfg.model_type in QK_NORM:
             q = self._norm(f"{prefix}.q_norm", q)
             k = self._norm(f"{prefix}.k_norm", k)
         inv_freq = cfg.inv_freq()
@@ -173,9 +198,43 @@ class LlamaFamilyReference:
 
     def _mlp(self, index: int, x: np.ndarray) -> np.ndarray:
         prefix = f"model.layers.{index}.mlp"
+        if self.config.sparse(index):
+            return self._experts(prefix, x)
         gate = _silu(x @ self.w[f"{prefix}.gate_proj"].T)
         up = x @ self.w[f"{prefix}.up_proj"].T
         return (gate * up) @ self.w[f"{prefix}.down_proj"].T
+
+    def route(self, index: int, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Expert indices ``[tokens, k]`` and their weights for layer ``index``."""
+
+        logits = (x @ self.w[f"model.layers.{index}.mlp.gate"].T).astype(np.float64)
+        probs = np.exp(logits - logits.max(axis=-1, keepdims=True))
+        probs /= probs.sum(axis=-1, keepdims=True)
+        k = self.config.num_experts_per_tok
+        chosen = np.argsort(-probs, axis=-1, kind="stable")[:, :k]
+        weights = np.take_along_axis(probs, chosen, axis=-1)
+        if self.config.norm_topk_prob:
+            weights /= weights.sum(axis=-1, keepdims=True)
+        return chosen, weights
+
+    def _expert_stack(self, prefix: str, name: str) -> np.ndarray:
+        """``[experts, rows, cols]``: MLX's stacked tensor or Transformers' per-expert ones."""
+
+        stacked = self.w.get(f"{prefix}.switch_mlp.{name}")
+        if stacked is not None:
+            return stacked
+        return np.stack([self.w[f"{prefix}.experts.{e}.{name}"] for e in range(self.config.num_experts)])
+
+    def _experts(self, prefix: str, x: np.ndarray) -> np.ndarray:
+        index = int(prefix.split(".")[2])
+        chosen, weights = self.route(index, x)
+        gate, up, down = (self._expert_stack(prefix, name) for name in ("gate_proj", "up_proj", "down_proj"))
+        out = np.zeros_like(x, dtype=np.float32)
+        for t in range(x.shape[0]):
+            for e, p in zip(chosen[t], weights[t]):
+                hidden = _silu(gate[e] @ x[t]) * (up[e] @ x[t])
+                out[t] += np.float32(p) * (down[e] @ hidden)
+        return out
 
     def logits(self, token_ids: Sequence[int]) -> np.ndarray:
         """Return ``[len(token_ids), vocab]`` float32 logits."""

@@ -83,14 +83,19 @@ def unpack_affine(words: np.ndarray, bits: int) -> np.ndarray:
 def dequantize_affine(
     words: np.ndarray, scales: np.ndarray, biases: np.ndarray, spec: QuantSpec
 ) -> np.ndarray:
-    """Return the ``float32`` matrix represented by an MLX affine triple."""
+    """Return the ``float32`` matrix represented by an MLX affine triple.
 
-    codes = unpack_affine(words, spec.bits).astype(np.float32)
-    rows, cols = codes.shape
+    Leading dimensions (stacked experts, ``[experts, rows, ...]``) are kept.
+    """
+
+    words = np.asarray(words, dtype=np.uint32)
+    *lead, rows, _ = words.shape
+    codes = unpack_affine(words.reshape(-1, words.shape[-1]), spec.bits).astype(np.float32)
+    cols = codes.shape[1]
     groups = cols // spec.group_size
-    if scales.shape != (rows, groups) or biases.shape != (rows, groups):
+    if scales.shape != (*lead, rows, groups) or biases.shape != (*lead, rows, groups):
         raise ValueError("scales/biases shape does not match weight")
-    grouped = codes.reshape(rows, groups, spec.group_size)
-    scale = np.asarray(scales, dtype=np.float32)[:, :, None]
-    bias = np.asarray(biases, dtype=np.float32)[:, :, None]
-    return (grouped * scale + bias).reshape(rows, cols)
+    grouped = codes.reshape(-1, groups, spec.group_size)
+    scale = np.asarray(scales, dtype=np.float32).reshape(-1, groups, 1)
+    bias = np.asarray(biases, dtype=np.float32).reshape(-1, groups, 1)
+    return (grouped * scale + bias).reshape(*lead, rows, cols)
