@@ -2,7 +2,7 @@
 
 These tests pin the oracles' semantics to an independent implementation:
 ``mx.dequantize`` for the packed affine layout, and MLX-LM's ``gemma3_text``,
-``gemma4``, ``llama``, ``qwen2`` and ``qwen3`` models for the full decoders. They need
+``gemma4``, ``llama``, ``qwen2``, ``qwen3`` and ``qwen3_moe`` models for the full decoders. They need
 ``mlx`` and ``mlx_lm`` and therefore run on Apple Silicon only.
 """
 from __future__ import annotations
@@ -93,8 +93,9 @@ def test_oracle_matches_mlx_lm_gemma3(tmp_path, spec):
         # MLX-LM runs Mistral through its Llama model, which has no sliding
         # window, so this variant leaves the window unset.
         TinyDenseSpec(model_type="mistral", tie_word_embeddings=False, rope_theta=1e6, seed=6),
+        TinyDenseSpec(model_type="qwen3_moe", head_dim=64, mlp_only_layers=(1,), seed=9),
     ],
-    ids=["llama3-rope-llama3", "qwen3-qk-norm", "qwen2-bias-group7", "mistral-untied"],
+    ids=["llama3-rope-llama3", "qwen3-qk-norm", "qwen2-bias-group7", "mistral-untied", "qwen3-moe-top2-of-8"],
 )
 def test_oracle_matches_mlx_lm_llama_family(tmp_path, spec):
     directory = write_tiny_dense(tmp_path / "model", spec)
