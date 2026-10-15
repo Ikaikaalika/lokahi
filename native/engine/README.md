@@ -23,9 +23,9 @@ cmake --build build/engine -j
 
 | Area | State | Evidence |
 |---|---|---|
-| Dense decoders on CPU: Gemma 3, Llama 3.x, Mistral, Qwen 2/2.5, Qwen 3 | Implemented | Correctness: matches the NumPy oracles (`oracles/gemma3.py`, `oracles/llama.py`) within 2e-4 relative; greedy tokens exact (`tests/test_native_engine.py`) |
-| Dense decoders on Metal (same families) | Implemented, awaiting first hardware run | Builds on hosted macOS CI; execution and parity run on the self-hosted runner |
-| Oracles vs MLX-LM (`gemma3_text`, `llama`, `qwen2`, `qwen3`) | Written | Runs on the self-hosted Mac (`tests/test_mlx_crosscheck.py`) |
+| Dense decoders on CPU: Gemma 3, Gemma 4 (dense; E2B/E4B and 31B layouts), Llama 3.x, Mistral, Qwen 2/2.5, Qwen 3 | Implemented | Correctness: matches the NumPy oracles (`oracles/gemma3.py`, `oracles/gemma4.py`, `oracles/llama.py`) within 2e-4 relative; greedy tokens exact (`tests/test_native_engine.py`). Gemma 4 fixtures cover KV sharing of both layer kinds, `attention_k_eq_v`, partial RoPE, per-layer inputs and layer scalars, and every non-equivalent mutation of those features fails the suite. The published E2B config parses to the expected layer map (`tests/engine_tests.cpp`) |
+| Dense decoders on Metal (Gemma 3 and the Llama family) | Implemented, awaiting first hardware run | Builds on hosted macOS CI; execution and parity run on the self-hosted runner. Gemma 4 is refused (`--backend auto` picks the CPU) until its kernels land |
+| Oracles vs MLX-LM (`gemma3_text`, `gemma4`, `llama`, `qwen2`, `qwen3`) | Written | Runs on the self-hosted Mac (`tests/test_mlx_crosscheck.py`) |
 | MLX affine 2/4/8-bit weights, BF16/F16 scales, per-module bit overrides | Implemented | Unit tests; MLX cross-check on Apple Silicon |
 | Tokenizer: SentencePiece-style BPE (Gemma, Llama 2, Mistral) from `tokenizer.json` | Implemented | Correctness: identical ids and text to Hugging Face `tokenizers` on trained fixtures (byte fallback, unknown fusion, added tokens, Metaspace) and a 262k-entry synthetic vocabulary (`tests/test_tokenizer.py`) |
 | Tokenizer: byte-level BPE (Llama 3, Qwen, GPT-OSS, DeepSeek, GLM) | Implemented | Correctness: identical words, ids and text to Hugging Face `tokenizers` for the Qwen 3, Llama 3, GLM, GPT-OSS o200k, DeepSeek V3 and GPT-2 configurations on text from every Unicode plane (`tests/test_tokenizer_bytelevel.py`); regex engine fuzzed against the reference's Oniguruma |
@@ -41,20 +41,31 @@ evidence against a fresh MLX-LM control.
 ## Design
 
 **Model families.** `DecoderConfig` describes how the supported families
-differ, and both backends implement every option:
+differ. The CPU backend implements every option; the Metal backend
+implements every column but Gemma 4:
 
-| Option | Gemma 3 | Llama 3.x | Mistral | Qwen 2/2.5 | Qwen 3 |
-|---|---|---|---|---|---|
-| RMSNorm scale | `1 + w` | `w` | `w` | `w` | `w` |
-| Norms after each sublayer | yes | no | no | no | no |
-| Per-head Q/K norm | yes | no | no | no | yes |
-| q/k/v biases | no | no | no | yes | no |
-| Gated MLP | GELU (tanh) | SiLU | SiLU | SiLU | SiLU |
-| RoPE | local and global bases, linear scaling | `llama3` or linear scaling | linear scaling | default | default |
-| Sliding window | 5 of every 6 layers | no | every layer, when set | no | no |
+| Option | Gemma 3 | Gemma 4 | Llama 3.x | Mistral | Qwen 2/2.5 | Qwen 3 |
+|---|---|---|---|---|---|---|
+| RMSNorm scale | `1 + w` | `w` | `w` | `w` | `w` | `w` |
+| Norms after each sublayer | yes | yes | no | no | no | no |
+| Per-head Q/K norm | yes | yes, plus a scale-free V norm; attention scale 1 | no | no | no | yes |
+| q/k/v biases | no | no | no | no | yes | no |
+| Gated MLP | GELU (tanh) | GELU (tanh), twice as wide in KV-shared layers | SiLU | SiLU | SiLU | SiLU |
+| RoPE | local and global bases, linear scaling | per layer kind; "proportional" partial rotation on full layers | `llama3` or linear scaling | linear scaling | default | default |
+| Sliding window | 5 of every 6 layers | 4 of every 5 layers | no | every layer, when set | no | no |
+| Per-layer geometry | no | full layers' own head size; with `attention_k_eq_v`, values are the raw keys and full layers have their own kv head count | no | no | no | no |
+| KV sharing | no | the last `num_kv_shared_layers` layers attend over the last unshared layer of their kind | no | no | no | no |
+| Per-layer inputs | no | a per-layer token embedding plus a projection of the embedding, gated into each layer; each layer's output times its `layer_scalar` | no | no | no | no |
 
 A family is a config parser in `decoder.cpp`. Options outside this table
-(o_proj or MLP biases, YaRN, partial rotary, other activations) fail at load.
+(o_proj or MLP biases, YaRN, partial rotary outside Gemma 4, other
+activations, Gemma 4's mixture-of-experts blocks) fail at load.
+
+Gemma 4's scalar constants (the embedding scale and the per-layer input
+scales) are rounded to BF16, as MLX-LM applies them to BF16 activations.
+Transformers rounds the embedding scales the same way but keeps the per-layer
+input scales in float32; those differ by about 1e-4, and two of the three
+cancel in the RMSNorm that follows.
 
 **Loading.** Checkpoints are memory-mapped safetensors (single file or
 shards) in MLX layout. The Metal backend copies every matrix once into a few
@@ -138,7 +149,7 @@ names differ:
   lm_head and sample. Each section is its own command buffer, and its time is
   that buffer's GPU time.
 - **CPU:** embed, norm, qkv, rope_kv, attention, o_proj, residual, mlp_up,
-  down_proj and lm_head. Times are host time.
+  down_proj, per_layer_input (Gemma 4) and lm_head. Times are host time.
 
 The per-section synchronization makes profiled runs slower than `bench`. Use
 the shares to choose work, and `bench` to measure it.
