@@ -38,7 +38,8 @@ bool is_gemma4(const Json& raw) {
 
 bool is_llama_family(const Json& raw) {
   const std::string type = model_type(raw);
-  return type == "llama" || type == "mistral" || type == "qwen2" || type == "qwen3" || type == "qwen3_moe";
+  return type == "llama" || type == "mistral" || type == "qwen2" || type == "qwen3" || type == "qwen3_moe" ||
+         type == "gpt_oss";
 }
 
 bool flag(const Json& cfg, const char* key) {
@@ -209,11 +210,14 @@ DecoderConfig gemma4_config(const Json& raw) {
   return c;
 }
 
-// Llama 3.x, Mistral, Qwen 2/2.5, Qwen 3 and Qwen 3 MoE: pre-norm blocks
-// with plain RMSNorm, SiLU-gated MLPs and rotate-half RoPE. Qwen 3 adds
+// Llama 3.x, Mistral, Qwen 2/2.5, Qwen 3, Qwen 3 MoE and GPT-OSS: pre-norm
+// blocks with plain RMSNorm, gated MLPs and rotate-half RoPE. Qwen 3 adds
 // per-head Q/K norm, Qwen 2 adds q/k/v biases, Mistral may use a sliding
 // window on every layer, and Qwen 3 MoE replaces the MLP of its sparse layers
-// with routed experts. Options these checkpoints do not use fail closed.
+// with routed experts. GPT-OSS adds attention biases and sinks, alternating
+// sliding and full layers, a top-k-then-softmax router over biased experts
+// with a clamped SwiGLU, and YaRN. Options these checkpoints do not use fail
+// closed.
 DecoderConfig llama_family_config(const Json& cfg) {
   DecoderConfig c;
   c.architecture = model_type(cfg);
@@ -229,14 +233,16 @@ DecoderConfig llama_family_config(const Json& cfg) {
                                                              : c.hidden_size / c.num_heads;
   c.rms_norm_eps = static_cast<float>(cfg.number_or("rms_norm_eps", 1e-6));
   c.qk_norm = arch == "qwen3" || arch == "qwen3_moe";
-  c.qkv_bias = arch == "qwen2";
+  c.qkv_bias = arch == "qwen2" || arch == "gpt_oss";
+  c.o_bias = arch == "gpt_oss";
+  c.attention_sinks = arch == "gpt_oss";
   c.attn_scale = 1.0f / std::sqrt(static_cast<float>(c.head_dim));
   c.rope_theta = static_cast<float>(cfg.number_or("rope_theta", 1e4));
 
   const std::string activation = cfg.string_or("hidden_act", "silu");
   LK_CHECK(activation == "silu", arch + ": unsupported activation " + activation);
-  // These add o_proj or MLP biases, which no supported checkpoint uses.
-  LK_CHECK(!flag(cfg, "attention_bias"), arch + ": attention_bias is not supported");
+  // These add o_proj or MLP biases, which only GPT-OSS uses.
+  LK_CHECK(arch == "gpt_oss" || !flag(cfg, "attention_bias"), arch + ": attention_bias is not supported");
   LK_CHECK(!flag(cfg, "mlp_bias"), arch + ": mlp_bias is not supported");
   const double rotary = cfg.number_or("partial_rotary_factor", 1.0);
   LK_CHECK(rotary == 1.0, arch + ": partial_rotary_factor is not supported");
@@ -254,6 +260,30 @@ DecoderConfig llama_family_config(const Json& cfg) {
     } else if (kind == "linear") {
       c.rope_scaling.kind = RopeScaling::Kind::Linear;
       c.rope_scaling.factor = scaling->at("factor").as_number();
+    } else if (kind == "yarn") {
+      // Transformers' _compute_yarn_parameters, including `truncate` (which
+      // GPT-OSS sets false and MLX-LM ignores).
+      RopeScaling& y = c.rope_scaling;
+      y.kind = RopeScaling::Kind::Yarn;
+      y.original_max_positions = scaling->at("original_max_position_embeddings").as_number();
+      const Json* factor = scaling->find("factor");
+      y.factor = factor != nullptr && factor->is_number()
+                     ? factor->as_number()
+                     : cfg.at("max_position_embeddings").as_number() / y.original_max_positions;
+      const double fast = scaling->number_or("beta_fast", 0.0), slow = scaling->number_or("beta_slow", 0.0);
+      y.beta_fast = fast != 0.0 ? fast : 32.0;
+      y.beta_slow = slow != 0.0 ? slow : 1.0;
+      const Json* truncate = scaling->find("truncate");
+      y.truncate = truncate == nullptr || !truncate->is_bool() || truncate->as_bool();
+      auto mscale = [](double scale, double m) { return scale <= 1.0 ? 1.0 : 0.1 * m * std::log(scale) + 1.0; };
+      double attention = scaling->number_or("attention_factor", 0.0);
+      if (attention == 0.0) {
+        const double m = scaling->number_or("mscale", 0.0), all = scaling->number_or("mscale_all_dim", 0.0);
+        attention = m != 0.0 && all != 0.0 ? mscale(y.factor, m) / mscale(y.factor, all) : mscale(y.factor, 1.0);
+      }
+      // The references scale cos and sin, so q and k, by `attention`; that is
+      // the same as scaling every attention logit by its square.
+      c.attn_scale *= static_cast<float>(attention * attention);
     } else {
       LK_CHECK(kind == "default", arch + ": rope_scaling type '" + kind + "' is not supported");
     }
@@ -267,6 +297,29 @@ DecoderConfig llama_family_config(const Json& cfg) {
   if (sliding) c.sliding_window = static_cast<int>(window->as_int());
   c.layer_is_sliding.assign(static_cast<size_t>(c.num_layers), sliding);
   c.eos_token_ids = eos_ids(cfg, cfg);
+
+  if (arch == "gpt_oss") {
+    // Alternating sliding and full layers by layer_types.
+    c.sliding_window = static_cast<int>(cfg.int_or("sliding_window", 128));
+    c.layer_is_sliding.clear();
+    if (const Json* types = cfg.find("layer_types"); types != nullptr && types->is_array()) {
+      for (const Json& kind : types->as_array()) c.layer_is_sliding.push_back(kind.as_string() == "sliding_attention");
+    } else {
+      for (int i = 0; i < c.num_layers; ++i) c.layer_is_sliding.push_back(i % 2 == 0);
+    }
+    c.num_experts = static_cast<int>(cfg.at("num_local_experts").as_int());
+    c.experts_per_token = static_cast<int>(cfg.int_or("num_experts_per_tok", cfg.int_or("experts_per_token", 4)));
+    c.moe_intermediate = c.intermediate_size;
+    LK_CHECK(c.num_experts > 0 && c.experts_per_token > 0 && c.experts_per_token <= c.num_experts,
+             arch + ": invalid expert configuration");
+    c.layer_moe.assign(static_cast<size_t>(c.num_layers), true);
+    c.router = DecoderConfig::Router::TopKSoftmax;
+    c.router_module = "mlp.router";
+    c.router_bias = true;
+    c.expert_bias = true;
+    c.activation = Activation::ClampedSwiglu;
+    c.swiglu_limit = static_cast<float>(cfg.number_or("swiglu_limit", 7.0));
+  }
 
   if (arch == "qwen3_moe") {
     // Qwen 2 MoE's shared expert is a different block.
@@ -340,6 +393,28 @@ std::vector<double> DecoderConfig::rope_inv_freq(bool sliding) const {
   const size_t rotated = sliding ? static_cast<size_t>(dims / 2)
                                  : static_cast<size_t>(static_cast<int>(dims * global_partial_rotary) / 2);
   std::vector<double> inv_freq(static_cast<size_t>(dims / 2), 0.0);
+  if (scaling.kind == RopeScaling::Kind::Yarn) {
+    // Interpolate (divide by the factor) the low frequencies, extrapolate the
+    // high ones, and ramp linearly between the dimensions where a frequency
+    // completes beta_fast and beta_slow rotations over the original context.
+    auto correction = [&](double rotations) {
+      return dims * std::log(scaling.original_max_positions / (rotations * 2.0 * kPi)) / (2.0 * std::log(base));
+    };
+    double low = correction(scaling.beta_fast), high = correction(scaling.beta_slow);
+    if (scaling.truncate) {
+      low = std::floor(low);
+      high = std::ceil(high);
+    }
+    low = std::max(low, 0.0);
+    high = std::min(high, static_cast<double>(dims - 1));
+    if (low == high) high += 0.001;
+    for (size_t i = 0; i < rotated; ++i) {
+      const double extrapolated = 1.0 / std::pow(base, static_cast<double>(2 * i) / dims);
+      const double ramp = std::clamp((static_cast<double>(i) - low) / (high - low), 0.0, 1.0);
+      inv_freq[i] = extrapolated / scaling.factor * ramp + extrapolated * (1.0 - ramp);
+    }
+    return inv_freq;
+  }
   for (size_t i = 0; i < rotated; ++i) {
     double f = 1.0 / std::pow(base, static_cast<double>(2 * i) / dims);
     if (scaling.kind == RopeScaling::Kind::Linear) {
@@ -372,13 +447,23 @@ void bind_experts(const DecoderWeights& w, DecoderLayer& layer, const std::strin
   const DecoderConfig& c = w.config;
   const Checkpoint& ck = *w.checkpoint;
   const std::string& p = c.weight_prefix;
-  layer.router = bind_linear(ck, w.raw_config, p + base + ".mlp.gate", p + base + ".mlp.gate");
+  const std::string router = p + base + "." + c.router_module;
+  layer.router = bind_linear(ck, w.raw_config, router, router);
   LK_CHECK(layer.router.rows == c.num_experts && layer.router.cols == c.hidden_size, base + ": router shape");
+  if (c.router_bias) {
+    layer.router_bias.resize(static_cast<size_t>(c.num_experts));
+    load_vector(ck, router + ".bias", c.num_experts, layer.router_bias.data());
+  }
   std::vector<Linear>* stacks[] = {&layer.expert_gate, &layer.expert_up, &layer.expert_down};
+  std::vector<float>* biases[] = {&layer.expert_gate_bias, &layer.expert_up_bias, &layer.expert_down_bias};
   const char* names[] = {"gate_proj", "up_proj", "down_proj"};
   for (int k = 0; k < 3; ++k) {
-    const std::string stacked = p + base + ".mlp.switch_mlp." + names[k];
-    if (ck.contains(stacked + ".weight")) {
+    // Stacked [experts, rows, cols]: MLX-LM's switch_mlp (Qwen) or experts
+    // (GPT-OSS); otherwise one module per expert.
+    std::string stacked = p + base + ".mlp.switch_mlp." + names[k];
+    if (!ck.contains(stacked + ".weight")) stacked = p + base + ".mlp.experts." + names[k];
+    const bool is_stacked = ck.contains(stacked + ".weight");
+    if (is_stacked) {
       *stacks[k] = bind_expert_linears(ck, w.raw_config, stacked, stacked);
     } else {
       for (int e = 0; e < c.num_experts; ++e) {
@@ -388,6 +473,21 @@ void bind_experts(const DecoderWeights& w, DecoderLayer& layer, const std::strin
     }
     LK_CHECK(static_cast<int>(stacks[k]->size()) == c.num_experts, base + ": expected " +
                                                                      std::to_string(c.num_experts) + " experts");
+    const int64_t rows = (*stacks[k])[0].rows;
+    if (c.expert_bias) {
+      biases[k]->resize(static_cast<size_t>(c.num_experts * rows));
+      if (is_stacked) {
+        load_vector(ck, stacked + ".bias", c.num_experts * rows, biases[k]->data());
+      } else {
+        for (int e = 0; e < c.num_experts; ++e) {
+          const std::string module = p + base + ".mlp.experts." + std::to_string(e) + "." + names[k];
+          load_vector(ck, module + ".bias", rows, biases[k]->data() + static_cast<size_t>(e * rows));
+        }
+      }
+    } else {
+      LK_CHECK(!ck.contains((is_stacked ? stacked : p + base + ".mlp.experts.0." + names[k]) + ".bias"),
+               base + ": unexpected expert bias for " + c.architecture);
+    }
   }
   for (int e = 0; e < c.num_experts; ++e) {
     const Linear& gate = layer.expert_gate[static_cast<size_t>(e)];
@@ -486,8 +586,15 @@ std::shared_ptr<DecoderWeights> DecoderWeights::load(const std::string& director
     for (const char* module : {".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj"}) {
       LK_CHECK(c.qkv_bias || !ck.contains(p + base + module + ".bias"), base + module + ": unexpected bias for " + arch);
     }
-    for (const char* module : {".self_attn.o_proj", ".mlp.gate_proj", ".mlp.up_proj", ".mlp.down_proj"}) {
+    LK_CHECK(c.o_bias || !ck.contains(p + base + ".self_attn.o_proj.bias"),
+             base + ".self_attn.o_proj: unexpected bias for " + arch);
+    for (const char* module : {".mlp.gate_proj", ".mlp.up_proj", ".mlp.down_proj"}) {
       LK_CHECK(!ck.contains(p + base + module + ".bias"), base + module + ": unexpected bias for " + arch);
+    }
+    if (c.o_bias) layer.o_bias = bias(base + ".self_attn.o_proj", c.hidden_size);
+    if (c.attention_sinks) {
+      layer.sinks.resize(static_cast<size_t>(c.num_heads));
+      load_vector(ck, p + base + ".self_attn.sinks", c.num_heads, layer.sinks.data());
     }
     layer.q_proj = linear(base + ".self_attn.q_proj");
     if (own_kv) {
@@ -858,11 +965,14 @@ class DecoderCpu final : public Model {
       }
       {
         Section section(profiler_, "attention", profiling ? traffic::attention(c_, l, start, n) : 0.0);
-        attend(l, start, n, sliding);
+        attend(l, start, n, sliding, c_.attention_sinks ? L.sinks.data() : nullptr);
       }
       {
         Section section(profiler_, "o_proj", profiling ? traffic::linear(L.o_proj, n) : 0.0);
         matmul(L.o_proj, attn_.data(), n, r_.data(), pool_);
+        if (c_.o_bias) {
+          for (int t = 0; t < n; ++t) add_bias(r_.data() + static_cast<size_t>(t) * hidden, L.o_bias);
+        }
       }
       {
         Section section(profiler_, "residual", residual_bytes);
@@ -915,14 +1025,33 @@ class DecoderCpu final : public Model {
   void gated_activation(float* gate, const float* up, size_t count) const {
     if (c_.activation == Activation::GeluTanh) {
       for (size_t i = 0; i < count; ++i) gate[i] = gelu_tanh(gate[i]) * up[i];
+    } else if (c_.activation == Activation::ClampedSwiglu) {
+      const float limit = c_.swiglu_limit;
+      for (size_t i = 0; i < count; ++i) {
+        const float g = std::min(gate[i], limit);
+        const float u = std::clamp(up[i], -limit, limit);
+        gate[i] = g / (1.0f + std::exp(-1.702f * g)) * (u + 1.0f);
+      }
     } else {
       for (size_t i = 0; i < count; ++i) gate[i] = silu(gate[i]) * up[i];
     }
   }
 
+  // rows[t] += bias[e * width ...] for each of n rows of `width` values.
+  static void add_expert_bias(float* rows, int n, int64_t width, const std::vector<float>& bias, int e) {
+    if (bias.empty()) return;
+    const float* b = bias.data() + static_cast<size_t>(e) * width;
+    for (int t = 0; t < n; ++t) {
+      float* row = rows + static_cast<size_t>(t) * width;
+      for (int64_t i = 0; i < width; ++i) row[i] += b[i];
+    }
+  }
+
   // r_ = the mixture-of-experts output for the normed rows in h_: each token's
-  // top experts by router softmax, weighted by their (renormalized)
-  // probabilities. Experts run once per pass over the tokens routed to them.
+  // top experts by router logit, weighted by their router probabilities
+  // (softmax over all experts, renormalized with norm_topk_prob, or a softmax
+  // over the chosen logits). Experts run once per pass over the tokens routed
+  // to them.
   void experts(const DecoderLayer& L, int n) {
     const int E = c_.num_experts, K = c_.experts_per_token;
     const int64_t hidden = c_.hidden_size, inter = c_.moe_intermediate;
@@ -936,7 +1065,8 @@ class DecoderCpu final : public Model {
       std::vector<int> order(static_cast<size_t>(E));
       std::vector<double> probs(static_cast<size_t>(E));
       for (int t = 0; t < n; ++t) {
-        const float* logits = route_.data() + static_cast<size_t>(t) * E;
+        float* logits = route_.data() + static_cast<size_t>(t) * E;
+        if (!L.router_bias.empty()) add_bias(logits, L.router_bias);
         const float top = *std::max_element(logits, logits + E);
         double total = 0.0;
         for (int e = 0; e < E; ++e) total += probs[static_cast<size_t>(e)] = std::exp(static_cast<double>(logits[e]) - top);
@@ -947,7 +1077,10 @@ class DecoderCpu final : public Model {
         });
         double kept = 0.0;
         for (int j = 0; j < K; ++j) kept += probs[static_cast<size_t>(order[static_cast<size_t>(j)])];
-        const double scale = c_.norm_topk_prob ? 1.0 / kept : 1.0 / total;
+        // Over the chosen experts, a softmax of their logits is their
+        // probabilities renormalized.
+        const bool renormalize = c_.norm_topk_prob || c_.router == DecoderConfig::Router::TopKSoftmax;
+        const double scale = renormalize ? 1.0 / kept : 1.0 / total;
         for (int j = 0; j < K; ++j) {
           const int e = order[static_cast<size_t>(j)];
           chosen_[static_cast<size_t>(t) * K + j] = e;
@@ -991,8 +1124,11 @@ class DecoderCpu final : public Model {
       }
       matmul(L.expert_gate[static_cast<size_t>(e)], expert_in_.data(), m, expert_gate_.data(), pool_);
       matmul(L.expert_up[static_cast<size_t>(e)], expert_in_.data(), m, expert_up_.data(), pool_);
+      add_expert_bias(expert_gate_.data(), m, inter, L.expert_gate_bias, e);
+      add_expert_bias(expert_up_.data(), m, inter, L.expert_up_bias, e);
       gated_activation(expert_gate_.data(), expert_up_.data(), sm * inter);
       matmul(L.expert_down[static_cast<size_t>(e)], expert_gate_.data(), m, expert_out_.data(), pool_);
+      add_expert_bias(expert_out_.data(), m, hidden, L.expert_down_bias, e);
       for (int i = 0; i < m; ++i) {
         const auto [t, weight] = tokens[static_cast<size_t>(i)];
         float* out = r_.data() + static_cast<size_t>(t) * hidden;
@@ -1029,7 +1165,7 @@ class DecoderCpu final : public Model {
 
   // Attention for the n tokens of this pass (queries in q_) over the keys and
   // values in the ring of layer l's KV source, into attn_.
-  void attend(int l, int start, int n, bool sliding) {
+  void attend(int l, int start, int n, bool sliding, const float* sinks) {
     const int H = c_.num_heads, D = c_.head_dim_of(l);
     const int group = H / c_.kv_heads_of(l);
     const int source = c_.kv_source(l);
@@ -1055,7 +1191,9 @@ class DecoderCpu final : public Model {
           scores[static_cast<size_t>(j - lo)] = dot;
           max_score = std::max(max_score, dot);
         }
-        float denom = 0.0f;
+        // A sink is one more logit in the softmax that attends to nothing.
+        if (sinks != nullptr) max_score = std::max(max_score, sinks[hh]);
+        float denom = sinks != nullptr ? std::exp(sinks[hh] - max_score) : 0.0f;
         for (float& s : scores) {
           s = std::exp(s - max_score);
           denom += s;

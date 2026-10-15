@@ -536,6 +536,47 @@ void test_gemma4_config() {
   EXPECT(keqv.kv_heads_of(34) == 4 && keqv.kv_source(34) == 14);
 }
 
+// The text fields of openai/gpt-oss-20b's config as mlx-community publishes it.
+static const char* kGptOss20BConfig = R"({
+  "attention_bias": true, "head_dim": 64, "hidden_act": "silu", "hidden_size": 2880, "intermediate_size": 2880,
+  "initial_context_length": 4096, "max_position_embeddings": 131072, "model_type": "gpt_oss",
+  "num_attention_heads": 64, "num_experts_per_tok": 4, "experts_per_token": 4, "num_hidden_layers": 24,
+  "num_key_value_heads": 8, "num_local_experts": 32, "rms_norm_eps": 1e-05, "rope_theta": 150000,
+  "rope_scaling": {"beta_fast": 32.0, "beta_slow": 1.0, "factor": 32.0, "original_max_position_embeddings": 4096,
+                   "rope_type": "yarn", "truncate": false},
+  "sliding_window": 128, "swiglu_limit": 7.0, "tie_word_embeddings": false, "vocab_size": 201088,
+  "eos_token_id": 200002,
+  "layer_types": ["sliding_attention", "full_attention", "sliding_attention", "full_attention",
+    "sliding_attention", "full_attention", "sliding_attention", "full_attention", "sliding_attention",
+    "full_attention", "sliding_attention", "full_attention", "sliding_attention", "full_attention",
+    "sliding_attention", "full_attention", "sliding_attention", "full_attention", "sliding_attention",
+    "full_attention", "sliding_attention", "full_attention", "sliding_attention", "full_attention"]
+})";
+
+void test_gpt_oss_config() {
+  const DecoderConfig c = DecoderConfig::from_json(Json::parse(kGptOss20BConfig));
+  EXPECT(c.architecture == "gpt_oss" && c.num_layers == 24 && c.num_experts == 32 && c.experts_per_token == 4);
+  EXPECT(c.moe_intermediate == 2880 && c.sliding_window == 128 && c.qkv_bias && c.o_bias && c.attention_sinks);
+  EXPECT(c.router == DecoderConfig::Router::TopKSoftmax && c.router_module == "mlp.router" && c.expert_bias);
+  EXPECT(c.activation == Activation::ClampedSwiglu && c.swiglu_limit == 7.0f && !c.uniform_layers());
+  for (int l = 0; l < 24; ++l) EXPECT(c.layer_is_sliding[static_cast<size_t>(l)] == (l % 2 == 0) && c.is_moe(l));
+  EXPECT(c.eos_token_ids == std::vector<int32_t>({200002}));
+  // YaRN's attention factor 0.1 ln 32 + 1, squared into the logit scale.
+  const double factor = 0.1 * std::log(32.0) + 1.0;
+  EXPECT(std::fabs(c.attn_scale / (factor * factor / 8.0) - 1.0) < 1e-6);
+  // Untruncated ramp between dimensions 8.09 and 17.4: pairs below extrapolate,
+  // pairs above interpolate (divide by 32), pairs between mix.
+  const std::vector<double> inv = c.rope_inv_freq(true);
+  auto plain = [](int i) { return std::pow(150000.0, -2.0 * i / 64); };
+  EXPECT(inv.size() == 32 && inv[0] == 1.0 && std::fabs(inv[8] / plain(8) - 1.0) < 1e-12);
+  EXPECT(std::fabs(inv[18] / (plain(18) / 32) - 1.0) < 1e-12 && std::fabs(inv[31] / (plain(31) / 32) - 1.0) < 1e-12);
+  const double pi = 3.14159265358979323846;
+  const double low = 64 * std::log(4096 / (32 * 2 * pi)) / (2 * std::log(150000.0));
+  const double high = 64 * std::log(4096 / (2 * pi)) / (2 * std::log(150000.0));
+  const double ramp = (12 - low) / (high - low);
+  EXPECT(std::fabs(inv[12] / (plain(12) / 32 * ramp + plain(12) * (1 - ramp)) - 1.0) < 1e-12);
+}
+
 int main() {
   test_json();
   test_half();
@@ -550,6 +591,7 @@ int main() {
   test_byte_level_stable_prefix();
   test_sampling();
   test_gemma4_config();
+  test_gpt_oss_config();
   if (g_failures) {
     std::fprintf(stderr, "%d expectation(s) failed\n", g_failures);
     return 1;
