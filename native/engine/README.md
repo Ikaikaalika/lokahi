@@ -17,6 +17,7 @@ cmake --build build/engine -j
 ./build/engine/lokahi bench --model DIR --tokens-file prompt.txt --max-new 128
 ./build/engine/lokahi profile --model DIR --tokens-file prompt.txt --max-new 32   # JSON: time per section
 ./build/engine/lokahi serve --config service.json   # Lōkahi wire v1 (Common Compute) as NDJSON on stdin/stdout
+./build/engine/lokahi generate --model GEMMA3_VLM --tokens-file prompt.txt --images photo.rgb --max-new 64
 ```
 
 ## Status
@@ -25,6 +26,7 @@ cmake --build build/engine -j
 |---|---|---|
 | Decoders on CPU: Gemma 3, Gemma 4 (dense; E2B/E4B and 31B layouts), Llama 3.x, Mistral, Qwen 2/2.5, Qwen 3, Qwen 3 MoE, GPT-OSS, GLM-4.5 | Implemented | Correctness: matches the NumPy oracles (`oracles/gemma3.py`, `oracles/gemma4.py`, `oracles/llama.py`) within 2e-4 relative; greedy tokens exact (`tests/test_native_engine.py`). Qwen 3 MoE fixtures cover stacked (MLX) and per-expert (Transformers) weights, renormalized and raw top-k, dense layers between sparse ones, and route far from ties on the router's real inputs. GPT-OSS fixtures mirror the 20B layout (MXFP4 experts behind affine overrides, sinks, alternating windows, untruncated YaRN) and are guarded so the SwiGLU clamps bind and the sinks move the logits; the published 20B config parses to the expected layer map, router and YaRN ramp. GLM-4.5 fixtures cover the Air layout and DeepSeek V3-style group-limited routing, and are guarded so the groups and the correction bias each change some token's experts. Gemma 4 fixtures cover KV sharing of both layer kinds, `attention_k_eq_v`, partial RoPE, per-layer inputs and layer scalars, and every non-equivalent mutation of those features fails the suite. The published E2B config parses to the expected layer map (`tests/engine_tests.cpp`) |
 | Decoders on Metal (every family above) | Implemented; correctness verified on a virtual GPU | Hosted macOS CI runs the Metal suites against the oracles on its paravirtual device (correctness only, no performance claims); hardware runs wait for the self-hosted runner. Gemma 4 covers 512-wide heads, KV sharing, `attention_k_eq_v`, the V norm, partial RoPE, per-layer inputs and layer scalars. Mixture-of-experts layers route on the GPU (`moe_route`) and run each token's experts with gathered matrix-vector kernels over stacked expert weights, affine or MXFP4. GPT-OSS adds sinks in the attention reduction, attention and expert biases and the clamped SwiGLU; GLM-4.5 adds a dense router kernel, grouped sigmoid routing (`moe_route_grouped`), the shared expert and classic partial RoPE. MXFP4 outside experts is refused (`--backend auto` picks the CPU) until the prefill matrix kernel and embedding gather read it |
+| Gemma 3 images on CPU (SigLIP tower and projector, `src/vision.h`; `--images`, `lokahi image-features`) | Implemented | Correctness: features, logits and greedy tokens match the NumPy oracle (`oracles/siglip.py`, Transformers' semantics) on a tiny vision-language fixture in mlx-community's layout, with prefill chunks that would cut an image, a window shorter than an image, and both convolution layouts; every mutant of the masks, the injection, the chunking and the tower fails the suite (`tests/test_gemma3_vision.py`). The published 4B config parses (`tests/engine_tests.cpp`). A correctness path: 896-pixel images cost about 5 TFLOP on the CPU's scalar matmul, and Metal refuses image features until its encoder lands |
 | Oracles vs MLX-LM (`gemma3_text`, `gemma4`, `llama`, `qwen2`, `qwen3`, `qwen3_moe`, `gpt_oss`, `glm4_moe`) | Written | Runs on the self-hosted Mac (`tests/test_mlx_crosscheck.py`) |
 | MLX affine 2/4/8-bit weights, BF16/F16 scales, per-module bit overrides | Implemented | Unit tests; MLX cross-check on Apple Silicon |
 | MLX MXFP4 weights (E2M1 codes, E8M0 scale per 32; GPT-OSS's expert format), on CPU and in Metal's matrix-vector and expert kernels | Implemented | Correctness: unit tests against hand-computed rows, the OCP encodings, and oracle parity on MXFP4 MLPs and experts (`tests/test_native_engine.py`); `mx.dequantize` cross-check on Apple Silicon. Per-module overrides follow `mlx.nn.quantize`: keys an override omits take its mode's defaults. Metal reads MXFP4 experts (GPT-OSS) and refuses MXFP4 elsewhere, since its prefill matrix kernel and embedding gather are affine only |
@@ -85,6 +87,21 @@ scales) are rounded to BF16, as MLX-LM applies them to BF16 activations.
 Transformers rounds the embedding scales the same way but keeps the per-layer
 input scales in float32; those differ by about 1e-4, and two of the three
 cancel in the RMSNorm that follows.
+
+**Images (Gemma 3).** `VisionEncoder` runs the processor's rescale and
+normalization on pre-resized RGB8 pixels, then the SigLIP tower (patch
+convolution, learned positions, pre-LayerNorm encoder layers with
+bidirectional attention, tanh GELU, a final LayerNorm), then the projector
+(average-pool to `mm_tokens_per_image`, RMSNorm `1 + w`, projection into the
+text width). `place_images` turns the features into a `PromptInjection` at
+the prompt's runs of `image_token_index`, which `Model::inject` hands to the
+next prefill: the rows replace those tokens' scaled embeddings as they are,
+and each image's tokens also attend to its later tokens. The sliding window
+still applies, as in Transformers' `AND(window, OR(causal, block))`. A
+prefill pass never splits an image; images longer than `--prefill-chunk`
+fail closed. MLX-VLM scales the features differently and builds no image
+mask, so the oracle follows Transformers, and there is no MLX cross-check for
+this path.
 
 **Loading.** Checkpoints are memory-mapped safetensors (single file or
 shards) in MLX layout. The Metal backend copies every matrix once into a few

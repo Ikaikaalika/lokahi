@@ -23,6 +23,11 @@ void Profiler::add(const std::string& name, double seconds, double bytes) {
   sections_.push_back({name, seconds, 1, bytes});
 }
 
+void Model::inject(PromptInjection injection) {
+  LK_CHECK(accepts_injection(), std::string("the ") + backend() + " backend does not take image features yet");
+  injection_ = std::move(injection);
+}
+
 int32_t argmax(const float* values, int count) {
   int32_t best = 0;
   for (int i = 1; i < count; ++i) {

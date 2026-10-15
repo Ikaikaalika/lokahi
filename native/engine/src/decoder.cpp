@@ -821,14 +821,26 @@ class DecoderCpu final : public Model {
   int position() const override { return position_; }
   size_t weight_bytes() const override { return w_->matrix_bytes(); }
   const std::vector<int32_t>& eos_token_ids() const override { return c_.eos_token_ids; }
-  void reset() override { position_ = 0; }
+  void reset() override {
+    position_ = 0;
+    injection_ = {};
+  }
 
   const float* prefill(const int32_t* tokens, int n) override {
     LK_CHECK(n > 0, "prefill requires at least one token");
-    for (int start = 0; start < n; start += chunk_) {
+    begin_injection(n);
+    const int base = position_;
+    for (int start = 0; start < n;) {
       int count = std::min(chunk_, n - start);
+      // A pass never splits an image block: it ends where the block begins.
+      for (const auto& [begin, end] : active_.blocks) {
+        const int b = begin - base;
+        if (b > start && b < start + count && end - base > start + count) count = b - start;
+      }
       forward(tokens + start, count, start + count == n);
+      start += count;
     }
+    end_injection();
     return logits_.data();
   }
 
@@ -837,7 +849,63 @@ class DecoderCpu final : public Model {
     return logits_.data();
   }
 
+ protected:
+  bool accepts_injection() const override { return true; }
+
  private:
+  // Takes the pending injection for a prefill of n tokens at position_,
+  // checks it, and indexes its rows and blocks by position.
+  void begin_injection(int n) {
+    active_ = std::move(injection_);
+    injection_ = {};
+    injected_row_.clear();
+    block_end_.clear();
+    inject_base_ = position_;
+    if (active_.empty()) return;
+    LK_CHECK(c_.per_layer_input == 0, c_.architecture + ": image features with per-layer inputs are not supported yet");
+    const size_t width = static_cast<size_t>(c_.hidden_size);
+    LK_CHECK(active_.rows.size() == active_.positions.size() * width, "injected rows must be hidden_size wide");
+    injected_row_.assign(static_cast<size_t>(n), -1);
+    for (size_t i = 0; i < active_.positions.size(); ++i) {
+      const int rel = active_.positions[i] - inject_base_;
+      LK_CHECK(rel >= 0 && rel < n, "image features must fall inside the prefill");
+      LK_CHECK(injected_row_[static_cast<size_t>(rel)] < 0, "an image position is given twice");
+      injected_row_[static_cast<size_t>(rel)] = static_cast<int>(i);
+    }
+    block_end_.assign(static_cast<size_t>(n), -1);
+    for (const auto& [begin, end] : active_.blocks) {
+      LK_CHECK(begin >= inject_base_ && begin < end && end <= inject_base_ + n,
+               "image blocks must fall inside the prefill");
+      LK_CHECK(end - begin <= chunk_, "an image's " + std::to_string(end - begin) +
+                                          " tokens do not fit one prefill chunk of " + std::to_string(chunk_));
+      for (int pos = begin; pos < end; ++pos) {
+        int& slot = block_end_[static_cast<size_t>(pos - inject_base_)];
+        LK_CHECK(slot < 0, "image blocks overlap");
+        slot = end;
+      }
+    }
+  }
+
+  void end_injection() {
+    active_ = {};
+    injected_row_.clear();
+    block_end_.clear();
+  }
+
+  // The injected row for position `pos`, or -1.
+  int injected_row(int pos) const {
+    const int rel = pos - inject_base_;
+    return rel >= 0 && rel < static_cast<int>(injected_row_.size()) ? injected_row_[static_cast<size_t>(rel)] : -1;
+  }
+
+  // The last key position `pos` attends to: itself, or the last position of
+  // its image block.
+  int last_key(int pos) const {
+    const int rel = pos - inject_base_;
+    if (rel < 0 || rel >= static_cast<int>(block_end_.size())) return pos;
+    return std::max(pos, block_end_[static_cast<size_t>(rel)] - 1);
+  }
+
   // Key or value `kv` of position `pos` in `layer`'s ring.
   const float* cached(const std::vector<std::vector<float>>& cache, int layer, int kv, int pos) const {
     const int capacity = capacity_[static_cast<size_t>(layer)];
@@ -941,6 +1009,11 @@ class DecoderCpu final : public Model {
       Section section(profiler_, "embed", profiler_ ? traffic::embed(w_->embed, n) : 0.0);
       for (int t = 0; t < n; ++t) {
         float* row = x_.data() + t * hidden;
+        // Injected rows (image features) replace the scaled embedding as is.
+        if (const int injected = injected_row(position_ + t); injected >= 0) {
+          std::copy_n(active_.rows.data() + static_cast<size_t>(injected) * hidden, hidden, row);
+          continue;
+        }
         dequantize_row(w_->embed, tokens[t], row);
         if (c_.embed_scale != 1.0f) {
           for (int64_t i = 0; i < hidden; ++i) row[i] *= c_.embed_scale;
@@ -1283,11 +1356,14 @@ class DecoderCpu final : public Model {
         const int hh = static_cast<int>(item % H);
         const int kv = hh / group;
         const int pos = start + t;
+        // Keys [lo, hi]: causal, except that an image block's tokens also see
+        // its later positions (all in this pass); the window still applies.
         const int lo = sliding ? std::max(0, pos - c_.sliding_window + 1) : 0;
+        const int hi = last_key(pos);
         const float* qv = q_.data() + (static_cast<size_t>(t) * H + hh) * D;
-        scores.resize(static_cast<size_t>(pos - lo + 1));
+        scores.resize(static_cast<size_t>(hi - lo + 1));
         float max_score = -std::numeric_limits<float>::infinity();
-        for (int j = lo; j <= pos; ++j) {
+        for (int j = lo; j <= hi; ++j) {
           const float* kvec = cached(kv_k_, source, kv, j);
           float dot = 0.0f;
           for (int d = 0; d < D; ++d) dot += qv[d] * kvec[d];
@@ -1307,7 +1383,7 @@ class DecoderCpu final : public Model {
         }
         float* out = attn_.data() + (static_cast<size_t>(t) * H + hh) * D;
         std::fill(out, out + D, 0.0f);
-        for (int j = lo; j <= pos; ++j) {
+        for (int j = lo; j <= hi; ++j) {
           const float p = scores[static_cast<size_t>(j - lo)] / denom;
           const float* vvec = cached(kv_v_, source, kv, j);
           for (int d = 0; d < D; ++d) out[d] += p * vvec[d];
@@ -1324,6 +1400,11 @@ class DecoderCpu final : public Model {
   int position_ = 0;
   size_t max_q_ = 0, max_kv_ = 0, max_inter_ = 0;  // per-token widths, the largest over layers
   std::vector<int> capacity_;                       // ring positions per layer; 0 for KV-shared layers
+  // The injection of the prefill in progress: its rows and, per position from
+  // inject_base_, the row index and the image block's end (-1 for none).
+  PromptInjection active_;
+  int inject_base_ = 0;
+  std::vector<int> injected_row_, block_end_;
   std::vector<std::vector<float>> kv_k_, kv_v_;
   std::vector<double> inv_freq_local_, inv_freq_global_;
   std::vector<float> x_, h_, r_, q_, k_, v_, attn_, gate_, up_, logits_;
