@@ -18,6 +18,7 @@ chip, OS build, and workload. Work is chosen and accepted by the
 | Oracles vs MLX-LM cross-check | Written | Runs on the self-hosted Mac |
 | Self-hosted Apple Silicon CI | Written | Needs the runner registered ([setup](APPLE_SILICON_RUNNER.md)) |
 | [Improvement loop](IMPROVEMENT_LOOP.md): `lokahi profile`, attribution, scoreboard, PR comment | Written | Correctness of the tooling: the profiler leaves tokens unchanged; scoring is tested on synthetic reports. First scoreboard waits on the runner |
+| Common Compute service: wire v1 codec, chat templates, request service, C ABI, Swift XPC package | Written | Correctness: acceptance gate B, and gate C parity on a fixture model (CPU here, XPC on hosted macOS). Gate C on a real pinned model runs on the self-hosted Mac. Wiring into the provider app needs access to its repository |
 | Common Compute fleet benchmarks | Spec below | Needs access to the provider app repository |
 | MLX-LM M1 baselines | Recorded (Qwen3 0.6B, Llama 3.2 1B, Gemma 3 1B) | Hardware, Aug 2026 |
 

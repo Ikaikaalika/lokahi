@@ -187,6 +187,7 @@ state machine, hardware profile, and explicit limitations.
 | `docs/LOKAHI_ENGINE_ARCHITECTURE.md` | Detailed Lōkahi engine modules, state machines, hot path, and build order |
 | `docs/MODEL_ADAPTIVE_ARCHITECTURE.md` | Dynamic model manifest, catalog bridge, family lowerings, and GPT-OSS design |
 | `docs/COMMON_COMPUTE_MODEL_BENCHMARKS.md` | Pinned M1 model ladder, MLX-LM runner, and Darkbloom comparison boundary |
+| `integrations/commoncompute/lokahi-xpc/` | Swift XPC service wrapping the native engine's wire v1 service (`LokahiComputeServiceV1`) |
 | `integrations/commoncompute/lokahi-wire-v1/` | Portable v1 request/control/event/receipt contract, Swift reference types, golden fixtures, verifier, and integration gates |
 | `docs/WAVE1_EVIDENCE.md` | Local M1 CPU, Metal, and ANE evidence and limitations |
 | `docs/WAVE2_EVIDENCE.md` | Adaptive planner, weight pack, and direct-ANE projection proof |

@@ -1,0 +1,5 @@
+module CLokahi [system] {
+    header "../../../../native/engine/include/lokahi/lokahi.h"
+    link "lokahi"
+    export *
+}
