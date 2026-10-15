@@ -6,7 +6,8 @@ Covers:
 * the native host sampler against the independent float64 oracle
   (``lokahi.oracles.sampling``);
 * the drawn distribution against its exact probabilities;
-* the sampler on each backend in ``LOKAHI_TEST_BACKENDS``.
+* generation on every fixture family against the same oracle, on each
+  backend in ``LOKAHI_TEST_BACKENDS``.
 
 Exact tokens are compared only where the oracle shows the decision is
 farther from a tie than float32 rounding could move it. Correctness evidence
@@ -23,6 +24,8 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from lokahi.fixtures import TinyDenseSpec, TinyGemma3Spec, write_tiny_dense, write_tiny_gemma3
+from lokahi.oracles import Gemma3Reference, LlamaFamilyReference
 from lokahi.oracles.sampling import SamplingParams, expected_distribution, philox4x32_10, sample
 
 # Decisions closer than this are left to float32 rounding and not compared;
@@ -137,3 +140,108 @@ def test_invalid_parameters_fail_closed(native_cli, tmp_path):
         result = subprocess.run([str(native_cli), "sample", "--logits-file", str(path), "--vocab", "4", *flags],
                                 capture_output=True, text=True)
         assert result.returncode != 0 and "sampling:" in result.stderr, flags
+
+
+FIXTURES = {
+    "gemma3": lambda d: write_tiny_gemma3(d, TinyGemma3Spec()),
+    "llama3": lambda d: write_tiny_dense(d, TinyDenseSpec(num_attention_heads=8, num_key_value_heads=2, head_dim=64,
+                                                         hidden_size=256, seed=3)),
+    "qwen3": lambda d: write_tiny_dense(d, TinyDenseSpec(model_type="qwen3", num_attention_heads=4,
+                                                        num_key_value_heads=2, head_dim=128, seed=4)),
+}
+
+
+PROMPT = [2, 5, 9, 33, 100, 7]
+
+
+@pytest.fixture(scope="module", params=sorted(FIXTURES))
+def fixture_model(request, tmp_path_factory):
+    """A fixture model, its oracle, and its logit scale. Random weights give
+    logits with a spread of 5 to 12, so temperatures are scaled by it to make
+    the draws diverse enough to test."""
+
+    directory = tmp_path_factory.mktemp(request.param)
+    FIXTURES[request.param](directory)
+    oracle = Gemma3Reference.load(directory) if request.param == "gemma3" else LlamaFamilyReference.load(directory)
+    scale = round(float(oracle.logits(PROMPT)[-1].std()), 1)
+    return directory, oracle, scale
+
+
+# Filters act on the untempered distribution (mlx_lm semantics), so their
+# limits are chosen to keep a nontrivial support on the fixtures' logits.
+GENERATION_PARAMS = {
+    "temperature": lambda scale: SamplingParams(temperature=scale, seed=7),
+    "top-k": lambda scale: SamplingParams(temperature=1.5 * scale, top_k=50, seed=8),
+    "top-p-min-p": lambda scale: SamplingParams(temperature=scale, top_p=0.999, min_p=1e-5, seed=9),
+}
+
+
+def _generate(cli: Path, directory: Path, backend: str, params: SamplingParams, steps: int) -> list[int]:
+    return _run(cli, "generate", "--model", str(directory), "--backend", backend,
+                "--tokens", ",".join(map(str, PROMPT)), "--max-new", str(steps), "--no-eos-stop",
+                *params.cli_args())["tokens"]
+
+
+@pytest.mark.parametrize("backend", _backends())
+@pytest.mark.parametrize("kind", sorted(GENERATION_PARAMS))
+def test_generation_draws_each_step_with_its_index(native_cli, fixture_model, backend, kind, tmp_path):
+    """The engine's tokens are the reference sampler's draws on the engine's own
+    logits, step by step: the step counter, filters and noise are wired right."""
+
+    if backend == "metal":
+        pytest.skip("Metal sampling arrives with its kernel")
+    directory, oracle, scale = fixture_model
+    params = GENERATION_PARAMS[kind](scale)
+    steps = 12
+    tokens = _generate(native_cli, directory, backend, params, steps)
+    assert len(tokens) == steps
+    # The untempered nucleus of a random-weight model is tiny, so only the
+    # unfiltered kinds must vary; a wrongly ignored filter still shows up as
+    # draws outside the oracle's support.
+    if kind != "top-p-min-p":
+        assert len(set(tokens)) >= 4, "draws too uniform to test anything"
+    assert tokens == _generate(native_cli, directory, backend, params, steps), "not reproducible"
+    out = tmp_path / "logits.bin"
+    report = _run(native_cli, "logits", "--model", str(directory), "--backend", backend,
+                  "--tokens", ",".join(map(str, PROMPT + tokens[:-1])), "--prefill", str(len(PROMPT)),
+                  "--out", str(out))
+    rows = np.fromfile(out, dtype=np.float32).reshape(report["rows"], oracle.config.vocab_size)
+    checked = 0
+    for step, token in enumerate(tokens):
+        draw = sample(rows[step], params, step)
+        if draw.score_margin < 1e-3 or not draw.filters_stable:
+            continue
+        checked += 1
+        assert token == draw.token, step
+    assert checked >= steps - 2
+
+
+@pytest.mark.parametrize("kind", sorted(GENERATION_PARAMS))
+def test_cpu_generation_follows_the_oracle_model(native_cli, fixture_model, kind):
+    """Against full-recompute NumPy logits, the sequences agree until the first
+    draw that logit rounding could flip."""
+
+    directory, oracle, scale = fixture_model
+    params = GENERATION_PARAMS[kind](scale)
+    steps = 10
+    tokens = _generate(native_cli, directory, "cpu", params, steps)
+    context = list(PROMPT)
+    for step in range(steps):
+        # NumPy and engine logits differ by up to ~2e-4 of their range.
+        draw = sample(oracle.logits(context)[-1], params, step, mass_delta=1e-3, logit_delta=5e-2)
+        if draw.score_margin < 2e-2 or not draw.filters_stable:
+            break
+        assert tokens[step] == draw.token, step
+        context.append(draw.token)
+    else:
+        return
+    assert step >= 2, "too few comparable steps; pick another seed"
+
+
+@pytest.mark.parametrize("backend", _backends())
+def test_temperature_zero_is_greedy(native_cli, fixture_model, backend):
+    directory, oracle, _ = fixture_model
+    greedy = _run(native_cli, "generate", "--model", str(directory), "--backend", backend,
+                  "--tokens", ",".join(map(str, PROMPT)), "--max-new", "8", "--no-eos-stop")["tokens"]
+    assert greedy == oracle.greedy(PROMPT, 8)
+    assert _generate(native_cli, directory, backend, SamplingParams(temperature=0.0, top_p=0.5, seed=9), 8) == greedy

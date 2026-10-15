@@ -3,8 +3,8 @@
 //   lokahi info       --model DIR [--backend B]
 //   lokahi logits     --model DIR --tokens 2,5,9 [--prefill N] --out FILE
 //   lokahi generate   --model DIR (--tokens 2,5,9 | --prompt TEXT) --max-new N [--no-eos-stop]
-//   lokahi sample     --logits-file F.f32 --vocab V [--temperature T] [--top-p P] [--top-k K]
-//                     [--min-p M] [--seed S] [--steps N] [--first-step S]
+//                     [--temperature T] [--top-p P] [--top-k K] [--min-p M] [--seed S]
+//   lokahi sample     --logits-file F.f32 --vocab V [sampling flags] [--steps N] [--first-step S]
 //   lokahi bench      --model DIR (--tokens ... | --tokens-file F) --max-new N
 //                     [--warmups W] [--repetitions R]
 //   lokahi profile    --model DIR (--tokens ... | --tokens-file F | --prompt TEXT)
@@ -203,8 +203,8 @@ int cmd_generate(const Args& args) {
   auto model = load_model(args.get("model"), load_options(args));
   std::vector<int32_t> tokens = prompt_tokens(args);
   GenerationTiming timing;
-  auto generated =
-      model->generate_greedy(tokens, args.get_int("max-new", 16), !args.has("no-eos-stop"), &timing);
+  auto generated = model->generate(tokens, args.get_int("max-new", 16), sampling_options(args),
+                                   !args.has("no-eos-stop"), &timing);
   std::string text;
   if (args.has("prompt")) text = ",\"text\":" + json_string(load_tokenizer(args).decode(generated, true));
   std::printf("{\"backend\":\"%s\",\"tokens\":%s%s,\"prefill_seconds\":%.9f,\"decode_seconds\":%.9f}\n",

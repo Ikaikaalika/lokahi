@@ -14,6 +14,7 @@ import pytest
 
 from lokahi.fixtures import TinyGemma3Spec, write_tiny_gemma3
 from lokahi.oracles import Gemma3Reference
+from lokahi.oracles.sampling import SamplingParams, sample
 
 
 class LoadOptions(ctypes.Structure):
@@ -27,6 +28,16 @@ class LoadOptions(ctypes.Structure):
 
 class Timing(ctypes.Structure):
     _fields_ = [("prefill_seconds", ctypes.c_double), ("decode_seconds", ctypes.c_double), ("generated_tokens", ctypes.c_int32)]
+
+
+class Sampling(ctypes.Structure):
+    _fields_ = [
+        ("temperature", ctypes.c_float),
+        ("top_p", ctypes.c_float),
+        ("top_k", ctypes.c_int32),
+        ("min_p", ctypes.c_float),
+        ("seed", ctypes.c_uint64),
+    ]
 
 
 @pytest.fixture(scope="module")
@@ -43,7 +54,7 @@ def _check(lib, code):
 
 
 def test_abi_version_and_errors(lib):
-    assert lib.lokahi_abi_version() == 1
+    assert lib.lokahi_abi_version() == 2
     handle = ctypes.c_void_p()
     assert lib.lokahi_model_load(b"/nonexistent", None, ctypes.byref(handle)) != 0
     assert b"config.json" in lib.lokahi_last_error()
@@ -72,8 +83,46 @@ def test_model_prefill_decode_and_generate(lib, tmp_path):
         _check(lib, lib.lokahi_generate_greedy(handle, tokens, len(prompt), 10, 0, out, ctypes.byref(count), ctypes.byref(timing)))
         assert list(out[: count.value]) == oracle.greedy(prompt, 10)
         assert timing.generated_tokens == 10
+
+        # Seeded generation: each token is the reference sampler's draw at its step.
+        params = Sampling(temperature=4.0, top_p=1.0, top_k=40, min_p=0.0, seed=2024)
+        lib.lokahi_model_reset(handle)
+        _check(lib, lib.lokahi_generate(handle, tokens, len(prompt), 10, ctypes.byref(params), 0, out,
+                                        ctypes.byref(count), None))
+        sampled = list(out[: count.value])
+        lib.lokahi_model_reset(handle)
+        _check(lib, lib.lokahi_generate(handle, tokens, len(prompt), 10, ctypes.byref(params), 0, out,
+                                        ctypes.byref(count), None))
+        assert list(out[: count.value]) == sampled
+        reference = SamplingParams(temperature=4.0, top_k=40, seed=2024)
+        context = list(prompt)
+        for step, token in enumerate(sampled):
+            draw = sample(oracle.logits(context)[-1], reference, step)
+            if draw.score_margin < 2e-2:
+                break
+            assert token == draw.token, step
+            context.append(token)
+        lib.lokahi_model_reset(handle)
+        _check(lib, lib.lokahi_generate(handle, tokens, len(prompt), 10, None, 0, out, ctypes.byref(count), None))
+        assert list(out[: count.value]) == oracle.greedy(prompt, 10)
     finally:
         lib.lokahi_model_free(handle)
+
+
+def test_reference_sampler_and_parameter_errors(lib):
+    logits = np.array([0.5, 3.0, 2.9, -1.0, 3.0, 0.0, 1.0], dtype=np.float32)
+    buffer = logits.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+    token = ctypes.c_int32()
+    params = Sampling(temperature=0.9, top_p=0.95, top_k=0, min_p=0.0, seed=77)
+    reference = SamplingParams(temperature=0.9, top_p=0.95, seed=77)
+    for step in range(32):
+        _check(lib, lib.lokahi_sample(buffer, len(logits), ctypes.byref(params), step, ctypes.byref(token)))
+        assert token.value == sample(logits, reference, step).token
+    _check(lib, lib.lokahi_sample(buffer, len(logits), None, 0, ctypes.byref(token)))
+    assert token.value == 1
+    bad = Sampling(temperature=1.0, top_p=0.0, top_k=0, min_p=0.0, seed=0)
+    assert lib.lokahi_sample(buffer, len(logits), ctypes.byref(bad), 0, ctypes.byref(token)) != 0
+    assert b"top_p" in lib.lokahi_last_error()
 
 
 def test_tokenizer_round_trip_and_capacity_contract(lib, tmp_path):

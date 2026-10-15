@@ -31,14 +31,18 @@ int32_t argmax(const float* values, int count) {
   return best;
 }
 
-std::vector<int32_t> Model::generate_greedy(const std::vector<int32_t>& prompt, int max_new,
-                                            bool stop_at_eos, GenerationTiming* timing,
-                                            const TokenCallback& on_token) {
+std::vector<int32_t> Model::generate(const std::vector<int32_t>& prompt, int max_new,
+                                     const SamplingParams& sampling, bool stop_at_eos, GenerationTiming* timing,
+                                     const TokenCallback& on_token) {
   std::vector<int32_t> out;
   if (max_new <= 0) return out;
+  validate_sampling(sampling);
   const auto& eos = eos_token_ids();
+  auto pick = [&](const float* logits) {
+    return sample_token(logits, vocab_size(), sampling, static_cast<int>(out.size()));
+  };
   const double start = now_seconds();
-  int32_t token = argmax(prefill(prompt.data(), static_cast<int>(prompt.size())), vocab_size());
+  int32_t token = pick(prefill(prompt.data(), static_cast<int>(prompt.size())));
   const double first = now_seconds();
   out.push_back(token);
   if (timing) {
@@ -48,7 +52,7 @@ std::vector<int32_t> Model::generate_greedy(const std::vector<int32_t>& prompt, 
   bool keep_going = !on_token || on_token(token);
   while (keep_going && static_cast<int>(out.size()) < max_new) {
     if (stop_at_eos && std::find(eos.begin(), eos.end(), token) != eos.end()) break;
-    token = argmax(decode(token), vocab_size());
+    token = pick(decode(token));
     out.push_back(token);
     if (timing) timing->token_times.push_back(now_seconds());
     keep_going = !on_token || on_token(token);

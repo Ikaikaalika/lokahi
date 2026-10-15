@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+#include "sampling.h"
+
 namespace lokahi {
 
 struct LoadOptions {
@@ -72,11 +74,17 @@ class Model {
   // returning false stops generation after that token.
   using TokenCallback = std::function<bool(int32_t)>;
 
-  // Greedy generation. Backends may keep tokens on the device and pipeline
-  // steps; the default runs prefill + decode with host-side argmax.
-  virtual std::vector<int32_t> generate_greedy(const std::vector<int32_t>& prompt, int max_new,
-                                               bool stop_at_eos, GenerationTiming* timing,
-                                               const TokenCallback& on_token = {});
+  // Generates up to max_new tokens with `sampling` (sampling.h); generated
+  // token i is drawn with step i. Backends may keep tokens on the device and
+  // pipeline steps; the default runs prefill + decode and samples on the host.
+  virtual std::vector<int32_t> generate(const std::vector<int32_t>& prompt, int max_new,
+                                        const SamplingParams& sampling, bool stop_at_eos,
+                                        GenerationTiming* timing, const TokenCallback& on_token = {});
+
+  std::vector<int32_t> generate_greedy(const std::vector<int32_t>& prompt, int max_new, bool stop_at_eos,
+                                       GenerationTiming* timing, const TokenCallback& on_token = {}) {
+    return generate(prompt, max_new, SamplingParams{}, stop_at_eos, timing, on_token);
+  }
 
  protected:
   Profiler* profiler_ = nullptr;

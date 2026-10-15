@@ -193,10 +193,12 @@ class DecoderMetal final : public Model {
     }
   }
 
-  std::vector<int32_t> generate_greedy(const std::vector<int32_t>& prompt, int max_new, bool stop_at_eos,
-                                       GenerationTiming* timing, const TokenCallback& on_token) override {
+  std::vector<int32_t> generate(const std::vector<int32_t>& prompt, int max_new, const SamplingParams& sampling,
+                                bool stop_at_eos, GenerationTiming* timing, const TokenCallback& on_token) override {
     std::vector<int32_t> out;
     if (max_new <= 0) return out;
+    validate_sampling(sampling);
+    LK_CHECK(sampling.greedy(), "metal: seeded sampling is not implemented yet; use --backend cpu");
     @autoreleasepool {
       drain();
       const int prompt_len = static_cast<int>(prompt.size());
