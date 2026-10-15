@@ -12,7 +12,10 @@ The default spec has the shape of mlx-community's Gemma 4 E2B, scaled down:
 - nested text_config with the language_model. prefix.
 
 attention_k_eq_v and num_global_key_value_heads cover the 26B/31B
-variant. Correctness evidence only.
+variant; enable_moe_block adds 26B-A4B's mixture of experts beside each
+dense MLP (stacked switch_glu experts, an 8-bit router with its input scale
+and per-expert scales, and the extra pre/post norms). Correctness evidence
+only.
 """
 from __future__ import annotations
 
@@ -47,6 +50,10 @@ class TinyGemma4Spec:
     attention_k_eq_v: bool = False
     tie_word_embeddings: bool = True
     final_logit_softcapping: float | None = 30.0
+    enable_moe_block: bool = False
+    num_experts: int = 8
+    top_k_experts: int = 2
+    moe_intermediate_size: int = 64
     nested: bool = True  # text_config and the language_model. prefix, as mlx-community ships it
     group_size: int = 32
     bits: int = 4
@@ -83,7 +90,9 @@ class TinyGemma4Spec:
             "hidden_size_per_layer_input": self.hidden_size_per_layer_input,
             "use_double_wide_mlp": self.use_double_wide_mlp,
             "attention_k_eq_v": self.attention_k_eq_v,
-            "enable_moe_block": False,
+            "enable_moe_block": self.enable_moe_block,
+            **({"num_experts": self.num_experts, "top_k_experts": self.top_k_experts,
+                "moe_intermediate_size": self.moe_intermediate_size} if self.enable_moe_block else {}),
             "final_logit_softcapping": self.final_logit_softcapping,
             "tie_word_embeddings": self.tie_word_embeddings,
             "eos_token_id": 1,
@@ -93,6 +102,10 @@ class TinyGemma4Spec:
 
     def config(self) -> dict:
         quant = {"group_size": self.group_size, "bits": self.bits, "mode": "affine"}
+        if self.enable_moe_block:  # 8-bit routers, as mlx-community converts 26B-A4B
+            p = "language_model." if self.nested else ""
+            for layer in range(self.num_hidden_layers):
+                quant[f"{p}model.layers.{layer}.router.proj"] = {"group_size": self.group_size, "bits": 8}
         if not self.nested:
             return {**self.text_config(), "quantization": quant, "quantization_config": quant}
         return {
@@ -116,8 +129,16 @@ def write_tiny_gemma4(directory: Path, spec: TinyGemma4Spec = TinyGemma4Spec()) 
     p = "language_model." if spec.nested else ""
     qspec = QuantSpec(group_size=spec.group_size, bits=spec.bits)
 
-    def linear(module: str, rows: int, cols: int, std: float) -> None:
-        weight, scales, biases = _quantized(rng, rows, cols, qspec, std)
+    quant = spec.config()["quantization"]
+
+    def linear(module: str, rows: int, cols: int, std: float, experts: int = 0) -> None:
+        override = quant.get(module)
+        spec_for = QuantSpec(group_size=spec.group_size, bits=override["bits"]) if isinstance(override, dict) else qspec
+        if experts:  # stacked [experts, rows, ...], each expert quantized on its own
+            weight, scales, biases = map(np.stack, zip(*(_quantized(rng, rows, cols, spec_for, std)
+                                                         for _ in range(experts))))
+        else:
+            weight, scales, biases = _quantized(rng, rows, cols, spec_for, std)
         tensors[f"{module}.weight"] = ("U32", weight)
         tensors[f"{module}.scales"] = ("BF16", scales)
         tensors[f"{module}.biases"] = ("BF16", biases)
@@ -157,6 +178,19 @@ def write_tiny_gemma4(directory: Path, spec: TinyGemma4Spec = TinyGemma4Spec()) 
         linear(f"{base}.mlp.gate_proj", inter, hidden, hidden**-0.5)
         linear(f"{base}.mlp.up_proj", inter, hidden, hidden**-0.5)
         linear(f"{base}.mlp.down_proj", hidden, inter, inter**-0.5)
+        if spec.enable_moe_block:
+            experts, moe = spec.num_experts, spec.moe_intermediate_size
+            for name in ("pre_feedforward_layernorm_2", "post_feedforward_layernorm_1", "post_feedforward_layernorm_2"):
+                norm(f"{base}.{name}", hidden)
+            # The router sees rms(x) * scale * hidden**-0.5, so a weight std of
+            # 3 spreads its logits by about 3.
+            linear(f"{base}.router.proj", experts, hidden, 3.0)
+            tensors[f"{base}.router.scale"] = ("BF16", f32_to_bf16(rng.normal(1.0, 0.2, hidden).astype(np.float32)))
+            tensors[f"{base}.router.per_expert_scale"] = (
+                "BF16", f32_to_bf16(rng.uniform(0.5, 1.5, experts).astype(np.float32)))
+            linear(f"{base}.experts.switch_glu.gate_proj", moe, hidden, hidden**-0.5, experts)
+            linear(f"{base}.experts.switch_glu.up_proj", moe, hidden, hidden**-0.5, experts)
+            linear(f"{base}.experts.switch_glu.down_proj", hidden, moe, moe**-0.5, experts)
         if size:
             linear(f"{base}.per_layer_input_gate", size, hidden, hidden**-0.5)
             linear(f"{base}.per_layer_projection", hidden, size, size**-0.5)

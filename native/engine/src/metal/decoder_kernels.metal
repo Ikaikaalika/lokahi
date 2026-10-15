@@ -382,6 +382,7 @@ struct MoeRouteParams {
   int topk_softmax;   // 1: softmax over the chosen logits; 0: softmax over all experts
   int norm_topk;      // with softmax over all experts, renormalize over the chosen
   int has_bias;       // add the router bias first (GPT-OSS)
+  int has_scale;      // multiply each weight by its expert's scale (Gemma 4)
 };
 
 // One simdgroup per token. Ties go to the lower expert index.
@@ -390,6 +391,7 @@ kernel void moe_route(device float* logits [[buffer(0)]],
                       device float* weights [[buffer(2)]],
                       constant MoeRouteParams& p [[buffer(3)]],
                       const device float* bias [[buffer(4)]],
+                      const device float* expert_scale [[buffer(5)]],
                       uint t [[threadgroup_position_in_grid]],
                       uint lane [[thread_index_in_simdgroup]]) {
   device float* l = logits + int(t) * p.experts;
@@ -429,7 +431,10 @@ kernel void moe_route(device float* logits [[buffer(0)]],
   }
   const float scale = (p.topk_softmax != 0 || p.norm_topk != 0) ? 1.0f / kept : 1.0f / total;
   if (lane == 0) {
-    for (int j = 0; j < p.k; ++j) weights[int(t) * p.k + j] *= scale;
+    for (int j = 0; j < p.k; ++j) {
+      const int slot = int(t) * p.k + j;
+      weights[slot] *= p.has_scale != 0 ? scale * expert_scale[chosen[slot]] : scale;
+    }
   }
 }
 

@@ -99,6 +99,9 @@ struct GpuLayer {
   // Norms and biases a family does not have are bound to a placeholder and
   // never read.
   BufRef attn_norm, attn_post_norm, mlp_norm, mlp_post_norm, q_norm, k_norm, q_bias, k_bias, v_bias, pl_norm;
+  // Gemma 4's experts beside the dense MLP: the router's input scale, the
+  // per-expert weight scales, and the extra norms.
+  BufRef router_input_scale, per_expert_scale, mlp_post_norm_1, expert_norm, expert_post_norm;
   // A KV-shared layer's caches and capacity are its source layer's.
   id<MTLBuffer> k_cache = nil;
   id<MTLBuffer> v_cache = nil;
@@ -179,7 +182,7 @@ struct RopeParams {
 };
 struct PerLayerCombineParams { int size; int layers; float eps; float offset; float proj_scale; float input_scale; };
 struct PerLayerGateParams { int size; int layers; int layer; int count; };
-struct MoeRouteParams { int experts; int k; int topk_softmax; int norm_topk; int has_bias; };
+struct MoeRouteParams { int experts; int k; int topk_softmax; int norm_topk; int has_bias; int has_scale; };
 struct GatherParams { int rows; int cols; int k; int input_rows; int act; int has_bias; float limit; };
 struct MoeCombineParams { int cols; int k; int count; int has_shared; };
 struct MoeGroupedParams { int experts; int k; int groups; int topk_groups; int norm_topk; float scaling; };
@@ -370,7 +373,8 @@ class DecoderMetal final : public Model {
         LK_CHECK(g.quant.bits == u.quant.bits && g.quant.group_size == u.quant.group_size &&
                      g.quant.mode == u.quant.mode && g.scale_dtype == u.scale_dtype,
                  "metal: expert gate and up projections must share a format");
-      } else {
+      }
+      if (!c_.is_moe(i) || c_.experts_beside_mlp) {
         for (const Linear* l : {&L.gate_proj, &L.up_proj, &L.down_proj}) check(*l);
       }
       if (!c_.shares_kv(i)) check(L.k_proj);
@@ -519,7 +523,12 @@ class DecoderMetal final : public Model {
         G.pl_proj = add_linear(arena, L.per_layer_proj, linear_fix, &G.pl_proj);
       }
       add_optional(L.per_layer_norm, &G.pl_norm);
-      if (!G.moe) {
+      add_optional(L.router_input_scale, &G.router_input_scale);
+      add_optional(L.per_expert_scale, &G.per_expert_scale);
+      add_optional(L.mlp_post_norm_1, &G.mlp_post_norm_1);
+      add_optional(L.expert_norm, &G.expert_norm);
+      add_optional(L.expert_post_norm, &G.expert_post_norm);
+      if (!G.moe || c_.experts_beside_mlp) {
         G.gate = add_linear(arena, L.gate_proj, linear_fix, &G.gate);
         G.up = add_linear(arena, L.up_proj, linear_fix, &G.up);
         G.down = add_linear(arena, L.down_proj, linear_fix, &G.down);
@@ -602,6 +611,10 @@ class DecoderMetal final : public Model {
     gate_ = private_buffer(chunk * widest * f);
     up_ = private_buffer(chunk * widest * f);
     if (c_.shared_intermediate > 0) shared_out_ = private_buffer(chunk * hidden * f);
+    if (c_.experts_beside_mlp) {
+      router_in_ = private_buffer(chunk * hidden * f);
+      moe_out_ = private_buffer(chunk * hidden * f);
+    }
     if (c_.num_experts > 0) {
       const size_t slots = chunk * static_cast<size_t>(c_.experts_per_token);
       route_ = private_buffer(chunk * static_cast<size_t>(c_.num_experts) * f);
@@ -746,6 +759,21 @@ class DecoderMetal final : public Model {
         threadsPerThreadgroup:MTLSizeMake(norm_threads(pso), 1, 1)];
   }
 
+  // into += norm(rows) * (offset + weight), row by row.
+  void encode_add_normed(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> into, id<MTLBuffer> rows, const BufRef& weight,
+                         int n) {
+    id<MTLComputePipelineState> pso = pipeline("residual_norm_rows");
+    [enc setComputePipelineState:pso];
+    bind(enc, into, 0, 0);
+    bind(enc, rows, 0, 1);
+    bind(enc, weight, 2);
+    bind(enc, weight, 3);
+    bind(enc, h_, 0, 4);  // unread without a next norm
+    bytes(enc, ResidualNormParams{c_.hidden_size, c_.rms_norm_eps, c_.norm_offset, 1, 0, 1.0f}, 5);
+    [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(n), 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(norm_threads(pso), 1, 1)];
+  }
+
   void encode_qkv(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n) {
     if (!G.own_kv || G.k_eq_v) {  // queries only, or queries and the keys that double as values
       encode_qmm(enc, G.q, h_, n, q_);
@@ -871,20 +899,20 @@ class DecoderMetal final : public Model {
     encode_qmm(enc, G.pl_proj, per_layer_gate_, n, r_);
   }
 
-  // r_ = the mixture-of-experts output for the normed rows in h_. Routing
+  // Routing of the rows in `input` (h_ unless Gemma 4's router input). It
   // runs on the GPU, so the host never waits for the chosen experts.
-  void encode_router(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n) {
+  void encode_router(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n, id<MTLBuffer> input) {
     if (G.router_dense) {
       [enc setComputePipelineState:pipeline("dense_rows")];
       bind(enc, G.dense_router.data, 0);
-      bind(enc, h_, 0, 1);
+      bind(enc, input, 0, 1);
       bind(enc, route_, 0, 2);
       bytes(enc, DenseParams{G.dense_router.rows, G.dense_router.cols, G.dense_router.dtype}, 3);
       [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((G.dense_router.rows + 1) / 2),
                                             static_cast<NSUInteger>(n), 1)
           threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
     } else {
-      encode_qmm(enc, G.router, h_, n, route_);
+      encode_qmm(enc, G.router, input, n, route_);
     }
     if (c_.router == DecoderConfig::Router::SigmoidGrouped) {
       [enc setComputePipelineState:pipeline("moe_route_grouped")];
@@ -905,13 +933,16 @@ class DecoderMetal final : public Model {
     bind(enc, expert_weights_, 0, 2);
     bytes(enc, MoeRouteParams{c_.num_experts, c_.experts_per_token,
                               c_.router == DecoderConfig::Router::TopKSoftmax ? 1 : 0, c_.norm_topk_prob ? 1 : 0,
-                              c_.router_bias ? 1 : 0},
+                              c_.router_bias ? 1 : 0, c_.experts_beside_mlp ? 1 : 0},
           3);
     bind(enc, G.router_bias, 4);
+    bind(enc, G.per_expert_scale, 5);
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(n), 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
   }
 
-  void encode_experts(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n) {
+  // `out` = the experts of the rows in `input`, weighted (plus the shared expert).
+  void encode_experts(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n, id<MTLBuffer> input,
+                      id<MTLBuffer> out) {
     const int K = c_.experts_per_token, I = c_.moe_intermediate, pairs = n * K;
     const int act = c_.activation == Activation::ClampedSwiglu ? 2 : c_.activation == Activation::Silu ? 1 : 0;
     const int has_bias = c_.expert_bias ? 1 : 0;
@@ -922,7 +953,7 @@ class DecoderMetal final : public Model {
     bind(enc, G.expert_up.words, 3);
     bind(enc, G.expert_up.scales, 4);
     bind(enc, G.expert_up.biases, 5);
-    bind(enc, h_, 0, 6);
+    bind(enc, input, 0, 6);
     bind(enc, expert_hidden_, 0, 7);
     bytes(enc, GatherParams{I, c_.hidden_size, K, 1, act, has_bias, c_.swiglu_limit}, 8);
     bind(enc, chosen_, 0, 9);
@@ -946,10 +977,10 @@ class DecoderMetal final : public Model {
     [enc setComputePipelineState:pipeline("moe_combine")];
     bind(enc, expert_out_, 0, 0);
     bind(enc, expert_weights_, 0, 1);
-    bind(enc, r_, 0, 2);
+    bind(enc, out, 0, 2);
     const int count = n * c_.hidden_size;
     bytes(enc, MoeCombineParams{c_.hidden_size, K, count, shared ? 1 : 0}, 3);
-    bind(enc, shared ? shared_out_ : r_, 0, 4);
+    bind(enc, shared ? shared_out_ : out, 0, 4);
     encode_elementwise(enc, count);
   }
 
@@ -1102,12 +1133,31 @@ class DecoderMetal final : public Model {
       section(enc, "o_proj", profiling ? traffic::linear(L.o_proj, n) : 0.0);
       encode_residual_norm(enc, G.attn_post_norm, &G.mlp_norm, n);
       section(enc, "residual_norm", residual_bytes);
-      if (G.moe) {
-        encode_router(enc, G, n);
+      if (G.moe && c_.experts_beside_mlp) {
+        // Gemma 4: r_ = mlp_post_norm_1(mlp(h_)) + expert_post_norm(experts(expert_norm(x))),
+        // routed on rms(x) * router_input_scale.
+        encode_mlp(enc, G, n);
+        section(enc, "mlp",
+                profiling ? traffic::linear(L.gate_proj, n) + traffic::linear(L.up_proj, n) +
+                                traffic::linear(L.down_proj, n) + traffic::rows(G.inter, n, 1)
+                          : 0.0);
+        encode_rms_norm(enc, r_, G.mlp_post_norm_1, r_, n);
+        encode_rms_norm(enc, x_, G.router_input_scale, router_in_, n);
+        encode_rms_norm(enc, x_, G.expert_norm, h_, n);
+        section(enc, "norm", profiling ? traffic::rows(c_.hidden_size, n, 6) + 12.0 * c_.hidden_size : 0.0);
+        encode_router(enc, G, n, router_in_);
+        section(enc, "router", profiling ? traffic::linear(L.router, n) + traffic::rows(c_.num_experts, n, 1) : 0.0);
+        const double expert_bytes = profiling ? expert_traffic(L, n) : 0.0;
+        encode_experts(enc, G, n, h_, moe_out_);
+        section(enc, "experts", expert_bytes);
+        encode_add_normed(enc, r_, moe_out_, G.expert_post_norm, n);
+        section(enc, "norm", profiling ? traffic::rows(c_.hidden_size, n, 3) + 4.0 * c_.hidden_size : 0.0);
+      } else if (G.moe) {
+        encode_router(enc, G, n, h_);
         section(enc, "router", profiling ? traffic::linear(L.router, n) + traffic::rows(c_.num_experts, n, 1) : 0.0);
         // While profiling the router has finished here, so its choices are readable.
         const double expert_bytes = profiling ? expert_traffic(L, n) : 0.0;
-        encode_experts(enc, G, n);
+        encode_experts(enc, G, n, h_, r_);
         section(enc, "experts", expert_bytes);
       } else {
         encode_mlp(enc, G, n);
@@ -1251,6 +1301,7 @@ class DecoderMetal final : public Model {
   std::vector<std::pair<GpuExperts*, std::array<size_t, 3>>> expert_fix_;
   std::vector<std::pair<BufRef*, size_t>> dense_fix_;
   id<MTLBuffer> shared_out_ = nil;  // GLM's shared expert output [chunk, hidden]
+  id<MTLBuffer> router_in_ = nil, moe_out_ = nil;  // Gemma 4: the router's input and the experts' output
   // Gemma 4's per-layer inputs [chunk, layers * P], their two parts, and one
   // layer's gate [chunk, P].
   id<MTLBuffer> per_layer_ = nil, per_layer_lookup_ = nil, per_layer_proj_ = nil, per_layer_gate_ = nil;

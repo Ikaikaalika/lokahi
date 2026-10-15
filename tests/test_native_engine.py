@@ -143,12 +143,23 @@ GEMMA4_VARIANTS = {
     ),
     # Shared sliding and full layers over k_eq_v sources, single-width MLPs,
     # no soft-cap.
+    # 26B-A4B: a mixture of experts beside every dense MLP (defined with its
+    # fixture guard below).
+    "gemma4-26b-a4b-moe": None,
     "gemma4-shared-both-kinds": TinyGemma4Spec(
         num_hidden_layers=8, sliding_window_pattern=4, num_kv_shared_layers=3, use_double_wide_mlp=False,
         final_logit_softcapping=None, attention_k_eq_v=True, num_key_value_heads=2, num_global_key_value_heads=1,
         seed=8,
     ),
 }
+# Gemma 4 26B-A4B's layout: 31B's attention plus a mixture of experts beside
+# every dense MLP; untied so greedy continuations discriminate.
+GEMMA4_MOE = TinyGemma4Spec(
+    num_key_value_heads=2, num_global_key_value_heads=1, attention_k_eq_v=True, num_kv_shared_layers=0,
+    hidden_size_per_layer_input=0, use_double_wide_mlp=False, enable_moe_block=True, tie_word_embeddings=False,
+    seed=41,
+)
+GEMMA4_VARIANTS["gemma4-26b-a4b-moe"] = GEMMA4_MOE
 VARIANTS = sorted(GEMMA3_VARIANTS) + sorted(GEMMA4_VARIANTS) + sorted(DENSE_VARIANTS)
 
 
@@ -387,7 +398,8 @@ def test_gemma4_fixtures_exercise_every_feature(tmp_path):
 @pytest.mark.parametrize(
     ("change", "message"),
     [
-        ({"enable_moe_block": True}, "gemma4: mixture-of-experts blocks are not supported yet"),
+        ({"enable_moe_block": True, "num_experts": 8, "top_k_experts": 9, "moe_intermediate_size": 64},
+         "gemma4: invalid mixture-of-experts sizes"),
         ({"num_kv_shared_layers": 4}, "gemma4: a shared layer has no earlier layer of its kind"),
         ({"rope_parameters": {"full_attention": {"rope_type": "yarn", "factor": 4.0}}},
          "gemma4: full rope_type 'yarn' is not supported"),
@@ -399,6 +411,17 @@ def test_gemma4_fixtures_exercise_every_feature(tmp_path):
 def test_unsupported_gemma4_configurations_fail_closed(native_cli, tmp_path, change, message):
     directory = write_tiny_gemma4(tmp_path / "model", TinyGemma4Spec(extra=change))
     assert message in _load_error(native_cli, directory)
+
+
+def test_gemma4_moe_without_its_router_scales_fails_closed(native_cli, tmp_path):
+    directory = write_tiny_gemma4(tmp_path / "model", GEMMA4_MOE)
+    path = directory / "model.safetensors"
+    tensors, metadata = read_safetensors(path)
+    del tensors["language_model.model.layers.2.router.per_expert_scale"]
+    from lokahi.formats.safetensors import write_safetensors
+
+    write_safetensors(path, tensors, metadata=metadata)
+    assert "layers.2.router.per_expert_scale" in _load_error(native_cli, directory)
 
 
 def test_gemma4_missing_layer_scalar_fails_closed(native_cli, tmp_path):
@@ -450,6 +473,39 @@ def test_unsupported_quantization_fails_closed(native_cli, tmp_path, override, m
     config["quantization"]["model.layers.0.mlp.up_proj"] = override
     (directory / "config.json").write_text(json.dumps(config))
     assert message in _load_error(native_cli, directory)
+
+
+def test_gemma4_moe_fixture_routes_far_from_ties_and_every_part_matters(tmp_path):
+    # Guards the fixture: on the router's real inputs the top-k choice is far
+    # from ties and uses every expert, and the per-expert scales, the
+    # router's input scale and the expert branch each move the outputs.
+    directory = write_tiny_gemma4(tmp_path / "moe", GEMMA4_MOE)
+    oracle = Gemma4Reference.load(directory)
+    margins, used, route = [], set(), oracle.route
+
+    def spy(index, x):
+        chosen, weights = route(index, x)
+        prefix = f"model.layers.{index}.router"
+        routed = (x / np.sqrt(np.mean(x.astype(np.float64) ** 2, axis=-1, keepdims=True) + 1e-6)).astype(np.float32)
+        logits = (routed * oracle.w[f"{prefix}.scale"] * np.float32(GEMMA4_MOE.hidden_size**-0.5)) @ (
+            oracle.w[f"{prefix}.proj"].T)
+        ordered = np.sort(logits, axis=-1)[:, ::-1]
+        margins.append(float(np.min(ordered[:, GEMMA4_MOE.top_k_experts - 1] - ordered[:, GEMMA4_MOE.top_k_experts])))
+        used.update(int(e) for e in chosen.reshape(-1))
+        return chosen, weights
+
+    oracle.route = spy
+    expected = oracle.logits(TOKENS)
+    assert min(margins) > 1e-2 and used == set(range(GEMMA4_MOE.num_experts))
+    scale = np.abs(expected).max()
+    for name in ("router.per_expert_scale", "router.scale"):
+        changed = Gemma4Reference.load(directory)
+        for layer in range(GEMMA4_MOE.num_hidden_layers):
+            changed.w[f"model.layers.{layer}.{name}"] = np.ones_like(changed.w[f"model.layers.{layer}.{name}"])
+        assert np.abs(changed.logits(TOKENS) - expected).max() > 0.01 * scale, name
+    no_experts = Gemma4Reference.load(directory)
+    no_experts._experts = lambda index, x: np.zeros_like(x)
+    assert np.abs(no_experts.logits(TOKENS) - expected).max() > 0.05 * scale
 
 
 def test_moe_fixtures_route_far_from_ties(tmp_path):
