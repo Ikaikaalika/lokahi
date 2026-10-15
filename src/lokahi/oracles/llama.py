@@ -1,8 +1,8 @@
-"""NumPy reference for the Llama family: Llama 3.x, Mistral, Qwen 2/2.5, Qwen 3, Qwen 3 MoE.
+"""NumPy reference for the Llama family: Llama 3.x, Mistral, Qwen 2/2.5, Qwen 3, Qwen 3 MoE, GPT-OSS.
 
 Semantics follow the Hugging Face ``LlamaForCausalLM``, ``MistralForCausalLM``,
-``Qwen2ForCausalLM``, ``Qwen3ForCausalLM`` and ``Qwen3MoeForCausalLM``
-implementations:
+``Qwen2ForCausalLM``, ``Qwen3ForCausalLM``, ``Qwen3MoeForCausalLM`` and
+``GptOssForCausalLM`` implementations:
 
 * pre-norm blocks: ``x += attn(norm(x))`` then ``x += mlp(norm(x))``, where
   the norm before the MLP is named ``post_attention_layernorm``;
@@ -17,7 +17,13 @@ implementations:
 * Qwen 3 MoE replaces the MLP of sparse layers with ``num_experts`` SiLU-gated
   experts: a softmax over the router logits picks the top
   ``num_experts_per_tok`` (renormalized when ``norm_topk_prob``), and the
-  layer outputs the probability-weighted sum of those experts.
+  layer outputs the probability-weighted sum of those experts;
+* GPT-OSS adds biases to q, k, v and o, a learned per-head sink logit to every
+  softmax, alternating sliding and full layers, and experts behind a biased
+  router whose top-k logits are softmaxed; experts have biases and the
+  clamped SwiGLU ``min(g, 7) * sigmoid(1.702 * min(g, 7)) * (clip(u, -7, 7) + 1)``;
+* YaRN RoPE as Transformers' ``_compute_yarn_parameters`` computes it,
+  honoring ``truncate``, with q and k scaled by the attention factor.
 
 Quantized MLX checkpoints are dequantized to float32 on load.
 """
@@ -32,7 +38,7 @@ import numpy as np
 
 from .gemma3 import load_dense_weights
 
-FAMILIES = ("llama", "mistral", "qwen2", "qwen3", "qwen3_moe")
+FAMILIES = ("llama", "mistral", "qwen2", "qwen3", "qwen3_moe", "gpt_oss")
 QK_NORM = ("qwen3", "qwen3_moe")
 
 
@@ -55,6 +61,9 @@ class LlamaFamilyConfig:
     decoder_sparse_step: int = 1
     mlp_only_layers: tuple[int, ...] = ()
     norm_topk_prob: bool = False
+    layer_types: tuple[str, ...] = ()
+    swiglu_limit: float = 7.0
+    max_position_embeddings: int = 0
 
     @classmethod
     def from_dict(cls, cfg: Mapping[str, Any]) -> "LlamaFamilyConfig":
@@ -66,9 +75,11 @@ class LlamaFamilyConfig:
         heads = int(cfg["num_attention_heads"])
         head_dim = cfg.get("head_dim") or int(cfg["hidden_size"]) // heads
         scaling = cfg.get("rope_scaling")
-        if scaling and scaling.get("rope_type", scaling.get("type")) not in ("default", "linear", "llama3"):
+        if scaling and scaling.get("rope_type", scaling.get("type")) not in ("default", "linear", "llama3", "yarn"):
             raise NotImplementedError(f"rope_scaling {scaling!r}")
-        window = cfg.get("sliding_window") if model_type == "mistral" else None
+        window = cfg.get("sliding_window") if model_type in ("mistral", "gpt_oss") else None
+        layers = int(cfg["num_hidden_layers"])
+        types = tuple(cfg.get("layer_types") or ["sliding_attention", "full_attention"] * (layers // 2 + 1))[:layers]
         return cls(
             model_type=model_type,
             vocab_size=int(cfg["vocab_size"]),
@@ -82,12 +93,21 @@ class LlamaFamilyConfig:
             rope_theta=float(cfg.get("rope_theta", 10_000.0)),
             rope_scaling=scaling,
             sliding_window=int(window) if window else None,
-            num_experts=int(cfg.get("num_experts") or 0) if model_type == "qwen3_moe" else 0,
-            num_experts_per_tok=int(cfg.get("num_experts_per_tok") or 0),
+            num_experts=int(cfg.get("num_experts") or 0) if model_type == "qwen3_moe"
+            else int(cfg.get("num_local_experts") or 0),
+            num_experts_per_tok=int(cfg.get("num_experts_per_tok") or cfg.get("experts_per_token") or 0),
             decoder_sparse_step=int(cfg.get("decoder_sparse_step") or 1),
             mlp_only_layers=tuple(cfg.get("mlp_only_layers") or ()),
             norm_topk_prob=bool(cfg.get("norm_topk_prob", False)),
+            layer_types=types if model_type == "gpt_oss" else (),
+            swiglu_limit=float(cfg.get("swiglu_limit", 7.0)),
+            max_position_embeddings=int(cfg.get("max_position_embeddings") or 0),
         )
+
+    def sliding(self, layer: int) -> bool:
+        if self.model_type == "gpt_oss":
+            return self.layer_types[layer] == "sliding_attention"
+        return bool(self.sliding_window)
 
     def sparse(self, layer: int) -> bool:
         """Whether ``layer`` uses the mixture of experts instead of the MLP."""
@@ -98,6 +118,30 @@ class LlamaFamilyConfig:
             and (layer + 1) % self.decoder_sparse_step == 0
         )
 
+    def attention_factor(self) -> float:
+        """YaRN's scale on cos and sin (so on q and k); 1 for other RoPE types."""
+
+        scaling = self.rope_scaling or {}
+        if scaling.get("rope_type", scaling.get("type")) != "yarn":
+            return 1.0
+        if scaling.get("attention_factor"):
+            return float(scaling["attention_factor"])
+        factor = self._yarn_factor()
+
+        def get_mscale(scale: float, mscale: float = 1.0) -> float:
+            return 1.0 if scale <= 1 else 0.1 * mscale * math.log(scale) + 1.0
+
+        mscale, all_dim = scaling.get("mscale"), scaling.get("mscale_all_dim")
+        if mscale and all_dim:
+            return get_mscale(factor, mscale) / get_mscale(factor, all_dim)
+        return get_mscale(factor)
+
+    def _yarn_factor(self) -> float:
+        scaling = self.rope_scaling or {}
+        if scaling.get("factor") is not None:
+            return float(scaling["factor"])
+        return self.max_position_embeddings / float(scaling["original_max_position_embeddings"])
+
     def inv_freq(self) -> np.ndarray:
         """RoPE inverse frequencies, as Hugging Face's rope initializers compute them."""
 
@@ -107,6 +151,23 @@ class LlamaFamilyConfig:
         kind = scaling.get("rope_type", scaling.get("type", "default"))
         if kind == "linear":
             return inv_freq / float(scaling["factor"])
+        if kind == "yarn":
+            factor = self._yarn_factor()
+            original = float(scaling["original_max_position_embeddings"])
+            fast, slow = scaling.get("beta_fast") or 32, scaling.get("beta_slow") or 1
+
+            def correction(rotations: float) -> float:
+                return dim * math.log(original / (rotations * 2 * math.pi)) / (2 * math.log(self.rope_theta))
+
+            low, high = correction(fast), correction(slow)
+            if scaling.get("truncate", True):
+                low, high = math.floor(low), math.ceil(high)
+            low, high = max(low, 0), min(high, dim - 1)
+            if low == high:
+                high += 0.001
+            ramp = np.clip((np.arange(dim // 2, dtype=np.float64) - low) / (high - low), 0, 1)
+            extrapolation = 1 - ramp
+            return (inv_freq / factor) * (1 - extrapolation) + inv_freq * extrapolation
         if kind == "llama3":
             factor = float(scaling["factor"])
             low = float(scaling.get("low_freq_factor", 1.0))
@@ -175,14 +236,16 @@ class LlamaFamilyReference:
             q = self._norm(f"{prefix}.q_norm", q)
             k = self._norm(f"{prefix}.k_norm", k)
         inv_freq = cfg.inv_freq()
-        q = _rope(q, positions, inv_freq)
-        k = _rope(k, positions, inv_freq)
+        factor = np.float32(cfg.attention_factor())
+        q = _rope(q, positions, inv_freq) * factor
+        k = _rope(k, positions, inv_freq) * factor
 
         i = positions[:, None]
         j = positions[None, :]
         allowed = j <= i
-        if cfg.sliding_window:
+        if cfg.sliding(index):
             allowed &= (i - j) < cfg.sliding_window
+        sinks = self.w.get(f"{prefix}.sinks")
         scale = dim ** -0.5
         group = heads // kv_heads
         out = np.empty((tokens, heads, dim), dtype=np.float32)
@@ -190,11 +253,13 @@ class LlamaFamilyReference:
             kv = head // group
             scores = (q[:, head, :] @ k[:, kv, :].T).astype(np.float64) * scale
             scores = np.where(allowed, scores, -np.inf)
+            if sinks is not None:  # one more logit per row, which attends to nothing
+                scores = np.concatenate([scores, np.full((tokens, 1), float(sinks[head]))], axis=-1)
             scores -= scores.max(axis=-1, keepdims=True)
             probs = np.exp(scores)
             probs /= probs.sum(axis=-1, keepdims=True)
-            out[:, head, :] = (probs @ v[:, kv, :]).astype(np.float32)
-        return out.reshape(tokens, heads * dim) @ self.w[f"{prefix}.o_proj"].T
+            out[:, head, :] = (probs[:, :tokens] @ v[:, kv, :]).astype(np.float32)
+        return self._project(f"{prefix}.o_proj", out.reshape(tokens, heads * dim))
 
     def _mlp(self, index: int, x: np.ndarray) -> np.ndarray:
         prefix = f"model.layers.{index}.mlp"
@@ -204,14 +269,22 @@ class LlamaFamilyReference:
         up = x @ self.w[f"{prefix}.up_proj"].T
         return (gate * up) @ self.w[f"{prefix}.down_proj"].T
 
+    def router_logits(self, index: int, x: np.ndarray) -> np.ndarray:
+        name = "router" if self.config.model_type == "gpt_oss" else "gate"
+        return self._project(f"model.layers.{index}.mlp.{name}", x).astype(np.float64)
+
     def route(self, index: int, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Expert indices ``[tokens, k]`` and their weights for layer ``index``."""
 
-        logits = (x @ self.w[f"model.layers.{index}.mlp.gate"].T).astype(np.float64)
+        logits = self.router_logits(index, x)
+        k = self.config.num_experts_per_tok
+        chosen = np.argsort(-logits, axis=-1, kind="stable")[:, :k]
+        if self.config.model_type == "gpt_oss":  # softmax over the top-k logits
+            top = np.take_along_axis(logits, chosen, axis=-1)
+            weights = np.exp(top - top.max(axis=-1, keepdims=True))
+            return chosen, weights / weights.sum(axis=-1, keepdims=True)
         probs = np.exp(logits - logits.max(axis=-1, keepdims=True))
         probs /= probs.sum(axis=-1, keepdims=True)
-        k = self.config.num_experts_per_tok
-        chosen = np.argsort(-probs, axis=-1, kind="stable")[:, :k]
         weights = np.take_along_axis(probs, chosen, axis=-1)
         if self.config.norm_topk_prob:
             weights /= weights.sum(axis=-1, keepdims=True)
@@ -220,20 +293,34 @@ class LlamaFamilyReference:
     def _expert_stack(self, prefix: str, name: str) -> np.ndarray:
         """``[experts, rows, cols]``: MLX's stacked tensor or Transformers' per-expert ones."""
 
-        stacked = self.w.get(f"{prefix}.switch_mlp.{name}")
-        if stacked is not None:
-            return stacked
+        for stacked in (f"{prefix}.switch_mlp.{name}", f"{prefix}.experts.{name}"):
+            if stacked in self.w:
+                return self.w[stacked]
         return np.stack([self.w[f"{prefix}.experts.{e}.{name}"] for e in range(self.config.num_experts)])
+
+    def _expert_bias(self, prefix: str, name: str, expert: int) -> np.ndarray | float:
+        stacked = self.w.get(f"{prefix}.experts.{name}.bias")
+        if stacked is not None:
+            return stacked[expert]
+        return self.w.get(f"{prefix}.experts.{expert}.{name}.bias", 0.0)
 
     def _experts(self, prefix: str, x: np.ndarray) -> np.ndarray:
         index = int(prefix.split(".")[2])
         chosen, weights = self.route(index, x)
         gate, up, down = (self._expert_stack(prefix, name) for name in ("gate_proj", "up_proj", "down_proj"))
         out = np.zeros_like(x, dtype=np.float32)
+        limit = self.config.swiglu_limit
         for t in range(x.shape[0]):
             for e, p in zip(chosen[t], weights[t]):
-                hidden = _silu(gate[e] @ x[t]) * (up[e] @ x[t])
-                out[t] += np.float32(p) * (down[e] @ hidden)
+                g = gate[e] @ x[t] + self._expert_bias(prefix, "gate_proj", e)
+                u = up[e] @ x[t] + self._expert_bias(prefix, "up_proj", e)
+                if self.config.model_type == "gpt_oss":
+                    g = np.minimum(g, limit)
+                    hidden = g / (1.0 + np.exp(-1.702 * g)) * (np.clip(u, -limit, limit) + 1.0)
+                else:
+                    hidden = _silu(g) * u
+                y = down[e] @ hidden + self._expert_bias(prefix, "down_proj", e)
+                out[t] += np.float32(p) * y
         return out
 
     def logits(self, token_ids: Sequence[int]) -> np.ndarray:

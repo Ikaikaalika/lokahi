@@ -2,7 +2,7 @@
 
 These tests pin the oracles' semantics to an independent implementation:
 ``mx.dequantize`` for the packed affine layout, and MLX-LM's ``gemma3_text``,
-``gemma4``, ``llama``, ``qwen2``, ``qwen3`` and ``qwen3_moe`` models for the full decoders. They need
+``gemma4``, ``llama``, ``qwen2``, ``qwen3``, ``qwen3_moe`` and ``gpt_oss`` models for the full decoders. They need
 ``mlx`` and ``mlx_lm`` and therefore run on Apple Silicon only.
 """
 from __future__ import annotations
@@ -108,9 +108,18 @@ def test_oracle_matches_mlx_lm_gemma3(tmp_path, spec):
         TinyDenseSpec(model_type="mistral", tie_word_embeddings=False, rope_theta=1e6, seed=6),
         TinyDenseSpec(model_type="qwen3_moe", head_dim=64, mlp_only_layers=(1,), seed=9),
         TinyDenseSpec(model_type="qwen3_moe", head_dim=64, mlp_only_layers=(1,), mxfp4_mlp=True, seed=11),
+        TinyDenseSpec(model_type="qwen3", head_dim=64, rope_theta=1e6,
+                      rope_scaling={"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32768},
+                      seed=16),
+        # MLX-LM's YaRN always rounds the correction range, so this GPT-OSS
+        # variant sets truncate (the engine and oracle honor truncate false).
+        TinyDenseSpec(model_type="gpt_oss", head_dim=64, num_hidden_layers=4, num_experts=8, num_experts_per_tok=2,
+                      moe_intermediate_size=64, sliding_window=6, rope_theta=150000.0, mxfp4_mlp=True,
+                      rope_scaling={"rope_type": "yarn", "factor": 32.0, "beta_fast": 32.0, "beta_slow": 1.0,
+                                    "original_max_position_embeddings": 4096, "truncate": True}, seed=14),
     ],
     ids=["llama3-rope-llama3", "qwen3-qk-norm", "qwen2-bias-group7", "mistral-untied", "qwen3-moe-top2-of-8",
-         "qwen3-moe-mxfp4-experts"],
+         "qwen3-moe-mxfp4-experts", "qwen3-yarn", "gpt-oss-mxfp4-truncated-yarn"],
 )
 def test_oracle_matches_mlx_lm_llama_family(tmp_path, spec):
     directory = write_tiny_dense(tmp_path / "model", spec)
