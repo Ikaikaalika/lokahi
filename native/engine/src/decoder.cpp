@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <utility>
 
 #include "common.h"
 #include "half.h"
@@ -37,7 +38,7 @@ bool is_gemma4(const Json& raw) {
 
 bool is_llama_family(const Json& raw) {
   const std::string type = model_type(raw);
-  return type == "llama" || type == "mistral" || type == "qwen2" || type == "qwen3";
+  return type == "llama" || type == "mistral" || type == "qwen2" || type == "qwen3" || type == "qwen3_moe";
 }
 
 bool flag(const Json& cfg, const char* key) {
@@ -208,10 +209,11 @@ DecoderConfig gemma4_config(const Json& raw) {
   return c;
 }
 
-// Llama 3.x, Mistral, Qwen 2/2.5 and Qwen 3: pre-norm blocks with plain
-// RMSNorm, SiLU-gated MLPs and rotate-half RoPE. Qwen 3 adds per-head Q/K
-// norm, Qwen 2 adds q/k/v biases, Mistral may use a sliding window on every
-// layer. Options these checkpoints do not use fail closed.
+// Llama 3.x, Mistral, Qwen 2/2.5, Qwen 3 and Qwen 3 MoE: pre-norm blocks
+// with plain RMSNorm, SiLU-gated MLPs and rotate-half RoPE. Qwen 3 adds
+// per-head Q/K norm, Qwen 2 adds q/k/v biases, Mistral may use a sliding
+// window on every layer, and Qwen 3 MoE replaces the MLP of its sparse layers
+// with routed experts. Options these checkpoints do not use fail closed.
 DecoderConfig llama_family_config(const Json& cfg) {
   DecoderConfig c;
   c.architecture = model_type(cfg);
@@ -226,7 +228,7 @@ DecoderConfig llama_family_config(const Json& cfg) {
   c.head_dim = head_dim != nullptr && head_dim->is_number() ? static_cast<int>(head_dim->as_int())
                                                              : c.hidden_size / c.num_heads;
   c.rms_norm_eps = static_cast<float>(cfg.number_or("rms_norm_eps", 1e-6));
-  c.qk_norm = arch == "qwen3";
+  c.qk_norm = arch == "qwen3" || arch == "qwen3_moe";
   c.qkv_bias = arch == "qwen2";
   c.attn_scale = 1.0f / std::sqrt(static_cast<float>(c.head_dim));
   c.rope_theta = static_cast<float>(cfg.number_or("rope_theta", 1e4));
@@ -265,6 +267,31 @@ DecoderConfig llama_family_config(const Json& cfg) {
   if (sliding) c.sliding_window = static_cast<int>(window->as_int());
   c.layer_is_sliding.assign(static_cast<size_t>(c.num_layers), sliding);
   c.eos_token_ids = eos_ids(cfg, cfg);
+
+  if (arch == "qwen3_moe") {
+    // Qwen 2 MoE's shared expert is a different block.
+    LK_CHECK(cfg.int_or("shared_expert_intermediate_size", 0) == 0, arch + ": shared experts are not supported");
+    c.num_experts = static_cast<int>(cfg.at("num_experts").as_int());
+    c.experts_per_token = static_cast<int>(cfg.at("num_experts_per_tok").as_int());
+    c.moe_intermediate = static_cast<int>(cfg.at("moe_intermediate_size").as_int());
+    c.norm_topk_prob = flag(cfg, "norm_topk_prob");
+    LK_CHECK(c.num_experts > 0 && c.experts_per_token > 0 && c.experts_per_token <= c.num_experts &&
+                 c.moe_intermediate > 0,
+             arch + ": invalid expert configuration");
+    const int step = static_cast<int>(cfg.int_or("decoder_sparse_step", 1));
+    LK_CHECK(step > 0, arch + ": decoder_sparse_step must be positive");
+    std::vector<bool> dense_only(static_cast<size_t>(c.num_layers), false);
+    if (const Json* only = cfg.find("mlp_only_layers"); only != nullptr && only->is_array()) {
+      for (const Json& layer : only->as_array()) {
+        const int64_t index = layer.as_int();
+        LK_CHECK(index >= 0 && index < c.num_layers, arch + ": mlp_only_layers entry out of range");
+        dense_only[static_cast<size_t>(index)] = true;
+      }
+    }
+    for (int i = 0; i < c.num_layers; ++i) {
+      c.layer_moe.push_back(!dense_only[static_cast<size_t>(i)] && (i + 1) % step == 0);
+    }
+  }
   return c;
 }
 
@@ -336,6 +363,43 @@ std::vector<double> DecoderConfig::rope_inv_freq(bool sliding) const {
   }
   return inv_freq;
 }
+
+namespace {
+
+// The router and experts of a mixture-of-experts layer: MLX's stacked
+// switch_mlp tensors, or one module per expert as Transformers stores them.
+void bind_experts(const DecoderWeights& w, DecoderLayer& layer, const std::string& base) {
+  const DecoderConfig& c = w.config;
+  const Checkpoint& ck = *w.checkpoint;
+  const std::string& p = c.weight_prefix;
+  layer.router = bind_linear(ck, w.raw_config, p + base + ".mlp.gate", p + base + ".mlp.gate");
+  LK_CHECK(layer.router.rows == c.num_experts && layer.router.cols == c.hidden_size, base + ": router shape");
+  std::vector<Linear>* stacks[] = {&layer.expert_gate, &layer.expert_up, &layer.expert_down};
+  const char* names[] = {"gate_proj", "up_proj", "down_proj"};
+  for (int k = 0; k < 3; ++k) {
+    const std::string stacked = p + base + ".mlp.switch_mlp." + names[k];
+    if (ck.contains(stacked + ".weight")) {
+      *stacks[k] = bind_expert_linears(ck, w.raw_config, stacked, stacked);
+    } else {
+      for (int e = 0; e < c.num_experts; ++e) {
+        const std::string module = p + base + ".mlp.experts." + std::to_string(e) + "." + names[k];
+        stacks[k]->push_back(bind_linear(ck, w.raw_config, module, module));
+      }
+    }
+    LK_CHECK(static_cast<int>(stacks[k]->size()) == c.num_experts, base + ": expected " +
+                                                                     std::to_string(c.num_experts) + " experts");
+  }
+  for (int e = 0; e < c.num_experts; ++e) {
+    const Linear& gate = layer.expert_gate[static_cast<size_t>(e)];
+    const Linear& up = layer.expert_up[static_cast<size_t>(e)];
+    const Linear& down = layer.expert_down[static_cast<size_t>(e)];
+    LK_CHECK(gate.rows == c.moe_intermediate && gate.cols == c.hidden_size && up.rows == c.moe_intermediate &&
+                 up.cols == c.hidden_size && down.rows == c.hidden_size && down.cols == c.moe_intermediate,
+             base + ": expert shape");
+  }
+}
+
+}  // namespace
 
 std::shared_ptr<DecoderWeights> DecoderWeights::load(const std::string& directory) {
   auto w = std::make_shared<DecoderWeights>();
@@ -434,15 +498,19 @@ std::shared_ptr<DecoderWeights> DecoderWeights::load(const std::string& director
                base + ": k/v shape");
     }
     layer.o_proj = linear(base + ".self_attn.o_proj");
-    layer.gate_proj = linear(base + ".mlp.gate_proj");
-    layer.up_proj = linear(base + ".mlp.up_proj");
-    layer.down_proj = linear(base + ".mlp.down_proj");
     LK_CHECK(layer.q_proj.rows == q_out && layer.q_proj.cols == c.hidden_size, base + ": q_proj shape");
     LK_CHECK(layer.o_proj.rows == c.hidden_size && layer.o_proj.cols == q_out, base + ": o_proj shape");
-    LK_CHECK(layer.gate_proj.rows == inter && layer.up_proj.rows == inter && layer.down_proj.cols == inter &&
-                 layer.gate_proj.cols == c.hidden_size && layer.up_proj.cols == c.hidden_size &&
-                 layer.down_proj.rows == c.hidden_size,
-             base + ": mlp shape");
+    if (c.is_moe(i)) {
+      bind_experts(*w, layer, base);
+    } else {
+      layer.gate_proj = linear(base + ".mlp.gate_proj");
+      layer.up_proj = linear(base + ".mlp.up_proj");
+      layer.down_proj = linear(base + ".mlp.down_proj");
+      LK_CHECK(layer.gate_proj.rows == inter && layer.up_proj.rows == inter && layer.down_proj.cols == inter &&
+                   layer.gate_proj.cols == c.hidden_size && layer.up_proj.cols == c.hidden_size &&
+                   layer.down_proj.rows == c.hidden_size,
+               base + ": mlp shape");
+    }
     if (c.per_layer_input > 0) {
       layer.per_layer_gate = linear(base + ".per_layer_input_gate");
       layer.per_layer_proj = linear(base + ".per_layer_projection");
@@ -463,7 +531,11 @@ size_t DecoderWeights::matrix_bytes() const {
   for (const auto& l : layers) {
     total += l.q_proj.weight_bytes() + l.k_proj.weight_bytes() + l.v_proj.weight_bytes() +
              l.o_proj.weight_bytes() + l.gate_proj.weight_bytes() + l.up_proj.weight_bytes() +
-             l.down_proj.weight_bytes() + l.per_layer_gate.weight_bytes() + l.per_layer_proj.weight_bytes();
+             l.down_proj.weight_bytes() + l.per_layer_gate.weight_bytes() + l.per_layer_proj.weight_bytes() +
+             l.router.weight_bytes();
+    for (const auto* experts : {&l.expert_gate, &l.expert_up, &l.expert_down}) {
+      for (const Linear& expert : *experts) total += expert.weight_bytes();
+    }
   }
   return total;
 }
@@ -781,20 +853,18 @@ class DecoderCpu final : public Model {
         Section section(profiler_, "norm", norm_bytes);
         for (int t = 0; t < n; ++t) norm(x_.data() + t * hidden, L.mlp_norm, hidden, h_.data() + t * hidden);
       }
-      {
-        Section section(profiler_, "mlp_up",
-                        profiling ? traffic::linear(L.gate_proj, n) + traffic::linear(L.up_proj, n) +
-                                        traffic::rows(inter, n, 1)
-                                  : 0.0);
-        matmul(L.gate_proj, h_.data(), n, gate_.data(), pool_);
-        matmul(L.up_proj, h_.data(), n, up_.data(), pool_);
-        if (c_.activation == Activation::GeluTanh) {
-          for (size_t i = 0; i < sn * inter; ++i) gate_[i] = gelu_tanh(gate_[i]) * up_[i];
-        } else {
-          for (size_t i = 0; i < sn * inter; ++i) gate_[i] = silu(gate_[i]) * up_[i];
+      if (c_.is_moe(l)) {
+        experts(L, n);
+      } else {
+        {
+          Section section(profiler_, "mlp_up",
+                          profiling ? traffic::linear(L.gate_proj, n) + traffic::linear(L.up_proj, n) +
+                                          traffic::rows(inter, n, 1)
+                                    : 0.0);
+          matmul(L.gate_proj, h_.data(), n, gate_.data(), pool_);
+          matmul(L.up_proj, h_.data(), n, up_.data(), pool_);
+          gated_activation(gate_.data(), up_.data(), sn * inter);
         }
-      }
-      {
         Section section(profiler_, "down_proj", profiling ? traffic::linear(L.down_proj, n) : 0.0);
         matmul(L.down_proj, gate_.data(), n, r_.data(), pool_);
       }
@@ -819,6 +889,97 @@ class DecoderCpu final : public Model {
     if (c_.final_logit_softcapping > 0.0f) {
       const float cap = c_.final_logit_softcapping;
       for (float& v : logits_) v = std::tanh(v / cap) * cap;
+    }
+  }
+
+  // gate[i] = act(gate[i]) * up[i]
+  void gated_activation(float* gate, const float* up, size_t count) const {
+    if (c_.activation == Activation::GeluTanh) {
+      for (size_t i = 0; i < count; ++i) gate[i] = gelu_tanh(gate[i]) * up[i];
+    } else {
+      for (size_t i = 0; i < count; ++i) gate[i] = silu(gate[i]) * up[i];
+    }
+  }
+
+  // r_ = the mixture-of-experts output for the normed rows in h_: each token's
+  // top experts by router softmax, weighted by their (renormalized)
+  // probabilities. Experts run once per pass over the tokens routed to them.
+  void experts(const DecoderLayer& L, int n) {
+    const int E = c_.num_experts, K = c_.experts_per_token;
+    const int64_t hidden = c_.hidden_size, inter = c_.moe_intermediate;
+    const size_t sn = static_cast<size_t>(n);
+    route_.resize(sn * E);
+    chosen_.resize(sn * K);
+    weight_.resize(sn * K);
+    {
+      Section section(profiler_, "router", profiler_ ? traffic::linear(L.router, n) : 0.0);
+      matmul(L.router, h_.data(), n, route_.data(), pool_);
+      std::vector<int> order(static_cast<size_t>(E));
+      std::vector<double> probs(static_cast<size_t>(E));
+      for (int t = 0; t < n; ++t) {
+        const float* logits = route_.data() + static_cast<size_t>(t) * E;
+        const float top = *std::max_element(logits, logits + E);
+        double total = 0.0;
+        for (int e = 0; e < E; ++e) total += probs[static_cast<size_t>(e)] = std::exp(static_cast<double>(logits[e]) - top);
+        for (int e = 0; e < E; ++e) order[static_cast<size_t>(e)] = e;
+        std::partial_sort(order.begin(), order.begin() + K, order.end(), [&](int a, int b) {
+          const double pa = probs[static_cast<size_t>(a)], pb = probs[static_cast<size_t>(b)];
+          return pa > pb || (pa == pb && a < b);
+        });
+        double kept = 0.0;
+        for (int j = 0; j < K; ++j) kept += probs[static_cast<size_t>(order[static_cast<size_t>(j)])];
+        const double scale = c_.norm_topk_prob ? 1.0 / kept : 1.0 / total;
+        for (int j = 0; j < K; ++j) {
+          const int e = order[static_cast<size_t>(j)];
+          chosen_[static_cast<size_t>(t) * K + j] = e;
+          weight_[static_cast<size_t>(t) * K + j] = static_cast<float>(probs[static_cast<size_t>(e)] * scale);
+        }
+      }
+    }
+    // Each expert's tokens, gathered so the expert's weights are read once.
+    std::vector<std::vector<std::pair<int, float>>> routed(static_cast<size_t>(E));
+    for (int t = 0; t < n; ++t) {
+      for (int j = 0; j < K; ++j) {
+        const size_t slot = static_cast<size_t>(t) * K + j;
+        routed[static_cast<size_t>(chosen_[slot])].push_back({t, weight_[slot]});
+      }
+    }
+    double bytes = 0.0;
+    if (profiler_) {
+      for (int e = 0; e < E; ++e) {
+        const int m = static_cast<int>(routed[static_cast<size_t>(e)].size());
+        if (m == 0) continue;
+        bytes += traffic::linear(L.expert_gate[static_cast<size_t>(e)], m) +
+                 traffic::linear(L.expert_up[static_cast<size_t>(e)], m) +
+                 traffic::linear(L.expert_down[static_cast<size_t>(e)], m) + traffic::rows(inter, m, 1) +
+                 traffic::rows(hidden, m, 2);
+      }
+    }
+    Section section(profiler_, "experts", bytes);
+    std::fill(r_.begin(), r_.begin() + static_cast<std::ptrdiff_t>(sn * hidden), 0.0f);
+    for (int e = 0; e < E; ++e) {
+      const auto& tokens = routed[static_cast<size_t>(e)];
+      const int m = static_cast<int>(tokens.size());
+      if (m == 0) continue;
+      const size_t sm = static_cast<size_t>(m);
+      expert_in_.resize(sm * hidden);
+      expert_gate_.resize(sm * inter);
+      expert_up_.resize(sm * inter);
+      expert_out_.resize(sm * hidden);
+      for (int i = 0; i < m; ++i) {
+        std::copy_n(h_.data() + static_cast<size_t>(tokens[static_cast<size_t>(i)].first) * hidden, hidden,
+                    expert_in_.data() + static_cast<size_t>(i) * hidden);
+      }
+      matmul(L.expert_gate[static_cast<size_t>(e)], expert_in_.data(), m, expert_gate_.data(), pool_);
+      matmul(L.expert_up[static_cast<size_t>(e)], expert_in_.data(), m, expert_up_.data(), pool_);
+      gated_activation(expert_gate_.data(), expert_up_.data(), sm * inter);
+      matmul(L.expert_down[static_cast<size_t>(e)], expert_gate_.data(), m, expert_out_.data(), pool_);
+      for (int i = 0; i < m; ++i) {
+        const auto [t, weight] = tokens[static_cast<size_t>(i)];
+        float* out = r_.data() + static_cast<size_t>(t) * hidden;
+        const float* y = expert_out_.data() + static_cast<size_t>(i) * hidden;
+        for (int64_t d = 0; d < hidden; ++d) out[d] += weight * y[d];
+      }
     }
   }
 
@@ -903,6 +1064,10 @@ class DecoderCpu final : public Model {
   std::vector<double> inv_freq_local_, inv_freq_global_;
   std::vector<float> x_, h_, r_, q_, k_, v_, attn_, gate_, up_, logits_;
   std::vector<float> pl_, row_;  // per-layer inputs [n, layers * P] and an embedding row
+  // Mixture of experts: router logits [n, E], each token's experts and
+  // weights [n, K], and one expert's gathered inputs and activations.
+  std::vector<float> route_, weight_, expert_in_, expert_gate_, expert_up_, expert_out_;
+  std::vector<int> chosen_;
 };
 
 }  // namespace

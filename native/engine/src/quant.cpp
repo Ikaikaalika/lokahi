@@ -73,6 +73,58 @@ Linear bind_linear(const Checkpoint& checkpoint, const Json& config, const std::
   return linear;
 }
 
+std::vector<Linear> bind_expert_linears(const Checkpoint& checkpoint, const Json& config, const std::string& module,
+                                        const std::string& quant_module) {
+  const TensorView& weight = checkpoint.get(module + ".weight");
+  const TensorView* scales = checkpoint.find(module + ".scales");
+  LK_CHECK(weight.shape.size() == 3, module + ": expert weights must be 3-D");
+  const int64_t experts = weight.dim(0);
+  LK_CHECK(experts > 0, module + ": no experts");
+  Linear first;
+  first.name = module;
+  first.rows = weight.dim(1);
+  size_t weight_stride = 0, scale_stride = 0;  // bytes per expert
+  if (scales == nullptr) {
+    LK_CHECK(weight.dtype == DType::F32 || weight.dtype == DType::F16 || weight.dtype == DType::BF16,
+             module + ": unsupported dense dtype");
+    first.cols = weight.dim(2);
+    first.dense = weight.data;
+    first.dense_dtype = weight.dtype;
+    weight_stride = static_cast<size_t>(first.rows * first.cols) * dtype_size(weight.dtype);
+  } else {
+    const TensorView& biases = checkpoint.get(module + ".biases");
+    first.quant = quant_spec_for(config, quant_module);
+    LK_CHECK(first.quant.quantized(), module + ": has scales but config marks it unquantized");
+    LK_CHECK(weight.dtype == DType::U32, module + ": quantized weight must be U32");
+    LK_CHECK(scales->dtype == biases.dtype && (scales->dtype == DType::BF16 || scales->dtype == DType::F16),
+             module + ": scales/biases must be BF16 or F16");
+    first.cols = weight.dim(2) * 32 / first.quant.bits;
+    LK_CHECK(scales->shape.size() == 3 && scales->dim(0) == experts && scales->dim(1) == first.rows &&
+                 scales->dim(2) == first.cols / first.quant.group_size,
+             module + ": scales shape does not match weight and group size");
+    LK_CHECK(biases.shape == scales->shape, module + ": biases shape mismatch");
+    first.words = weight.as<uint32_t>();
+    first.scales = scales->as<uint16_t>();
+    first.biases = biases.as<uint16_t>();
+    first.scale_dtype = scales->dtype;
+    weight_stride = static_cast<size_t>(first.rows * first.words_per_row()) * 4;
+    scale_stride = static_cast<size_t>(first.rows * first.groups_per_row()) * 2;
+  }
+  std::vector<Linear> out(static_cast<size_t>(experts), first);
+  for (int64_t e = 0; e < experts; ++e) {
+    Linear& linear = out[static_cast<size_t>(e)];
+    const size_t offset = static_cast<size_t>(e);
+    if (linear.quant.quantized()) {
+      linear.words = reinterpret_cast<const uint32_t*>(reinterpret_cast<const uint8_t*>(first.words) + offset * weight_stride);
+      linear.scales = reinterpret_cast<const uint16_t*>(reinterpret_cast<const uint8_t*>(first.scales) + offset * scale_stride);
+      linear.biases = reinterpret_cast<const uint16_t*>(reinterpret_cast<const uint8_t*>(first.biases) + offset * scale_stride);
+    } else {
+      linear.dense = static_cast<const uint8_t*>(first.dense) + offset * weight_stride;
+    }
+  }
+  return out;
+}
+
 void load_vector(const Checkpoint& checkpoint, const std::string& name, int64_t size, float* out) {
   const TensorView& view = checkpoint.get(name);
   LK_CHECK(view.numel() == size, name + ": expected " + std::to_string(size) + " elements");

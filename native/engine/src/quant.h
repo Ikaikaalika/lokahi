@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "json.h"
 #include "safetensors.h"
@@ -42,6 +43,11 @@ struct Linear {
 // Binds `module` (e.g. "model.layers.0.mlp.up_proj") from the checkpoint.
 Linear bind_linear(const Checkpoint& checkpoint, const Json& config, const std::string& module,
                    const std::string& quant_module);
+
+// Binds a stack of expert matrices stored as one [experts, rows, cols]
+// tensor (MLX switch layers), as one zero-copy view per expert.
+std::vector<Linear> bind_expert_linears(const Checkpoint& checkpoint, const Json& config, const std::string& module,
+                                        const std::string& quant_module);
 
 // Dense 1-D vector (norm weights) as float32.
 void load_vector(const Checkpoint& checkpoint, const std::string& name, int64_t size, float* out);
