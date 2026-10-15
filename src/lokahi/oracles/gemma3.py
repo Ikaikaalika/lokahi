@@ -26,7 +26,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
-from ..formats.mlx_quant import dequantize_affine, quant_spec_for
+from ..formats.mlx_quant import dequantize_affine, dequantize_mxfp4, quant_spec_for
 from ..formats.safetensors import bf16_to_f32, f32_to_bf16, read_safetensors
 
 
@@ -137,10 +137,11 @@ def load_dense_weights(model_dir: Path) -> tuple[dict[str, Any], dict[str, np.nd
             spec = quant_spec_for(raw_config, module)
             if spec is None:
                 raise ValueError(f"{module} has scales but no quantization config")
-            biases = tensors[module + ".biases"]
-            matrix = dequantize_affine(
-                array, _tensor_f32(*scales), _tensor_f32(*biases), spec
-            )
+            if spec.mode == "mxfp4":
+                matrix = dequantize_mxfp4(array, scales[1])
+            else:
+                biases = tensors[module + ".biases"]
+                matrix = dequantize_affine(array, _tensor_f32(*scales), _tensor_f32(*biases), spec)
         else:
             matrix = _tensor_f32(dtype, array)
         dense[strip(module)] = matrix

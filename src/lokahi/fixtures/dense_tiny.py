@@ -19,7 +19,7 @@ import numpy as np
 
 from ..formats.mlx_quant import QuantSpec
 from ..formats.safetensors import f32_to_bf16, write_safetensors
-from .gemma3_tiny import _quantized
+from .gemma3_tiny import _mxfp4, _quantized
 
 ARCHITECTURES = {
     "llama": "LlamaForCausalLM",
@@ -57,12 +57,24 @@ class TinyDenseSpec:
     mlp_only_layers: tuple[int, ...] = ()
     norm_topk_prob: bool = True
     stacked_experts: bool = True  # MLX's switch_mlp stacks; False writes Transformers' experts.{e}
+    mxfp4_mlp: bool = False  # MLP and expert projections in MXFP4, as GPT-OSS ships its experts
     seed: int = 0
     extra: dict = field(default_factory=dict)
 
     @property
     def resolved_head_dim(self) -> int:
         return self.head_dim or self.hidden_size // self.num_attention_heads
+
+    def mlp_modules(self, layer: int) -> list[str]:
+        """The MLP or expert projection modules of ``layer``."""
+
+        base = f"model.layers.{layer}.mlp"
+        projections = ("gate_proj", "up_proj", "down_proj")
+        if not self.sparse(layer):
+            return [f"{base}.{proj}" for proj in projections]
+        if self.stacked_experts:
+            return [f"{base}.switch_mlp.{proj}" for proj in projections]
+        return [f"{base}.experts.{e}.{proj}" for e in range(self.num_experts) for proj in projections]
 
     def sparse(self, layer: int) -> bool:
         return (
@@ -81,6 +93,9 @@ class TinyDenseSpec:
         for layer in range(self.num_hidden_layers):
             if self.sparse(layer):  # mlx-lm quantizes the router to 8 bits, group 64
                 quant[f"model.layers.{layer}.mlp.gate"] = {"group_size": 64, "bits": 8}
+            if self.mxfp4_mlp:
+                for module in self.mlp_modules(layer):
+                    quant[module] = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
         config = {
             "architectures": [ARCHITECTURES[self.model_type]],
             "model_type": self.model_type,
@@ -141,6 +156,12 @@ def write_tiny_dense(directory: Path, spec: TinyDenseSpec = TinyDenseSpec()) -> 
     def linear(module: str, rows: int, cols: int, std: float, experts: int = 0) -> None:
         override = config["quantization"].get(module)
         source = override if isinstance(override, dict) else config["quantization"]
+        if source.get("mode") == "mxfp4":
+            pairs = [_mxfp4(rng, rows, cols, std) for _ in range(max(1, experts))]
+            weight, exponents = map(np.stack, zip(*pairs)) if experts else pairs[0]
+            tensors[f"{module}.weight"] = ("U32", weight)
+            tensors[f"{module}.scales"] = ("U8", exponents)
+            return
         qspec = QuantSpec(group_size=source["group_size"], bits=source["bits"])
         if not experts:
             weight, scales, biases = _quantized(rng, rows, cols, qspec, std)

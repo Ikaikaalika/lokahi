@@ -48,6 +48,19 @@ def test_affine_layout_matches_mx_dequantize(bits):
     np.testing.assert_allclose(np.array(theirs), ours, rtol=0, atol=1e-6)
 
 
+def test_mxfp4_layout_matches_mx_dequantize():
+    import mlx.core as mx
+
+    from lokahi.formats import dequantize_mxfp4
+
+    rng = np.random.default_rng(4)
+    codes = rng.integers(0, 16, size=(6, 128), dtype=np.uint32)
+    exponents = rng.integers(110, 140, size=(6, 4)).astype(np.uint8)
+    words = pack_affine(codes, 4)
+    theirs = mx.dequantize(mx.array(words), mx.array(exponents), None, group_size=32, bits=4, mode="mxfp4")
+    np.testing.assert_array_equal(np.array(theirs.astype(mx.float32)), dequantize_mxfp4(words, exponents))
+
+
 @pytest.mark.parametrize(
     "spec",
     [
@@ -94,8 +107,10 @@ def test_oracle_matches_mlx_lm_gemma3(tmp_path, spec):
         # window, so this variant leaves the window unset.
         TinyDenseSpec(model_type="mistral", tie_word_embeddings=False, rope_theta=1e6, seed=6),
         TinyDenseSpec(model_type="qwen3_moe", head_dim=64, mlp_only_layers=(1,), seed=9),
+        TinyDenseSpec(model_type="qwen3_moe", head_dim=64, mlp_only_layers=(1,), mxfp4_mlp=True, seed=11),
     ],
-    ids=["llama3-rope-llama3", "qwen3-qk-norm", "qwen2-bias-group7", "mistral-untied", "qwen3-moe-top2-of-8"],
+    ids=["llama3-rope-llama3", "qwen3-qk-norm", "qwen2-bias-group7", "mistral-untied", "qwen3-moe-top2-of-8",
+         "qwen3-moe-mxfp4-experts"],
 )
 def test_oracle_matches_mlx_lm_llama_family(tmp_path, spec):
     directory = write_tiny_dense(tmp_path / "model", spec)
