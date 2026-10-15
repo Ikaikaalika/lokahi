@@ -12,6 +12,7 @@
 //                     [--max-new N] [--warmups W]
 //   lokahi tokenize   --model DIR (--text TEXT | --texts-file F.json) [--no-special]
 //   lokahi detokenize --model DIR (--tokens 1,2 | --ids-file F.json) [--keep-special]
+//                     [--stream [--stops-file S.json]]
 //   lokahi pretokenize --model DIR (--text TEXT | --texts-file F.json)
 //   lokahi run        --model DIR --prompt TEXT [--max-new N]
 //
@@ -36,6 +37,7 @@
 #include "json.h"
 #include "safetensors.h"
 #include "sampling.h"
+#include "text_stream.h"
 #include "tokenizer.h"
 
 #if defined(LOKAHI_WITH_METAL)
@@ -276,9 +278,39 @@ int cmd_tokenize(const Args& args) {
   return 0;
 }
 
+// Each id list through a TextStream: the text every push returned, the
+// finish text last, and the token after which a stop string ended it.
+std::string stream_texts(const Tokenizer& tokenizer, const Json& lists, const Args& args) {
+  std::vector<std::string> stops;
+  if (args.has("stops-file")) {
+    const Json list = Json::parse(read_text_file(args.get("stops-file")));
+    for (const Json& stop : list.as_array()) stops.push_back(stop.as_string());
+  }
+  std::string out = "{\"streams\":[";
+  for (size_t i = 0; i < lists.as_array().size(); ++i) {
+    TextStream stream(tokenizer, stops, !args.has("keep-special"));
+    std::string deltas;
+    long stopped_after = -1;
+    const auto& list = lists.as_array()[i].as_array();
+    for (size_t k = 0; k < list.size(); ++k) {
+      deltas += (k ? "," : "") + json_string(stream.push(static_cast<int32_t>(list[k].as_int())));
+      if (stream.stopped() && stopped_after < 0) stopped_after = static_cast<long>(k);
+    }
+    deltas += (list.empty() ? "" : ",") + json_string(stream.finish());
+    out += (i ? "," : "") + std::string("{\"deltas\":[") + deltas + "],\"stopped_after\":" +
+           std::to_string(stopped_after) + ",\"text\":" + json_string(stream.text()) + "}";
+  }
+  return out + "]}";
+}
+
 int cmd_detokenize(const Args& args) {
   Tokenizer tokenizer = load_tokenizer(args);
   const bool skip = !args.has("keep-special");
+  if (args.has("stream")) {
+    LK_CHECK(args.has("ids-file"), "--stream needs --ids-file");
+    std::printf("%s\n", stream_texts(tokenizer, Json::parse(read_text_file(args.get("ids-file"))), args).c_str());
+    return 0;
+  }
   if (args.has("ids-file")) {
     Json lists = Json::parse(read_text_file(args.get("ids-file")));
     std::string out = "{\"texts\":[";
