@@ -2,7 +2,7 @@
 
 These tests pin the oracles' semantics to an independent implementation:
 ``mx.dequantize`` for the packed affine layout, and MLX-LM's ``gemma3_text``,
-``llama``, ``qwen2`` and ``qwen3`` models for the full decoders. They need
+``gemma4``, ``llama``, ``qwen2`` and ``qwen3`` models for the full decoders. They need
 ``mlx`` and ``mlx_lm`` and therefore run on Apple Silicon only.
 """
 from __future__ import annotations
@@ -12,9 +12,16 @@ import importlib.util
 import numpy as np
 import pytest
 
-from lokahi.fixtures import TinyDenseSpec, TinyGemma3Spec, write_tiny_dense, write_tiny_gemma3
+from lokahi.fixtures import (
+    TinyDenseSpec,
+    TinyGemma3Spec,
+    TinyGemma4Spec,
+    write_tiny_dense,
+    write_tiny_gemma3,
+    write_tiny_gemma4,
+)
 from lokahi.formats import QuantSpec, dequantize_affine, pack_affine
-from lokahi.oracles import Gemma3Reference, LlamaFamilyReference
+from lokahi.oracles import Gemma3Reference, Gemma4Reference, LlamaFamilyReference
 
 pytestmark = pytest.mark.skipif(
     importlib.util.find_spec("mlx") is None or importlib.util.find_spec("mlx_lm") is None,
@@ -92,6 +99,24 @@ def test_oracle_matches_mlx_lm_gemma3(tmp_path, spec):
 def test_oracle_matches_mlx_lm_llama_family(tmp_path, spec):
     directory = write_tiny_dense(tmp_path / "model", spec)
     _assert_mlx_lm_matches(directory, LlamaFamilyReference.load(directory).logits(TOKENS))
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        TinyGemma4Spec(),
+        TinyGemma4Spec(
+            num_key_value_heads=2, num_global_key_value_heads=1, attention_k_eq_v=True, num_kv_shared_layers=0,
+            hidden_size_per_layer_input=0, use_double_wide_mlp=False, tie_word_embeddings=False, nested=False,
+            sliding_window=5, global_partial_rotary_factor=0.5, group_size=64, bits=8, seed=7,
+        ),
+    ],
+    ids=["e2b-shape", "k-eq-v-untied-flat"],
+)
+def test_oracle_matches_mlx_lm_gemma4(tmp_path, spec):
+    directory = write_tiny_gemma4(tmp_path / "model", spec)
+    # In float32, MLX-LM's scalar constants are not rounded to BF16.
+    _assert_mlx_lm_matches(directory, Gemma4Reference.load(directory, bf16_constants=False).logits(TOKENS))
 
 
 def _assert_mlx_lm_matches(directory, expected):
