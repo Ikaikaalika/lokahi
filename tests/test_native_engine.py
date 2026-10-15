@@ -106,6 +106,18 @@ DENSE_VARIANTS = {
         moe_intermediate_size=64, sliding_window=9, rope_theta=150000.0,
         rope_scaling={**GPT_OSS_YARN, "truncate": True}, seed=15,
     ),
+    # GLM-4.5-Air's layout: q/k/v biases, RoPE on half of each head, a leading
+    # dense layer, a dense sigmoid router with a correction bias, a shared
+    # expert, untied.
+    "glm4-moe-air": TinyDenseSpec(model_type="glm4_moe", head_dim=64, num_hidden_layers=3, num_experts=8,
+                                  num_experts_per_tok=2, moe_intermediate_size=64, rope_theta=1e6,
+                                  tie_word_embeddings=False, seed=18),
+    # DeepSeek V3-style group-limited routing (best 2 of 4 groups), q/k norms,
+    # two shared experts, raw weights times 2.5.
+    "glm4-moe-grouped": TinyDenseSpec(model_type="glm4_moe", head_dim=64, num_hidden_layers=3, num_experts=8,
+                                      num_experts_per_tok=3, moe_intermediate_size=64, rope_theta=1e6, n_group=4,
+                                      topk_group=2, routed_scaling_factor=2.5, use_qk_norm=True, n_shared_experts=2,
+                                      norm_topk_prob=False, seed=18),
     # Qwen 3 with long-context YaRN.
     "qwen3-yarn": TinyDenseSpec(model_type="qwen3", head_dim=64, rope_theta=1e6, rope_scaling=QWEN3_YARN, seed=16),
     # Every other layer sparse, top-3 of 6 unnormalized, Transformers'
@@ -152,7 +164,7 @@ def fixture_model(request, tmp_path_factory):
     return directory, LlamaFamilyReference.load(directory)
 
 
-CPU_ONLY = ("qwen3_moe", "gpt_oss")  # the Metal backend refuses these for now
+CPU_ONLY = ("qwen3_moe", "gpt_oss", "glm4_moe")  # the Metal backend refuses these for now
 
 
 def _uses_mxfp4(config: dict) -> bool:
@@ -428,7 +440,7 @@ def test_moe_fixtures_route_far_from_ties(tmp_path):
     # Guards the fixtures: on the router's real inputs, the top-k choice must
     # be stable under float32 error, and every expert must serve some token.
     for name in ("qwen3-moe-top2-of-8", "qwen3-moe-mxfp4-experts", "qwen3-moe-top3-of-6-per-expert",
-                 "gpt-oss-mxfp4-yarn", "gpt-oss-affine-top3"):
+                 "gpt-oss-mxfp4-yarn", "gpt-oss-affine-top3", "glm4-moe-air", "glm4-moe-grouped"):
         oracle = LlamaFamilyReference.load(write_tiny_dense(tmp_path / name, DENSE_VARIANTS[name]))
         k, route = oracle.config.num_experts_per_tok, oracle.route
         gaps: list[float] = []
@@ -481,6 +493,32 @@ def test_gpt_oss_fixtures_exercise_every_feature(tmp_path):
     assert abs(untruncated.attention_factor() - (0.1 * np.log(32.0) + 1.0)) < 1e-12
 
 
+def test_glm_fixtures_exercise_every_feature(tmp_path):
+    # Guards the fixtures: group limits and the correction bias each change
+    # some token's experts, and partial RoPE leaves half of each head alone.
+    oracle = LlamaFamilyReference.load(write_tiny_dense(tmp_path / "grouped", DENSE_VARIANTS["glm4-moe-grouped"]))
+    cfg = oracle.config
+    assert cfg.rotary_dim == cfg.head_dim // 2 and cfg.inv_freq().shape == (cfg.head_dim // 4,)
+    inputs: list[np.ndarray] = []
+    route = oracle.route
+
+    def traced(layer, x):
+        inputs.append((layer, x))
+        return route(layer, x)
+
+    oracle.route = traced
+    oracle.logits(TOKENS)
+    k = cfg.num_experts_per_tok
+    regrouped = debiased = 0
+    for layer, x in inputs:
+        chosen = np.sort(route(layer, x)[0], axis=-1)
+        raw = 1.0 / (1.0 + np.exp(-(x @ oracle.w[f"model.layers.{layer}.mlp.gate"].T)))
+        corrected = raw + oracle.w[f"model.layers.{layer}.mlp.gate.e_score_correction_bias"]
+        regrouped += (np.sort(np.argsort(-corrected, axis=-1)[:, :k], axis=-1) != chosen).any(axis=-1).sum()
+        debiased += (np.sort(np.argsort(-raw, axis=-1)[:, :k], axis=-1) != chosen).any(axis=-1).sum()
+    assert regrouped > 0 and debiased > 0
+
+
 def test_gpt_oss_without_sinks_fails_closed(native_cli, tmp_path):
     directory = write_tiny_dense(tmp_path / "model", DENSE_VARIANTS["gpt-oss-affine-top3"])
     path = directory / "model.safetensors"
@@ -498,8 +536,14 @@ def test_gpt_oss_without_sinks_fails_closed(native_cli, tmp_path):
         ({"shared_expert_intermediate_size": 64}, "qwen3_moe: shared experts are not supported"),
         ({"num_experts_per_tok": 9}, "qwen3_moe: invalid expert configuration"),
         ({"mlp_only_layers": [3]}, "qwen3_moe: mlp_only_layers entry out of range"),
+        ({"scoring_func": "softmax"}, "glm4_moe: only sigmoid routing is supported"),
+        ({"topk_method": "greedy"}, "glm4_moe: only noaux_tc routing is supported"),
+        ({"n_group": 3}, "glm4_moe: invalid expert configuration"),
+        ({"partial_rotary_factor": 0.3}, "glm4_moe: partial_rotary_factor must rotate an even number of dimensions"),
     ],
 )
 def test_unsupported_moe_configurations_fail_closed(native_cli, tmp_path, change, message):
-    directory = write_tiny_dense(tmp_path / "model", TinyDenseSpec(model_type="qwen3_moe", extra=change))
+    model_type = message.split(":")[0]
+    spec = TinyDenseSpec(model_type=model_type, head_dim=64, extra=change)
+    directory = write_tiny_dense(tmp_path / "model", spec)
     assert message in _load_error(native_cli, directory)

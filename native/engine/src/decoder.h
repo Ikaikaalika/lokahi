@@ -1,6 +1,6 @@
 // Decoder-only transformers (Gemma 3, Gemma 4, Llama 3.x, Mistral, Qwen 2/2.5,
-// Qwen 3, Qwen 3 MoE, GPT-OSS): configuration, weight binding, and the CPU
-// backend.
+// Qwen 3, Qwen 3 MoE, GPT-OSS, GLM-4.5): configuration, weight binding, and
+// the CPU backend.
 // One configuration describes how the families differ (norm style and
 // placement, activation, per-head Q/K norm, q/k/v biases, RoPE bases,
 // scaling and partial rotation, sliding windows, logit soft-capping, and
@@ -84,6 +84,10 @@ struct DecoderConfig {
   // Full layers rotate only this fraction of their dimensions, with
   // exponents over the whole head size ("proportional" RoPE).
   float global_partial_rotary = 1.0f;
+  // Classic partial RoPE (GLM): rotate-half within the first rotary_dim
+  // dimensions, exponents over rotary_dim, the rest untouched; 0 rotates the
+  // whole head.
+  int rotary_dim = 0;
   int per_layer_input = 0;          // hidden_size_per_layer_input; 0 disables
   // Per-layer input constants as the references apply them: the lookup times
   // sqrt(P), the projection times hidden^-0.5, their sum times 2^-0.5.
@@ -100,7 +104,14 @@ struct DecoderConfig {
   std::vector<bool> layer_moe;
   // Softmax: softmax over all experts, then the top k (Qwen 3 MoE).
   // TopKSoftmax: the top k router logits, then a softmax over them (GPT-OSS).
-  enum class Router { Softmax, TopKSoftmax } router = Router::Softmax;
+  // SigmoidGrouped: sigmoid scores plus a correction bias choose the top k
+  // within the best topk_group of n_group groups; the raw scores of the
+  // chosen experts, renormalized, times routed_scaling, weight them (GLM-4.5,
+  // DeepSeek V3's noaux_tc).
+  enum class Router { Softmax, TopKSoftmax, SigmoidGrouped } router = Router::Softmax;
+  int n_group = 1, topk_group = 1;
+  float routed_scaling = 1.0f;
+  int shared_intermediate = 0;  // width of the always-on shared expert; 0 for none
   std::string router_module = "mlp.gate";  // relative to the layer
   bool router_bias = false;
   bool expert_bias = false;     // biases on every expert projection
@@ -123,7 +134,7 @@ struct DecoderConfig {
   // What the Metal backend implements: every option but mixture-of-experts
   // layers and GPT-OSS's attention biases and sinks. (MXFP4 matrices are
   // refused per matrix.)
-  bool metal_implements() const { return num_experts == 0 && !o_bias && !attention_sinks; }
+  bool metal_implements() const { return num_experts == 0 && !o_bias && !attention_sinks && rotary_dim == 0; }
 };
 
 bool is_supported_decoder(const Json& raw);
@@ -142,6 +153,8 @@ struct DecoderLayer {
   Linear router;
   std::vector<Linear> expert_gate, expert_up, expert_down;
   std::vector<float> router_bias, expert_gate_bias, expert_up_bias, expert_down_bias;
+  std::vector<float> router_correction;          // SigmoidGrouped's selection bias
+  Linear shared_gate, shared_up, shared_down;    // the shared expert, with shared_intermediate
   // Per-layer inputs (Gemma 4): gate [P, hidden], projection [hidden, P].
   Linear per_layer_gate, per_layer_proj;
   std::vector<float> per_layer_norm;
