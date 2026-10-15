@@ -540,6 +540,25 @@ size_t DecoderWeights::matrix_bytes() const {
   return total;
 }
 
+bool DecoderWeights::uses_mxfp4() const {
+  if (embed.quant.mxfp4() || lm_head.quant.mxfp4() || embed_per_layer.quant.mxfp4() ||
+      per_layer_model_proj.quant.mxfp4()) {
+    return true;
+  }
+  for (const auto& l : layers) {
+    for (const Linear* m : {&l.q_proj, &l.k_proj, &l.v_proj, &l.o_proj, &l.gate_proj, &l.up_proj, &l.down_proj,
+                            &l.per_layer_gate, &l.per_layer_proj, &l.router}) {
+      if (m->quant.mxfp4()) return true;
+    }
+    for (const auto* experts : {&l.expert_gate, &l.expert_up, &l.expert_down}) {
+      for (const Linear& expert : *experts) {
+        if (expert.quant.mxfp4()) return true;
+      }
+    }
+  }
+  return false;
+}
+
 namespace traffic {
 
 double linear(const Linear& weights, int n) {

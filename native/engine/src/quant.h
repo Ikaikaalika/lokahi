@@ -1,4 +1,5 @@
-// Linear-layer weights: MLX affine-quantized or dense, plus CPU kernels.
+// Linear-layer weights: MLX affine- or MXFP4-quantized, or dense, plus CPU
+// kernels.
 #pragma once
 
 #include <cstdint>
@@ -11,10 +12,16 @@
 
 namespace lokahi {
 
+// Affine: code * scale + bias per group, with BF16/F16 scales and biases.
+// MXFP4 (OCP microscaling): 4-bit E2M1 codes times a per-32 E8M0 scale.
+enum class QuantMode { Affine, Mxfp4 };
+
 struct QuantSpec {
   int group_size = 0;
   int bits = 0;  // 0 means unquantized.
+  QuantMode mode = QuantMode::Affine;
   bool quantized() const { return bits != 0; }
+  bool mxfp4() const { return quantized() && mode == QuantMode::Mxfp4; }
 };
 
 // Resolves an MLX `quantization` config (default plus per-module overrides,
@@ -22,15 +29,16 @@ struct QuantSpec {
 QuantSpec quant_spec_for(const Json& config, const std::string& module);
 
 // A [rows, cols] matrix used as y = W x. Either quantized (packed uint32
-// codes with per-group scales and biases) or dense.
+// codes with per-group scales, plus biases for affine) or dense.
 struct Linear {
   std::string name;
   int64_t rows = 0;
   int64_t cols = 0;
   QuantSpec quant;
   const uint32_t* words = nullptr;  // quantized: [rows, cols * bits / 32]
-  const uint16_t* scales = nullptr;  // quantized: [rows, cols / group_size]
+  const uint16_t* scales = nullptr;  // affine: [rows, cols / group_size]
   const uint16_t* biases = nullptr;
+  const uint8_t* exponents = nullptr;  // mxfp4: [rows, cols / 32] E8M0 scales
   DType scale_dtype = DType::BF16;  // BF16 or F16
   const void* dense = nullptr;       // dense: [rows, cols]
   DType dense_dtype = DType::F32;

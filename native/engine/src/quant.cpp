@@ -1,6 +1,7 @@
 #include "quant.h"
 
 #include <algorithm>
+#include <cstring>
 #include <vector>
 
 #include "common.h"
@@ -18,10 +19,17 @@ QuantSpec quant_spec_for(const Json& config, const std::string& module) {
   if (const Json* override_value = quant->find(module)) {
     if (override_value->is_bool() && !override_value->as_bool()) return {};
     if (override_value->is_object()) {
-      spec.group_size = static_cast<int>(override_value->int_or("group_size", spec.group_size));
-      spec.bits = static_cast<int>(override_value->int_or("bits", spec.bits));
-      mode = override_value->string_or("mode", mode);
+      // As mlx.nn.quantize passes it to to_quantized: missing keys take that
+      // mode's defaults, not the model-wide ones.
+      mode = override_value->string_or("mode", "affine");
+      spec.group_size = static_cast<int>(override_value->int_or("group_size", mode == "mxfp4" ? 32 : 64));
+      spec.bits = static_cast<int>(override_value->int_or("bits", 4));
     }
+  }
+  if (mode == "mxfp4") {
+    LK_CHECK(spec.bits == 4 && spec.group_size == 32, "mxfp4 needs 4 bits and group size 32 (" + module + ")");
+    spec.mode = QuantMode::Mxfp4;
+    return spec;
   }
   LK_CHECK(mode == "affine", "quantization mode '" + mode + "' is not supported yet (" + module + ")");
   LK_CHECK(spec.bits == 2 || spec.bits == 4 || spec.bits == 8,
@@ -33,9 +41,37 @@ QuantSpec quant_spec_for(const Json& config, const std::string& module) {
 
 size_t Linear::weight_bytes() const {
   if (!quant.quantized()) return static_cast<size_t>(rows * cols) * dtype_size(dense_dtype);
+  // Affine groups carry a 2-byte scale and bias; MXFP4 groups a 1-byte exponent.
   return static_cast<size_t>(rows * words_per_row()) * 4 +
-         static_cast<size_t>(rows * groups_per_row()) * 2 * 2;
+         static_cast<size_t>(rows * groups_per_row()) * (quant.mxfp4() ? 1 : 4);
 }
+
+namespace {
+
+// Binds the per-group scales of a quantized module whose codes are bound:
+// affine BF16/F16 scales and biases, or MXFP4's U8 exponents. `experts` > 0
+// expects a leading expert dimension.
+void bind_scales(const Checkpoint& checkpoint, const std::string& module, int64_t experts, Linear& linear) {
+  const TensorView& scales = checkpoint.get(module + ".scales");
+  std::vector<int64_t> shape = {linear.rows, linear.cols / linear.quant.group_size};
+  if (experts > 0) shape.insert(shape.begin(), experts);
+  LK_CHECK(scales.shape == shape, module + ": scales shape does not match weight and group size");
+  if (linear.quant.mxfp4()) {
+    LK_CHECK(scales.dtype == DType::U8, module + ": mxfp4 scales must be U8");
+    LK_CHECK(checkpoint.find(module + ".biases") == nullptr, module + ": mxfp4 has no biases");
+    linear.exponents = scales.as<uint8_t>();
+    return;
+  }
+  const TensorView& biases = checkpoint.get(module + ".biases");
+  LK_CHECK(scales.dtype == biases.dtype && (scales.dtype == DType::BF16 || scales.dtype == DType::F16),
+           module + ": scales/biases must be BF16 or F16");
+  LK_CHECK(biases.shape == scales.shape, module + ": biases shape mismatch");
+  linear.scales = scales.as<uint16_t>();
+  linear.biases = biases.as<uint16_t>();
+  linear.scale_dtype = scales.dtype;
+}
+
+}  // namespace
 
 Linear bind_linear(const Checkpoint& checkpoint, const Json& config, const std::string& module,
                    const std::string& quant_module) {
@@ -53,23 +89,13 @@ Linear bind_linear(const Checkpoint& checkpoint, const Json& config, const std::
     linear.dense_dtype = weight.dtype;
     return linear;
   }
-  const TensorView& biases = checkpoint.get(module + ".biases");
   linear.quant = quant_spec_for(config, quant_module);
   LK_CHECK(linear.quant.quantized(), module + ": has scales but config marks it unquantized");
   LK_CHECK(weight.dtype == DType::U32, module + ": quantized weight must be U32");
-  LK_CHECK(scales->dtype == biases.dtype &&
-               (scales->dtype == DType::BF16 || scales->dtype == DType::F16),
-           module + ": scales/biases must be BF16 or F16");
   linear.rows = weight.dim(0);
   linear.cols = weight.dim(1) * 32 / linear.quant.bits;
-  LK_CHECK(scales->shape.size() == 2 && scales->dim(0) == linear.rows &&
-               scales->dim(1) == linear.cols / linear.quant.group_size,
-           module + ": scales shape does not match weight and group size");
-  LK_CHECK(biases.shape == scales->shape, module + ": biases shape mismatch");
   linear.words = weight.as<uint32_t>();
-  linear.scales = scales->as<uint16_t>();
-  linear.biases = biases.as<uint16_t>();
-  linear.scale_dtype = scales->dtype;
+  bind_scales(checkpoint, module, 0, linear);
   return linear;
 }
 
@@ -92,29 +118,23 @@ std::vector<Linear> bind_expert_linears(const Checkpoint& checkpoint, const Json
     first.dense_dtype = weight.dtype;
     weight_stride = static_cast<size_t>(first.rows * first.cols) * dtype_size(weight.dtype);
   } else {
-    const TensorView& biases = checkpoint.get(module + ".biases");
     first.quant = quant_spec_for(config, quant_module);
     LK_CHECK(first.quant.quantized(), module + ": has scales but config marks it unquantized");
     LK_CHECK(weight.dtype == DType::U32, module + ": quantized weight must be U32");
-    LK_CHECK(scales->dtype == biases.dtype && (scales->dtype == DType::BF16 || scales->dtype == DType::F16),
-             module + ": scales/biases must be BF16 or F16");
     first.cols = weight.dim(2) * 32 / first.quant.bits;
-    LK_CHECK(scales->shape.size() == 3 && scales->dim(0) == experts && scales->dim(1) == first.rows &&
-                 scales->dim(2) == first.cols / first.quant.group_size,
-             module + ": scales shape does not match weight and group size");
-    LK_CHECK(biases.shape == scales->shape, module + ": biases shape mismatch");
     first.words = weight.as<uint32_t>();
-    first.scales = scales->as<uint16_t>();
-    first.biases = biases.as<uint16_t>();
-    first.scale_dtype = scales->dtype;
+    bind_scales(checkpoint, module, experts, first);
     weight_stride = static_cast<size_t>(first.rows * first.words_per_row()) * 4;
-    scale_stride = static_cast<size_t>(first.rows * first.groups_per_row()) * 2;
+    scale_stride = static_cast<size_t>(first.rows * first.groups_per_row()) * (first.quant.mxfp4() ? 1 : 2);
   }
   std::vector<Linear> out(static_cast<size_t>(experts), first);
   for (int64_t e = 0; e < experts; ++e) {
     Linear& linear = out[static_cast<size_t>(e)];
     const size_t offset = static_cast<size_t>(e);
-    if (linear.quant.quantized()) {
+    if (linear.quant.mxfp4()) {
+      linear.words = reinterpret_cast<const uint32_t*>(reinterpret_cast<const uint8_t*>(first.words) + offset * weight_stride);
+      linear.exponents = first.exponents + offset * scale_stride;
+    } else if (linear.quant.quantized()) {
       linear.words = reinterpret_cast<const uint32_t*>(reinterpret_cast<const uint8_t*>(first.words) + offset * weight_stride);
       linear.scales = reinterpret_cast<const uint16_t*>(reinterpret_cast<const uint8_t*>(first.scales) + offset * scale_stride);
       linear.biases = reinterpret_cast<const uint16_t*>(reinterpret_cast<const uint8_t*>(first.biases) + offset * scale_stride);
@@ -158,9 +178,29 @@ static inline float dense_value(const Linear& linear, int64_t index) {
   }
 }
 
+// E2M1 values by code, and an E8M0 exponent as MLX decodes it: 2^(e - 127),
+// built from its bits (e = 0 is the subnormal 2^-127).
+constexpr float kFp4[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+                            -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+
+static float e8m0_value(uint8_t e) {
+  const uint32_t bits = e == 0 ? 0x00400000u : static_cast<uint32_t>(e) << 23;
+  float out;
+  std::memcpy(&out, &bits, sizeof(out));
+  return out;
+}
+
 void dequantize_row(const Linear& linear, int64_t row, float* out) {
   if (!linear.quant.quantized()) {
     for (int64_t c = 0; c < linear.cols; ++c) out[c] = dense_value(linear, row * linear.cols + c);
+    return;
+  }
+  if (linear.quant.mxfp4()) {
+    const uint32_t* words = linear.words + row * linear.words_per_row();
+    for (int64_t g = 0; g < linear.groups_per_row(); ++g) {
+      const float scale = e8m0_value(linear.exponents[row * linear.groups_per_row() + g]);
+      for (int64_t c = g * 32; c < (g + 1) * 32; ++c) out[c] = scale * kFp4[(words[c / 8] >> (4 * (c % 8))) & 0xF];
+    }
     return;
   }
   const int bits = linear.quant.bits;
@@ -205,6 +245,25 @@ static float quant_row_dot(const Linear& linear, int64_t row, const float* x, co
   return total;
 }
 
+// Dot of one MXFP4 row with x: per group, the scale times the sum of
+// E2M1 values times x, as MLX accumulates it.
+static float mxfp4_row_dot(const Linear& linear, int64_t row, const float* x) {
+  const uint32_t* words = linear.words + row * linear.words_per_row();
+  const uint8_t* exponents = linear.exponents + row * linear.groups_per_row();
+  float total = 0.0f;
+  for (int64_t g = 0; g < linear.groups_per_row(); ++g) {
+    const uint32_t* gw = words + g * 4;
+    const float* gx = x + g * 32;
+    float acc = 0.0f;
+    for (int w = 0; w < 4; ++w) {
+      const uint32_t word = gw[w];
+      for (int j = 0; j < 8; ++j) acc += kFp4[(word >> (4 * j)) & 0xF] * gx[w * 8 + j];
+    }
+    total += e8m0_value(exponents[g]) * acc;
+  }
+  return total;
+}
+
 static float row_dot(const Linear& linear, int64_t row, const float* x, const float* xsum,
                      float* scratch) {
   if (!linear.quant.quantized()) {
@@ -219,6 +278,7 @@ static float row_dot(const Linear& linear, int64_t row, const float* x, const fl
     for (int64_t c = 0; c < linear.cols; ++c) acc += scratch[c] * x[c];
     return acc;
   }
+  if (linear.quant.mxfp4()) return mxfp4_row_dot(linear, row, x);
   switch (linear.quant.bits) {
     case 2: return quant_row_dot<2>(linear, row, x, xsum);
     case 4: return quant_row_dot<4>(linear, row, x, xsum);

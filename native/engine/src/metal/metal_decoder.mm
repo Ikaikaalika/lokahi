@@ -277,6 +277,8 @@ class DecoderMetal final : public Model {
   void validate() const {
     auto check = [&](const Linear& l) {
       LK_CHECK(l.quant.quantized(), "metal: " + l.name + " is not quantized; use --backend cpu");
+      LK_CHECK(!l.quant.mxfp4(), "metal: " + l.name + " is mxfp4, which the Metal kernels do not implement yet; "
+               "use --backend cpu");
       LK_CHECK(l.cols % 32 == 0 && l.quant.group_size % 32 == 0,
                "metal: " + l.name + " needs cols and group_size divisible by 32");
     };
