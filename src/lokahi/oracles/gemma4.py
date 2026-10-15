@@ -35,7 +35,9 @@ checkpoints are converted for:
 * each layer's output is multiplied by its ``layer_scalar``;
 * the MLP is GeGLU with the tanh GELU, and logits are soft-capped;
 * with images (``logits(..., injected, blocks)``), the image features replace
-  their tokens' scaled embeddings as they are and, when
+  their tokens' scaled embeddings as they are (with per-layer inputs, those
+  positions look up the pad token's per-layer embedding and project the
+  features) and, when
   ``use_bidirectional_attention`` is ``"vision"``, each image's tokens attend
   to each other in both directions on sliding layers only, within the window
   (Transformers' ``AND(window, OR(causal, block))``); full layers stay causal.
@@ -74,6 +76,7 @@ class Gemma4Config:
     num_kv_shared_layers: int
     hidden_size_per_layer_input: int
     final_logit_softcapping: float | None
+    pad_token_id: int = 0
     bidirectional_vision: bool = False  # use_bidirectional_attention == "vision"
     num_experts: int = 0  # with enable_moe_block
     top_k_experts: int = 0
@@ -109,6 +112,7 @@ class Gemma4Config:
             num_kv_shared_layers=int(cfg.get("num_kv_shared_layers", 0)),
             hidden_size_per_layer_input=int(cfg.get("hidden_size_per_layer_input") or 0),
             final_logit_softcapping=cfg.get("final_logit_softcapping"),
+            pad_token_id=int(cfg.get("pad_token_id", raw.get("pad_token_id", 0)) or 0),
             bidirectional_vision=cfg.get("use_bidirectional_attention") == "vision",
             num_experts=int(cfg["num_experts"]) if moe else 0,
             top_k_experts=int(cfg["top_k_experts"]) if moe else 0,
@@ -302,12 +306,13 @@ class Gemma4Reference:
         tokens = np.asarray(token_ids, dtype=np.int64)
         positions = np.arange(tokens.shape[0])
         x = self.w["model.embed_tokens"][tokens] * self._constant(math.sqrt(cfg.hidden_size))
-        if injected and cfg.hidden_size_per_layer_input:
-            # Transformers feeds image positions' per-layer inputs the pad token.
-            raise NotImplementedError("image features with per-layer inputs")
-        per_layer = self._per_layer_inputs(tokens, x)
+        lookup = tokens.copy()
         for position, row in (injected or {}).items():
             x[position] = row
+            # Transformers looks up image positions' per-layer embeddings for
+            # the pad token; their projection reads the image features.
+            lookup[position] = cfg.pad_token_id
+        per_layer = self._per_layer_inputs(lookup, x)
         kvs: dict[int, tuple[np.ndarray, np.ndarray]] = {}
         for index in range(cfg.num_hidden_layers):
             prefix = f"model.layers.{index}"

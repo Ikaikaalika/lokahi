@@ -100,6 +100,9 @@ struct DecoderConfig {
   // sqrt(P), the projection times hidden^-0.5, their sum times 2^-0.5.
   float per_layer_embed_scale = 1.0f, per_layer_projection_scale = 1.0f, per_layer_input_scale = 1.0f;
   bool layer_scalars = false;       // each layer's output times its layer_scalar
+  // The token whose per-layer embedding image positions look up (Gemma 4,
+  // as Transformers replaces image tokens with the pad token there).
+  int pad_token_id = 0;
 
   // Mixture of experts (Qwen 3 MoE). In layers marked in layer_moe, a
   // softmax router picks experts_per_token of num_experts gated experts

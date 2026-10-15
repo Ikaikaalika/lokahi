@@ -639,6 +639,7 @@ class DecoderMetal final : public Model {
     prompt_ = shared_buffer(static_cast<size_t>(max_context_) * sizeof(int32_t));
     // An injection's row index and last key per prompt token; always bound.
     inject_index_ = shared_buffer(static_cast<size_t>(max_context_) * sizeof(int32_t));
+    if (c_.per_layer_input > 0) per_layer_tokens_ = shared_buffer(static_cast<size_t>(max_context_) * sizeof(int32_t));
     last_key_ = shared_buffer(static_cast<size_t>(max_context_) * sizeof(int32_t));
   }
 
@@ -1094,7 +1095,9 @@ class DecoderMetal final : public Model {
     }
     section(enc, "embed", profiling ? traffic::embed(w_->embed, n) : 0.0);
     if (c_.per_layer_input > 0) {
-      encode_per_layer_inputs(enc, tokens, tokens_offset, n);
+      // During an image prefill the lookup reads the pad-substituted tokens,
+      // laid out like the prompt.
+      encode_per_layer_inputs(enc, plan_.empty() ? tokens : per_layer_tokens_, tokens_offset, n);
       const int64_t width = static_cast<int64_t>(c_.num_layers) * c_.per_layer_input;
       section(enc, "per_layer_input",
               profiling ? traffic::linear(w_->per_layer_model_proj, n) + traffic::embed(w_->embed_per_layer, n) +
@@ -1222,11 +1225,14 @@ class DecoderMetal final : public Model {
     LK_CHECK(n > 0, "prefill requires at least one token");
     LK_CHECK(position_ + n <= max_context_, "context length exceeded");
     for (int i = 0; i < n; ++i) LK_CHECK(tokens[i] >= 0 && tokens[i] < c_.vocab_size, "token id out of range");
-    if (!active_.empty()) {
-      LK_CHECK(c_.per_layer_input == 0, "metal: image features with per-layer inputs are not supported yet");
-    }
     plan_ = plan_injection(active_, position_, n, c_.hidden_size, chunk_);
     if (!plan_.empty()) {
+      if (c_.per_layer_input > 0) {
+        // Image positions look up the pad token's per-layer embedding.
+        LK_CHECK(c_.pad_token_id >= 0 && c_.pad_token_id < embed_per_layer_.rows, "metal: pad token out of range");
+        int32_t* lookup = static_cast<int32_t*>([per_layer_tokens_ contents]);
+        for (int i = 0; i < n; ++i) lookup[i] = plan_.row[static_cast<size_t>(i)] >= 0 ? c_.pad_token_id : tokens[i];
+      }
       std::memcpy([inject_index_ contents], plan_.row.data(), sizeof(int32_t) * static_cast<size_t>(n));
       std::memcpy([last_key_ contents], plan_.last_key.data(), sizeof(int32_t) * static_cast<size_t>(n));
       inject_rows_ = [device_ newBufferWithBytes:active_.rows.data()
@@ -1311,6 +1317,7 @@ class DecoderMetal final : public Model {
   PromptInjection active_;
   InjectionPlan plan_;
   id<MTLBuffer> inject_rows_ = nil, inject_index_ = nil, last_key_ = nil;
+  id<MTLBuffer> per_layer_tokens_ = nil;  // the prompt with image tokens replaced by the pad token
   std::vector<id<MTLCommandBuffer>> pending_;
   // The command buffer encode_forward is appending to (sections replace it
   // while profiling).
