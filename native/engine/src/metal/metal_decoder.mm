@@ -22,9 +22,9 @@
 
 #include "common.h"
 #include "decoder_kernels_source.h"
+#include "metal/metal_common.h"
 
 namespace lokahi {
-namespace {
 
 std::string ns_error(NSError* error) {
   return error ? std::string([[error localizedDescription] UTF8String]) : std::string("unknown error");
@@ -38,6 +38,8 @@ id<MTLLibrary> compile_kernels(id<MTLDevice> device) {
   LK_CHECK(library != nil, "metal: kernel compilation failed: " + ns_error(error));
   return library;
 }
+
+namespace {
 
 struct BufRef {
   id<MTLBuffer> buffer = nil;
@@ -184,8 +186,9 @@ struct MoeGroupedParams { int experts; int k; int groups; int topk_groups; int n
 struct DenseParams { int rows; int cols; int dtype; };
 struct AttnParams {
   int heads; int kv_heads; int head_dim; int start_pos; int window; int capacity; int block; int n_blocks;
-  float scale; float softcap;
+  float scale; float softcap; int has_last_key;
 };
+struct ReplaceParams { int cols; int n; };
 struct ReduceParams { int heads; int head_dim; int n_blocks; int has_sinks; };
 struct BiasParams { int cols; int count; };
 struct ArgmaxParams { int vocab; int history_index; };
@@ -239,6 +242,7 @@ class DecoderMetal final : public Model {
   void reset() override {
     drain();
     position_ = 0;
+    injection_ = {};
   }
 
   const float* prefill(const int32_t* tokens, int n) override {
@@ -318,6 +322,9 @@ class DecoderMetal final : public Model {
     }
     return out;
   }
+
+ protected:
+  bool accepts_injection() const override { return true; }
 
  private:
   // ---- setup --------------------------------------------------------------
@@ -617,6 +624,9 @@ class DecoderMetal final : public Model {
     token_ = shared_buffer(sizeof(int32_t));
     history_ = shared_buffer(static_cast<size_t>(max_context_) * sizeof(int32_t));
     prompt_ = shared_buffer(static_cast<size_t>(max_context_) * sizeof(int32_t));
+    // An injection's row index and last key per prompt token; always bound.
+    inject_index_ = shared_buffer(static_cast<size_t>(max_context_) * sizeof(int32_t));
+    last_key_ = shared_buffer(static_cast<size_t>(max_context_) * sizeof(int32_t));
   }
 
   id<MTLComputePipelineState> pipeline(const std::string& name) {
@@ -787,7 +797,9 @@ class DecoderMetal final : public Model {
 
   void encode_attention(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n, int start) {
     const int window = G.sliding ? c_.sliding_window : (1 << 30);
-    const int keys_max = std::min(window, start + n);  // keys seen by the last query
+    // Image blocks let a query also see up to plan_.reach later keys.
+    const bool blocks = !plan_.empty() && plan_.reach > 0;
+    const int keys_max = std::min(window + (blocks ? plan_.reach : 0), start + n);  // the most keys a query sees
     const int max_blocks = n == 1 ? kDecodeMaxBlocks : kPrefillMaxBlocks;
     const int min_block = n == 1 ? 32 : 64;
     const int block = std::max(min_block, (keys_max + max_blocks - 1) / max_blocks);
@@ -802,8 +814,9 @@ class DecoderMetal final : public Model {
     bind(enc, part_ml_, 0, 4);
     bytes(enc,
           AttnParams{c_.num_heads, G.kv_heads, G.head_dim, start, window, G.capacity, block, n_blocks,
-                     c_.attn_scale, c_.attn_logit_softcapping},
+                     c_.attn_scale, c_.attn_logit_softcapping, blocks ? 1 : 0},
           5);
+    bind(enc, last_key_, blocks ? sizeof(int32_t) * static_cast<size_t>(start - plan_.base) : 0, 6);
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(n_blocks),
                                           static_cast<NSUInteger>(G.kv_heads), static_cast<NSUInteger>(n))
         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
@@ -1039,6 +1052,15 @@ class DecoderMetal final : public Model {
     bytes(enc, EmbedParams{c_.hidden_size, n, c_.embed_scale}, 5);
     [enc dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(c_.hidden_size), static_cast<NSUInteger>(n), 1)
         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    if (!plan_.empty()) {  // injected rows (image features) replace the scaled embeddings
+      [enc setComputePipelineState:pipeline("replace_rows")];
+      bind(enc, inject_rows_, 0, 0);
+      bind(enc, inject_index_, sizeof(int32_t) * static_cast<size_t>(start - plan_.base), 1);
+      bind(enc, x_, 0, 2);
+      bytes(enc, ReplaceParams{c_.hidden_size, n}, 3);
+      [enc dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(c_.hidden_size), static_cast<NSUInteger>(n), 1)
+          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    }
     section(enc, "embed", profiling ? traffic::embed(w_->embed, n) : 0.0);
     if (c_.per_layer_input > 0) {
       encode_per_layer_inputs(enc, tokens, tokens_offset, n);
@@ -1137,16 +1159,40 @@ class DecoderMetal final : public Model {
   }
 
   void run_prefill(const int32_t* tokens, int n) {
+    // The pending injection applies to this prefill only.
+    active_ = std::move(injection_);
+    injection_ = {};
+    struct Clear {
+      DecoderMetal& self;
+      ~Clear() {
+        self.active_ = {};
+        self.plan_ = {};
+      }
+    } clear{*this};
     LK_CHECK(n > 0, "prefill requires at least one token");
     LK_CHECK(position_ + n <= max_context_, "context length exceeded");
     for (int i = 0; i < n; ++i) LK_CHECK(tokens[i] >= 0 && tokens[i] < c_.vocab_size, "token id out of range");
+    if (!active_.empty()) {
+      LK_CHECK(c_.per_layer_input == 0, "metal: image features with per-layer inputs are not supported yet");
+    }
+    plan_ = plan_injection(active_, position_, n, c_.hidden_size, chunk_);
+    if (!plan_.empty()) {
+      std::memcpy([inject_index_ contents], plan_.row.data(), sizeof(int32_t) * static_cast<size_t>(n));
+      std::memcpy([last_key_ contents], plan_.last_key.data(), sizeof(int32_t) * static_cast<size_t>(n));
+      inject_rows_ = [device_ newBufferWithBytes:active_.rows.data()
+                                          length:std::max<size_t>(sizeof(float) * active_.rows.size(), 16)
+                                         options:MTLResourceStorageModeShared];
+      LK_CHECK(inject_rows_ != nil, "metal: allocation failed");
+    }
     std::memcpy([prompt_ contents], tokens, sizeof(int32_t) * static_cast<size_t>(n));
     active_cb_ = [queue_ commandBuffer];
     id<MTLComputeCommandEncoder> enc = [active_cb_ computeCommandEncoder];
-    for (int begin = 0; begin < n; begin += chunk_) {
-      const int count = std::min(chunk_, n - begin);
+    for (int begin = 0; begin < n;) {
+      // A pass never splits an image block.
+      const int count = plan_.pass_length(begin, std::min(chunk_, n - begin));
       encode_forward(enc, prompt_, sizeof(int32_t) * static_cast<size_t>(begin), count, position_ + begin,
                      begin + count == n, 0);
+      begin += count;
     }
     [enc endEncoding];
     id<MTLCommandBuffer> cb = active_cb_;
@@ -1209,6 +1255,11 @@ class DecoderMetal final : public Model {
   // layer's gate [chunk, P].
   id<MTLBuffer> per_layer_ = nil, per_layer_lookup_ = nil, per_layer_proj_ = nil, per_layer_gate_ = nil;
   id<MTLBuffer> logits_ = nil, token_ = nil, history_ = nil, prompt_ = nil;
+  // The prefill in progress's injection and plan; its rows, and per prompt
+  // token the row index and last key (shared, written before each prefill).
+  PromptInjection active_;
+  InjectionPlan plan_;
+  id<MTLBuffer> inject_rows_ = nil, inject_index_ = nil, last_key_ = nil;
   std::vector<id<MTLCommandBuffer>> pending_;
   // The command buffer encode_forward is appending to (sections replace it
   // while profiling).

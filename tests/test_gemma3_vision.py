@@ -102,8 +102,13 @@ def test_placement_rejects_mismatched_and_split_image_runs(reference):
 
 
 # ---------------------------------------------------------------------------
-# The native engine against the oracle (CPU; Metal fails closed for now).
+# The native engine against the oracle.
 # ---------------------------------------------------------------------------
+
+def _backends() -> list[str]:
+    requested = os.environ.get("LOKAHI_TEST_BACKENDS", "cpu")
+    return [name.strip() for name in requested.split(",") if name.strip()]
+
 
 def _run(cli: Path, *args: str) -> dict:
     result = subprocess.run([str(cli), *args], check=True, capture_output=True, text=True)
@@ -135,41 +140,68 @@ def vlm(request, tmp_path_factory):
     return directory, Gemma3VisionReference.load(directory), images, _image_files(directory, images)
 
 
-def test_image_features_match_oracle(native_cli, vlm, tmp_path):
+@pytest.mark.parametrize("backend", _backends())
+def test_image_features_match_oracle(native_cli, vlm, backend, tmp_path):
     directory, oracle, images, files = vlm
     out = tmp_path / "features.bin"
-    report = _run(native_cli, "image-features", "--model", str(directory), "--images", files, "--out", str(out))
-    assert report == {"images": 2, "tokens_per_image": SPEC.mm_tokens_per_image, "width": SPEC.text.hidden_size}
+    report = _run(native_cli, "image-features", "--model", str(directory), "--backend", backend,
+                  "--images", files, "--out", str(out))
+    assert report == {"backend": backend, "images": 2, "tokens_per_image": SPEC.mm_tokens_per_image,
+                      "width": SPEC.text.hidden_size}
     got = np.fromfile(out, dtype=np.float32).reshape(2, SPEC.mm_tokens_per_image, SPEC.text.hidden_size)
     expected = np.stack([oracle.encode(preprocess(image)) for image in images])
-    np.testing.assert_allclose(got, expected, atol=1e-5 * np.abs(expected).max(), rtol=0)
+    tolerance = 1e-5 if backend == "cpu" else 1e-3
+    np.testing.assert_allclose(got, expected, atol=tolerance * np.abs(expected).max(), rtol=0)
+
+
+# 64 patches pooled to 16 tokens: matrix products span several 32-row tiles.
+WIDE = replace(SPEC, image_size=112, mm_tokens_per_image=16, seed=102)
+
+
+@pytest.mark.parametrize("backend", _backends())
+def test_image_features_match_oracle_across_tiles(native_cli, backend, tmp_path):
+    directory = write_tiny_gemma3_vision(tmp_path / "wide", WIDE)
+    oracle = Gemma3VisionReference.load(directory)
+    rng = np.random.default_rng(5)
+    image = rng.integers(0, 256, (WIDE.image_size, WIDE.image_size, 3), dtype=np.uint8)
+    out = tmp_path / "features.bin"
+    _run(native_cli, "image-features", "--model", str(directory), "--backend", backend,
+         "--images", _image_files(tmp_path, [image]), "--out", str(out))
+    got = np.fromfile(out, dtype=np.float32).reshape(WIDE.mm_tokens_per_image, WIDE.text.hidden_size)
+    expected = oracle.encode(preprocess(image))
+    tolerance = 1e-5 if backend == "cpu" else 1e-3
+    np.testing.assert_allclose(got, expected, atol=tolerance * np.abs(expected).max(), rtol=0)
 
 
 # Chunks of 5 and 4 would cut an image block (positions 4-7 and 13-16); the
 # engine ends those passes where the block begins.
+@pytest.mark.parametrize("backend", _backends())
 @pytest.mark.parametrize("chunk", [512, 5, 4])
-def test_logits_with_images_match_oracle(native_cli, vlm, chunk, tmp_path):
+def test_logits_with_images_match_oracle(native_cli, vlm, backend, chunk, tmp_path):
     directory, oracle, images, files = vlm
     tokens = PROMPT + [44, 45]  # decoded after the prompt's prefill
     out = tmp_path / "logits.bin"
     report = _run(
-        native_cli, "logits", "--model", str(directory), "--tokens", ",".join(map(str, tokens)),
-        "--prefill", str(len(PROMPT)), "--prefill-chunk", str(chunk), "--images", files, "--out", str(out),
+        native_cli, "logits", "--model", str(directory), "--backend", backend,
+        "--tokens", ",".join(map(str, tokens)), "--prefill", str(len(PROMPT)), "--prefill-chunk", str(chunk),
+        "--images", files, "--out", str(out),
     )
-    assert report["backend"] == "cpu"  # chosen for --images
+    assert report["backend"] == backend
     vocab = oracle.language.config.vocab_size
     got = np.fromfile(out, dtype=np.float32).reshape(report["rows"], vocab)
     injected, blocks = oracle.placement(PROMPT, [preprocess(image) for image in images])
     expected = oracle.language.logits(tokens, injected, blocks)[len(PROMPT) - 1 :]
-    np.testing.assert_allclose(got, expected, atol=2e-4 * np.abs(expected).max(), rtol=0)
+    tolerance = 2e-4 if backend == "cpu" else 2e-2
+    np.testing.assert_allclose(got, expected, atol=tolerance * np.abs(expected).max(), rtol=0)
     np.testing.assert_array_equal(got.argmax(axis=1), expected.argmax(axis=1))
 
 
-def test_greedy_with_images_matches_full_recompute(native_cli, vlm):
+@pytest.mark.parametrize("backend", _backends())
+def test_greedy_with_images_matches_full_recompute(native_cli, vlm, backend):
     directory, oracle, images, files = vlm
     report = _run(
-        native_cli, "generate", "--model", str(directory), "--tokens", ",".join(map(str, PROMPT)),
-        "--images", files, "--max-new", "12", "--no-eos-stop",
+        native_cli, "generate", "--model", str(directory), "--backend", backend,
+        "--tokens", ",".join(map(str, PROMPT)), "--images", files, "--max-new", "12", "--no-eos-stop",
     )
     assert report["tokens"] == oracle.greedy(PROMPT, [preprocess(image) for image in images], 12)
 
@@ -188,9 +220,10 @@ def test_vision_checkpoint_runs_text_only_prompts(native_cli, vlm, tmp_path):
                               "image_token_id": SPEC.image_token_index}
 
 
-def test_image_inputs_fail_closed(native_cli, vlm, tmp_path):
+@pytest.mark.parametrize("backend", _backends())
+def test_image_inputs_fail_closed(native_cli, vlm, backend, tmp_path):
     directory, _, images, files = vlm
-    model = ["--model", str(directory), "--out", str(tmp_path / "x.bin")]
+    model = ["--model", str(directory), "--backend", backend, "--out", str(tmp_path / "x.bin")]
     prompt = ["--tokens", ",".join(map(str, PROMPT))]
     one = files.split(",")[0]
     assert "image tokens for 1 image" in _fails(native_cli, "logits", *model, *prompt, "--images", one)
@@ -212,11 +245,3 @@ def test_images_need_a_vision_tower(native_cli, tmp_path):
     image.write_bytes(b"\0" * (56 * 56 * 3))
     assert "no vision tower" in _fails(native_cli, "logits", "--model", str(directory), "--tokens", "2,5",
                                        "--images", str(image), "--out", str(tmp_path / "x.bin"))
-
-
-@pytest.mark.skipif("metal" not in os.environ.get("LOKAHI_TEST_BACKENDS", ""), reason="needs the Metal backend")
-def test_metal_refuses_image_features(native_cli, vlm, tmp_path):
-    directory, _, _, files = vlm
-    assert "metal backend does not take image features" in _fails(
-        native_cli, "logits", "--model", str(directory), "--backend", "metal",
-        "--tokens", ",".join(map(str, PROMPT)), "--images", files, "--out", str(tmp_path / "x.bin"))

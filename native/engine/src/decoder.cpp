@@ -829,14 +829,8 @@ class DecoderCpu final : public Model {
   const float* prefill(const int32_t* tokens, int n) override {
     LK_CHECK(n > 0, "prefill requires at least one token");
     begin_injection(n);
-    const int base = position_;
     for (int start = 0; start < n;) {
-      int count = std::min(chunk_, n - start);
-      // A pass never splits an image block: it ends where the block begins.
-      for (const auto& [begin, end] : active_.blocks) {
-        const int b = begin - base;
-        if (b > start && b < start + count && end - base > start + count) count = b - start;
-      }
+      const int count = plan_.pass_length(start, std::min(chunk_, n - start));
       forward(tokens + start, count, start + count == n);
       start += count;
     }
@@ -853,57 +847,32 @@ class DecoderCpu final : public Model {
   bool accepts_injection() const override { return true; }
 
  private:
-  // Takes the pending injection for a prefill of n tokens at position_,
-  // checks it, and indexes its rows and blocks by position.
+  // Takes the pending injection for a prefill of n tokens at position_.
   void begin_injection(int n) {
     active_ = std::move(injection_);
     injection_ = {};
-    injected_row_.clear();
-    block_end_.clear();
-    inject_base_ = position_;
-    if (active_.empty()) return;
-    LK_CHECK(c_.per_layer_input == 0, c_.architecture + ": image features with per-layer inputs are not supported yet");
-    const size_t width = static_cast<size_t>(c_.hidden_size);
-    LK_CHECK(active_.rows.size() == active_.positions.size() * width, "injected rows must be hidden_size wide");
-    injected_row_.assign(static_cast<size_t>(n), -1);
-    for (size_t i = 0; i < active_.positions.size(); ++i) {
-      const int rel = active_.positions[i] - inject_base_;
-      LK_CHECK(rel >= 0 && rel < n, "image features must fall inside the prefill");
-      LK_CHECK(injected_row_[static_cast<size_t>(rel)] < 0, "an image position is given twice");
-      injected_row_[static_cast<size_t>(rel)] = static_cast<int>(i);
+    if (!active_.empty()) {
+      LK_CHECK(c_.per_layer_input == 0, c_.architecture + ": image features with per-layer inputs are not supported yet");
     }
-    block_end_.assign(static_cast<size_t>(n), -1);
-    for (const auto& [begin, end] : active_.blocks) {
-      LK_CHECK(begin >= inject_base_ && begin < end && end <= inject_base_ + n,
-               "image blocks must fall inside the prefill");
-      LK_CHECK(end - begin <= chunk_, "an image's " + std::to_string(end - begin) +
-                                          " tokens do not fit one prefill chunk of " + std::to_string(chunk_));
-      for (int pos = begin; pos < end; ++pos) {
-        int& slot = block_end_[static_cast<size_t>(pos - inject_base_)];
-        LK_CHECK(slot < 0, "image blocks overlap");
-        slot = end;
-      }
-    }
+    plan_ = plan_injection(active_, position_, n, c_.hidden_size, chunk_);
   }
 
   void end_injection() {
     active_ = {};
-    injected_row_.clear();
-    block_end_.clear();
+    plan_ = {};
   }
 
   // The injected row for position `pos`, or -1.
   int injected_row(int pos) const {
-    const int rel = pos - inject_base_;
-    return rel >= 0 && rel < static_cast<int>(injected_row_.size()) ? injected_row_[static_cast<size_t>(rel)] : -1;
+    const int rel = pos - plan_.base;
+    return rel >= 0 && rel < static_cast<int>(plan_.row.size()) ? plan_.row[static_cast<size_t>(rel)] : -1;
   }
 
   // The last key position `pos` attends to: itself, or the last position of
   // its image block.
   int last_key(int pos) const {
-    const int rel = pos - inject_base_;
-    if (rel < 0 || rel >= static_cast<int>(block_end_.size())) return pos;
-    return std::max(pos, block_end_[static_cast<size_t>(rel)] - 1);
+    const int rel = pos - plan_.base;
+    return rel >= 0 && rel < static_cast<int>(plan_.last_key.size()) ? plan_.last_key[static_cast<size_t>(rel)] : pos;
   }
 
   // Key or value `kv` of position `pos` in `layer`'s ring.
@@ -1400,11 +1369,9 @@ class DecoderCpu final : public Model {
   int position_ = 0;
   size_t max_q_ = 0, max_kv_ = 0, max_inter_ = 0;  // per-token widths, the largest over layers
   std::vector<int> capacity_;                       // ring positions per layer; 0 for KV-shared layers
-  // The injection of the prefill in progress: its rows and, per position from
-  // inject_base_, the row index and the image block's end (-1 for none).
+  // The injection of the prefill in progress and its plan.
   PromptInjection active_;
-  int inject_base_ = 0;
-  std::vector<int> injected_row_, block_end_;
+  InjectionPlan plan_;
   std::vector<std::vector<float>> kv_k_, kv_v_;
   std::vector<double> inv_freq_local_, inv_freq_global_;
   std::vector<float> x_, h_, r_, q_, k_, v_, attn_, gate_, up_, logits_;

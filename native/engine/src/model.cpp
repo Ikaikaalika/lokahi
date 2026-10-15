@@ -23,6 +23,45 @@ void Profiler::add(const std::string& name, double seconds, double bytes) {
   sections_.push_back({name, seconds, 1, bytes});
 }
 
+int InjectionPlan::pass_length(int start, int count) const {
+  for (const auto& [begin, end] : blocks) {
+    const int b = begin - base;
+    if (b > start && b < start + count && end - base > start + count) count = b - start;
+  }
+  return count;
+}
+
+InjectionPlan plan_injection(const PromptInjection& injection, int base, int n, int width, int chunk) {
+  InjectionPlan plan;
+  plan.base = base;
+  if (injection.empty()) return plan;
+  LK_CHECK(injection.rows.size() == injection.positions.size() * static_cast<size_t>(width),
+           "injected rows must be hidden_size wide");
+  plan.row.assign(static_cast<size_t>(n), -1);
+  plan.last_key.resize(static_cast<size_t>(n));
+  for (int t = 0; t < n; ++t) plan.last_key[static_cast<size_t>(t)] = base + t;
+  for (size_t i = 0; i < injection.positions.size(); ++i) {
+    const int rel = injection.positions[i] - base;
+    LK_CHECK(rel >= 0 && rel < n, "image features must fall inside the prefill");
+    LK_CHECK(plan.row[static_cast<size_t>(rel)] < 0, "an image position is given twice");
+    plan.row[static_cast<size_t>(rel)] = static_cast<int>(i);
+  }
+  std::vector<bool> taken(static_cast<size_t>(n), false);
+  for (const auto& [begin, end] : injection.blocks) {
+    LK_CHECK(begin >= base && begin < end && end <= base + n, "image blocks must fall inside the prefill");
+    LK_CHECK(end - begin <= chunk, "an image's " + std::to_string(end - begin) +
+                                       " tokens do not fit one prefill chunk of " + std::to_string(chunk));
+    for (int pos = begin; pos < end; ++pos) {
+      LK_CHECK(!taken[static_cast<size_t>(pos - base)], "image blocks overlap");
+      taken[static_cast<size_t>(pos - base)] = true;
+      plan.last_key[static_cast<size_t>(pos - base)] = end - 1;
+    }
+    plan.reach = std::max(plan.reach, end - 1 - begin);
+    plan.blocks.emplace_back(begin, end);
+  }
+  return plan;
+}
+
 void Model::inject(PromptInjection injection) {
   LK_CHECK(accepts_injection(), std::string("the ") + backend() + " backend does not take image features yet");
   injection_ = std::move(injection);

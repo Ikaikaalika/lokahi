@@ -5,7 +5,7 @@
 //   lokahi generate   --model DIR (--tokens 2,5,9 | --prompt TEXT) --max-new N [--no-eos-stop]
 //                     [--images A.rgb,B.rgb]
 //                     [--temperature T] [--top-p P] [--top-k K] [--min-p M] [--seed S]
-//   lokahi image-features --model DIR --images A.rgb[,B.rgb] --out FILE
+//   lokahi image-features --model DIR --images A.rgb[,B.rgb] --out FILE [--backend B]
 //   lokahi sample     --logits-file F.f32 --vocab V [sampling flags] [--steps N] [--first-step S]
 //                     [--backend cpu|metal]
 //   lokahi bench      --model DIR (--tokens ... | --tokens-file F) --max-new N
@@ -120,8 +120,6 @@ std::vector<int32_t> prompt_tokens(const Args& args) {
 LoadOptions load_options(const Args& args) {
   LoadOptions options;
   options.backend = args.get("backend", "auto");
-  // Only the CPU backend takes image features so far.
-  if (args.has("images") && options.backend == "auto") options.backend = "cpu";
   options.max_context = args.get_int("max-context", 4096);
   options.prefill_chunk = args.get_int("prefill-chunk", 512);
   options.cpu_threads = static_cast<unsigned>(args.get_int("threads", 0));
@@ -219,8 +217,10 @@ std::vector<std::vector<float>> encode_images(const Args& args, VisionEncoder& e
   return features;
 }
 
+// The vision encoder on the same backend as the decoder (--backend).
 std::unique_ptr<VisionEncoder> load_vision(const Args& args) {
-  auto encoder = VisionEncoder::load(args.get("model"), static_cast<unsigned>(args.get_int("threads", 0)));
+  auto encoder = VisionEncoder::load(args.get("model"), args.get("backend", "auto"),
+                                     static_cast<unsigned>(args.get_int("threads", 0)));
   LK_CHECK(encoder != nullptr, "this model has no vision tower");
   return encoder;
 }
@@ -241,8 +241,8 @@ int cmd_image_features(const Args& args) {
   for (const auto& image : features) {
     out.write(reinterpret_cast<const char*>(image.data()), static_cast<std::streamsize>(sizeof(float) * image.size()));
   }
-  std::printf("{\"images\":%zu,\"tokens_per_image\":%d,\"width\":%d}\n", features.size(),
-              encoder->config().tokens_per_image, encoder->config().text_hidden_size);
+  std::printf("{\"backend\":\"%s\",\"images\":%zu,\"tokens_per_image\":%d,\"width\":%d}\n", encoder->backend(),
+              features.size(), encoder->config().tokens_per_image, encoder->config().text_hidden_size);
   return 0;
 }
 

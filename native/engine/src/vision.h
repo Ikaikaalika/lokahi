@@ -1,8 +1,9 @@
-// Gemma 3's image path on the CPU: the processor's rescale and normalization,
-// the SigLIP vision tower and the multimodal projector, as Transformers'
+// Gemma 3's image path: the processor's rescale and normalization, the SigLIP
+// vision tower and the multimodal projector, as Transformers'
 // Gemma3ImageProcessor, SiglipVisionModel and Gemma3MultiModalProjector
-// compute them. This is the correctness path; an 896-pixel image costs about
-// 5 TFLOP through the 27-layer tower of the published models.
+// compute them. The CPU encoder is the correctness path (an 896-pixel image
+// costs about 5 TFLOP, run by its scalar matmul); the Metal encoder
+// (metal/metal_vision.h) runs the same math on the GPU.
 #pragma once
 
 #include <cstdint>
@@ -14,7 +15,6 @@
 #include "model.h"
 #include "quant.h"
 #include "safetensors.h"
-#include "thread_pool.h"
 
 namespace lokahi {
 
@@ -35,6 +35,8 @@ struct VisionConfig {
   float std[3] = {0.5f, 0.5f, 0.5f};
 
   int patches_per_side() const { return image_size / patch_size; }
+  int patches() const { return patches_per_side() * patches_per_side(); }
+  int tokens_per_side() const;
 
   // config.json's vision fields; `preprocessor` is preprocessor_config.json
   // when the checkpoint has one.
@@ -44,12 +46,41 @@ struct VisionConfig {
 // Whether config.json describes a vision tower.
 bool has_vision(const Json& config);
 
+// The tower's and projector's weights, bound to the mapped checkpoint.
+struct VisionWeights {
+  struct Layer {
+    std::vector<float> ln1_weight, ln1_bias, ln2_weight, ln2_bias;
+    Linear q_proj, k_proj, v_proj, out_proj, fc1, fc2;  // views into the checkpoint
+    std::vector<float> q_bias, k_bias, v_bias, out_bias, fc1_bias, fc2_bias;
+  };
+
+  VisionConfig config;
+  std::shared_ptr<Checkpoint> checkpoint;
+  // Owned float32: the patch convolution as [hidden, kH * kW * 3] (MLX's
+  // layout, whichever layout the checkpoint stores) and the positions
+  // [patches, hidden].
+  std::vector<float> patch_weight, patch_bias, positions;
+  std::vector<Layer> layers;
+  std::vector<float> post_weight, post_bias, soft_norm;
+  // multi_modal_projector.mm_input_projection_weight [hidden, text_hidden]
+  // (features times it), as stored.
+  const TensorView* projection = nullptr;
+
+  // nullptr when the checkpoint has no vision tower.
+  static std::shared_ptr<VisionWeights> load(const std::string& directory);
+};
+
 class VisionEncoder {
  public:
-  // nullptr when the checkpoint has no vision tower.
-  static std::unique_ptr<VisionEncoder> load(const std::string& directory, unsigned threads = 0);
+  virtual ~VisionEncoder() = default;
 
-  const VisionConfig& config() const { return c_; }
+  // A backend ("cpu", "metal" or "auto") for the checkpoint in `directory`;
+  // nullptr when it has no vision tower.
+  static std::unique_ptr<VisionEncoder> load(const std::string& directory, const std::string& backend = "auto",
+                                             unsigned threads = 0);
+
+  virtual const char* backend() const = 0;
+  const VisionConfig& config() const { return weights_->config; }
 
   // An RGB8 image [image_size, image_size, 3], already resized, to normalized
   // pixels [3, image_size, image_size].
@@ -57,28 +88,19 @@ class VisionEncoder {
 
   // Normalized pixels to the image's features [tokens_per_image,
   // text_hidden_size].
-  std::vector<float> encode(const float* pixels);
+  virtual std::vector<float> encode(const float* pixels) = 0;
 
- private:
-  struct Layer {
-    std::vector<float> ln1_weight, ln1_bias, ln2_weight, ln2_bias;
-    Linear q_proj, k_proj, v_proj, out_proj, fc1, fc2;
-    std::vector<float> q_bias, k_bias, v_bias, out_bias, fc1_bias, fc2_bias;
-  };
+ protected:
+  explicit VisionEncoder(std::shared_ptr<const VisionWeights> weights) : weights_(std::move(weights)) {}
 
-  VisionEncoder(VisionConfig config, unsigned threads) : c_(config), pool_(threads) {}
+  // Patches [patches, kH * kW * 3], each flattened as (row, column, channel)
+  // to match the convolution.
+  std::vector<float> patches(const float* pixels) const;
 
-  VisionConfig c_;
-  ThreadPool pool_;
-  std::shared_ptr<Checkpoint> checkpoint_;
-  // Owned float32 copies: the patch convolution as [hidden, kH * kW * 3]
-  // (MLX's layout), positions [patches, hidden] and the projection transposed
-  // to [text_hidden, hidden]; the Linears below view them.
-  std::vector<float> patch_weight_, positions_, projection_weight_;
-  Linear patch_, projection_;
-  std::vector<float> patch_bias_, post_weight_, post_bias_, soft_norm_;
-  std::vector<Layer> layers_;
+  std::shared_ptr<const VisionWeights> weights_;
 };
+
+std::unique_ptr<VisionEncoder> make_vision_cpu(std::shared_ptr<const VisionWeights> weights, unsigned threads);
 
 // Places images' features at the runs of the image token in `tokens`, a
 // prompt whose first token sits at position `start`: image i fills the i-th

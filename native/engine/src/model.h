@@ -58,6 +58,25 @@ struct PromptInjection {
   bool empty() const { return positions.empty() && blocks.empty(); }
 };
 
+// A PromptInjection checked against a prefill of `n` tokens whose first sits
+// at position `base`, indexed by offset into the prefill.
+struct InjectionPlan {
+  int base = 0;
+  std::vector<int> row;       // [n] index into the injection's rows, or -1
+  std::vector<int> last_key;  // [n] the last position each token attends to
+  int reach = 0;              // the most any token looks ahead: max(last_key[t] - base - t)
+  std::vector<std::pair<int, int>> blocks;
+
+  bool empty() const { return row.empty(); }
+  // How many of `count` tokens from offset `start` a pass should take so it
+  // never splits a block: it ends where a block begins.
+  int pass_length(int start, int count) const;
+};
+
+// Fails closed unless every row and block lies inside the prefill, rows are
+// `width` wide, blocks do not overlap and each fits a pass of `chunk` tokens.
+InjectionPlan plan_injection(const PromptInjection& injection, int base, int n, int width, int chunk);
+
 class Model {
  public:
   virtual ~Model() = default;
