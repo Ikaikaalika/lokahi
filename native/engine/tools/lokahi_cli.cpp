@@ -120,8 +120,6 @@ std::vector<int32_t> prompt_tokens(const Args& args) {
 LoadOptions load_options(const Args& args) {
   LoadOptions options;
   options.backend = args.get("backend", "auto");
-  // Only the CPU backend takes image features so far.
-  if (args.has("images") && options.backend == "auto") options.backend = "cpu";
   options.max_context = args.get_int("max-context", 4096);
   options.prefill_chunk = args.get_int("prefill-chunk", 512);
   options.cpu_threads = static_cast<unsigned>(args.get_int("threads", 0));

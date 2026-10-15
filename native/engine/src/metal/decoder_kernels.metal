@@ -114,6 +114,25 @@ kernel void embed_rows(const device uint* w [[buffer(0)]],
   out[t * p.cols + c] = (scale_at(scales, g) * float(code) + scale_at(biases, g)) * p.scale;
 }
 
+struct ReplaceParams {
+  int cols;
+  int n;
+};
+
+// x[t, :] = rows[index[t], :] wherever index[t] >= 0: injected rows (image
+// features) over the scaled embeddings.
+kernel void replace_rows(const device float* rows [[buffer(0)]],
+                         const device int* index [[buffer(1)]],
+                         device float* x [[buffer(2)]],
+                         constant ReplaceParams& p [[buffer(3)]],
+                         uint2 gid [[thread_position_in_grid]]) {
+  const int c = int(gid.x);
+  const int t = int(gid.y);
+  if (c >= p.cols || t >= p.n) return;
+  const int r = index[t];
+  if (r >= 0) x[t * p.cols + c] = rows[r * p.cols + c];
+}
+
 // ---------------------------------------------------------------------------
 // RMSNorm scaled by (offset + w): Gemma's offset is 1, most families use 0.
 // One threadgroup per row.
@@ -640,7 +659,6 @@ kernel void moe_combine(const device float* slots [[buffer(0)]],
 }
 
 // ---------------------------------------------------------------------------
-// Quantized matrix-matrix product for prefill: Y[n, rows] = X[n, cols] W^T.// ---------------------------------------------------------------------------
 // Quantized matrix-matrix product for prefill: Y[n, rows] = X[n, cols] W^T.
 //
 // 32x32 output tiles, 4 simdgroups each owning a 16x16 quadrant of 8x8
@@ -971,6 +989,7 @@ struct AttnParams {
   int n_blocks;
   float scale;
   float softcap;  // 0 disables
+  int has_last_key;  // last_key[t] extends query t's keys (Gemma 3's image blocks)
 };
 
 template <int G, int DPL>
@@ -980,6 +999,7 @@ template <int G, int DPL>
                              device float* part_o [[buffer(3)]],
                              device float* part_ml [[buffer(4)]],
                              constant AttnParams& p [[buffer(5)]],
+                             const device int* last_key [[buffer(6)]],
                              uint3 tgp [[threadgroup_position_in_grid]],
                              uint sg [[simdgroup_index_in_threadgroup]],
                              uint lane [[thread_index_in_simdgroup]]) {
@@ -993,8 +1013,9 @@ template <int G, int DPL>
   const int D = p.head_dim;
   const int pos = p.start_pos + t;
   const int lo = max(0, pos - p.window + 1);
+  const int hi = p.has_last_key != 0 ? max(pos, last_key[t]) : pos;
   const int kb = lo + blk * p.block;
-  const int ke = min(kb + p.block, pos + 1);
+  const int ke = min(kb + p.block, hi + 1);
 
   float qv[G][DPL];
   for (int g = 0; g < G; ++g) {
