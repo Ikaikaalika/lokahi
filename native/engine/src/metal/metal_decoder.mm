@@ -802,6 +802,9 @@ std::string metal_device_name() {
 }
 
 std::unique_ptr<Model> make_decoder_metal(std::shared_ptr<DecoderWeights> weights, const LoadOptions& options) {
+  LK_CHECK(weights->config.uniform_layers(),
+           weights->config.architecture + ": the Metal backend does not implement per-layer geometry, KV sharing or "
+           "per-layer inputs yet; use --backend cpu");
   return std::make_unique<DecoderMetal>(std::move(weights), options);
 }
 

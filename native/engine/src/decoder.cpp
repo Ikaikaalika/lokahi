@@ -17,6 +17,10 @@ static const Json& text_config(const Json& raw) {
 
 namespace {
 
+// A scalar constant as MLX-LM applies it to BF16 activations: weakly typed,
+// so rounded to BF16 first.
+float bf16_round(float x) { return bf16_to_f32(f32_to_bf16(x)); }
+
 std::string model_type(const Json& raw) {
   return text_config(raw).string_or("model_type", raw.string_or("model_type", ""));
 }
@@ -24,6 +28,11 @@ std::string model_type(const Json& raw) {
 bool is_gemma3(const Json& raw) {
   const std::string type = model_type(raw);
   return type == "gemma3_text" || type == "gemma3";
+}
+
+bool is_gemma4(const Json& raw) {
+  const std::string type = model_type(raw);
+  return type == "gemma4_text" || type == "gemma4";
 }
 
 bool is_llama_family(const Json& raw) {
@@ -64,7 +73,7 @@ DecoderConfig gemma3_config(const Json& raw) {
   c.sandwich_norms = true;
   c.qk_norm = true;
   // sqrt(hidden_size) rounded to BF16, as the reference implementations do.
-  c.embed_scale = bf16_to_f32(f32_to_bf16(std::sqrt(static_cast<float>(c.hidden_size))));
+  c.embed_scale = bf16_round(std::sqrt(static_cast<float>(c.hidden_size)));
   c.attn_scale = 1.0f / std::sqrt(static_cast<float>(cfg.number_or("query_pre_attn_scalar", c.head_dim)));
   c.rope_theta = static_cast<float>(cfg.number_or("rope_theta", 1e6));
   c.local_rope = true;
@@ -95,6 +104,105 @@ DecoderConfig gemma3_config(const Json& raw) {
   }
   if (const Json* cap = cfg.find("attn_logit_softcapping"); cap && cap->is_number()) {
     c.attn_logit_softcapping = static_cast<float>(cap->as_number());
+  }
+  c.eos_token_ids = eos_ids(raw, cfg);
+  return c;
+}
+
+// Gemma 4 (dense; MLX-LM gemma4_text): sandwich norms that scale by the
+// weight itself, Q/K norm plus a scale-free V norm and attention scale 1,
+// sliding and full layers with their own head size and RoPE (proportional
+// partial rotation on full layers), the last num_kv_shared_layers layers
+// attending over an earlier layer's keys and values with double-wide MLPs,
+// per-layer input embeddings, per-layer output scalars, and a final soft-cap.
+DecoderConfig gemma4_config(const Json& raw) {
+  const Json& cfg = text_config(raw);
+  DecoderConfig c;
+  c.architecture = "gemma4";
+  LK_CHECK(!flag(cfg, "enable_moe_block"), "gemma4: mixture-of-experts blocks are not supported yet");
+  LK_CHECK(!flag(cfg, "attention_bias"), "gemma4: attention_bias is not supported");
+  LK_CHECK(!flag(cfg, "use_bidirectional_attention"), "gemma4: bidirectional attention is not supported");
+  c.vocab_size = static_cast<int>(cfg.at("vocab_size").as_int());
+  c.hidden_size = static_cast<int>(cfg.at("hidden_size").as_int());
+  c.intermediate_size = static_cast<int>(cfg.at("intermediate_size").as_int());
+  c.num_layers = static_cast<int>(cfg.at("num_hidden_layers").as_int());
+  c.num_heads = static_cast<int>(cfg.int_or("num_attention_heads", 8));
+  c.num_kv_heads = static_cast<int>(cfg.int_or("num_key_value_heads", 1));
+  c.head_dim = static_cast<int>(cfg.int_or("head_dim", 256));
+  c.rms_norm_eps = static_cast<float>(cfg.number_or("rms_norm_eps", 1e-6));
+  c.sandwich_norms = true;
+  c.qk_norm = true;
+  c.v_norm = true;
+  c.attn_scale = 1.0f;
+  c.embed_scale = bf16_round(std::sqrt(static_cast<float>(c.hidden_size)));
+  const std::string activation = cfg.string_or("hidden_activation", "gelu_pytorch_tanh");
+  LK_CHECK(activation == "gelu_pytorch_tanh", "gemma4: unsupported activation " + activation);
+  c.activation = Activation::GeluTanh;
+  c.sliding_window = static_cast<int>(cfg.int_or("sliding_window", 512));
+  if (const Json* types = cfg.find("layer_types"); types != nullptr && types->is_array()) {
+    for (const Json& kind : types->as_array()) c.layer_is_sliding.push_back(kind.as_string() == "sliding_attention");
+  } else {
+    const int pattern = static_cast<int>(cfg.int_or("sliding_window_pattern", 5));
+    for (int i = 0; i < c.num_layers; ++i) c.layer_is_sliding.push_back((i + 1) % pattern != 0);
+  }
+  LK_CHECK(static_cast<int>(c.layer_is_sliding.size()) == c.num_layers, "gemma4: layer_types length mismatch");
+
+  // RoPE per layer kind. Sliding layers rotate fully with their own base.
+  c.local_rope = true;
+  c.rope_local_theta = 1e4f;
+  c.rope_theta = 1e6f;
+  c.global_partial_rotary = 0.25f;
+  if (const Json* rope = cfg.find("rope_parameters"); rope != nullptr && rope->is_object()) {
+    if (const Json* local = rope->find("sliding_attention")) {
+      const std::string kind = local->string_or("rope_type", "default");
+      LK_CHECK(kind == "default", "gemma4: sliding rope_type '" + kind + "' is not supported");
+      LK_CHECK(local->number_or("partial_rotary_factor", 1.0) == 1.0, "gemma4: partial rotation on sliding layers");
+      c.rope_local_theta = static_cast<float>(local->number_or("rope_theta", 1e4));
+    }
+    if (const Json* full = rope->find("full_attention")) {
+      const std::string kind = full->string_or("rope_type", "default");
+      LK_CHECK(kind == "proportional" || kind == "default", "gemma4: full rope_type '" + kind + "' is not supported");
+      c.rope_theta = static_cast<float>(full->number_or("rope_theta", 1e6));
+      c.global_partial_rotary = static_cast<float>(full->number_or("partial_rotary_factor", 1.0));
+      if (kind == "default") LK_CHECK(c.global_partial_rotary == 1.0f, "gemma4: default RoPE with partial rotation");
+      const double factor = full->number_or("factor", 1.0);
+      if (factor != 1.0) {
+        c.rope_scaling.kind = RopeScaling::Kind::Linear;
+        c.rope_scaling.factor = factor;
+      }
+    }
+  }
+
+  const int global_dim = static_cast<int>(cfg.int_or("global_head_dim", c.head_dim));
+  const bool k_eq_v = flag(cfg, "attention_k_eq_v");
+  const Json* global_kv = cfg.find("num_global_key_value_heads");
+  const int shared = static_cast<int>(cfg.int_or("num_kv_shared_layers", 0));
+  const int first_shared = c.num_layers - shared;
+  LK_CHECK(shared >= 0 && first_shared > 0, "gemma4: num_kv_shared_layers out of range");
+  const bool double_wide = flag(cfg, "use_double_wide_mlp");
+  for (int i = 0; i < c.num_layers; ++i) {
+    const bool full = !c.layer_is_sliding[static_cast<size_t>(i)];
+    const bool layer_k_eq_v = k_eq_v && full;
+    c.layer_head_dim.push_back(full ? global_dim : c.head_dim);
+    c.layer_kv_heads.push_back(layer_k_eq_v && global_kv != nullptr && global_kv->is_number()
+                                   ? static_cast<int>(global_kv->as_int())
+                                   : c.num_kv_heads);
+    c.layer_k_eq_v.push_back(layer_k_eq_v);
+    int source = i;
+    if (shared > 0 && i >= first_shared) {
+      source = -1;
+      for (int j = 0; j < first_shared; ++j) {
+        if (c.layer_is_sliding[static_cast<size_t>(j)] == c.layer_is_sliding[static_cast<size_t>(i)]) source = j;
+      }
+      LK_CHECK(source >= 0, "gemma4: a shared layer has no earlier layer of its kind");
+    }
+    c.layer_kv_source.push_back(source);
+    c.layer_intermediate.push_back(c.intermediate_size * (double_wide && source != i ? 2 : 1));
+  }
+  c.per_layer_input = static_cast<int>(cfg.int_or("hidden_size_per_layer_input", 0));
+  c.layer_scalars = true;
+  if (const Json* cap = cfg.find("final_logit_softcapping"); cap && cap->is_number()) {
+    c.final_logit_softcapping = static_cast<float>(cap->as_number());
   }
   c.eos_token_ids = eos_ids(raw, cfg);
   return c;
@@ -162,18 +270,27 @@ DecoderConfig llama_family_config(const Json& cfg) {
 
 }  // namespace
 
-bool is_supported_decoder(const Json& raw) { return is_gemma3(raw) || is_llama_family(raw); }
+bool is_supported_decoder(const Json& raw) { return is_gemma3(raw) || is_gemma4(raw) || is_llama_family(raw); }
 
 DecoderConfig DecoderConfig::from_json(const Json& raw) {
   LK_CHECK(is_supported_decoder(raw),
            "unsupported architecture '" + model_type(raw) +
-               "'; this build supports gemma3, llama, mistral, qwen2 and qwen3 text models");
-  DecoderConfig c = is_gemma3(raw) ? gemma3_config(raw) : llama_family_config(raw);
+               "'; this build supports gemma3, gemma4, llama, mistral, qwen2 and qwen3 text models");
+  DecoderConfig c = is_gemma3(raw)   ? gemma3_config(raw)
+                    : is_gemma4(raw) ? gemma4_config(raw)
+                                     : llama_family_config(raw);
   LK_CHECK(static_cast<int>(c.layer_is_sliding.size()) == c.num_layers,
            c.architecture + ": layer_types length mismatch");
-  LK_CHECK(c.num_heads > 0 && c.num_kv_heads > 0 && c.num_heads % c.num_kv_heads == 0,
-           c.architecture + ": heads must be a multiple of kv heads");
-  LK_CHECK(c.head_dim > 0 && c.head_dim % 2 == 0, c.architecture + ": head_dim must be even");
+  for (int l = 0; l < c.num_layers; ++l) {
+    const int kv = c.kv_heads_of(l), dim = c.head_dim_of(l);
+    LK_CHECK(c.num_heads > 0 && kv > 0 && c.num_heads % kv == 0, c.architecture + ": heads must be a multiple of kv heads");
+    LK_CHECK(dim > 0 && dim % 2 == 0, c.architecture + ": head_dim must be even");
+    const int source = c.kv_source(l);
+    LK_CHECK(source >= 0 && source <= l && !c.shares_kv(source) &&
+                 c.layer_is_sliding[static_cast<size_t>(source)] == c.layer_is_sliding[static_cast<size_t>(l)] &&
+                 c.head_dim_of(source) == dim && c.kv_heads_of(source) == kv,
+             c.architecture + ": layer " + std::to_string(l) + " shares keys and values with an incompatible layer");
+  }
   LK_CHECK(c.sliding_window > 0 ||
                std::none_of(c.layer_is_sliding.begin(), c.layer_is_sliding.end(), [](bool s) { return s; }),
            c.architecture + ": sliding layers need a positive sliding_window");
@@ -186,9 +303,18 @@ std::vector<double> DecoderConfig::rope_inv_freq(bool sliding) const {
   const RopeScaling none;
   const RopeScaling& scaling = local ? none : rope_scaling;
   constexpr double kPi = 3.14159265358979323846;
-  std::vector<double> inv_freq(static_cast<size_t>(head_dim / 2));
-  for (size_t i = 0; i < inv_freq.size(); ++i) {
-    double f = 1.0 / std::pow(base, static_cast<double>(2 * i) / head_dim);
+  int dims = head_dim;  // the head size of this layer kind
+  for (int l = 0; l < num_layers; ++l) {
+    if (layer_is_sliding[static_cast<size_t>(l)] == sliding) {
+      dims = head_dim_of(l);
+      break;
+    }
+  }
+  const size_t rotated = sliding ? static_cast<size_t>(dims / 2)
+                                 : static_cast<size_t>(static_cast<int>(dims * global_partial_rotary) / 2);
+  std::vector<double> inv_freq(static_cast<size_t>(dims / 2), 0.0);
+  for (size_t i = 0; i < rotated; ++i) {
+    double f = 1.0 / std::pow(base, static_cast<double>(2 * i) / dims);
     if (scaling.kind == RopeScaling::Kind::Linear) {
       f /= scaling.factor;
     } else if (scaling.kind == RopeScaling::Kind::Llama3) {
@@ -209,11 +335,6 @@ std::vector<double> DecoderConfig::rope_inv_freq(bool sliding) const {
     inv_freq[i] = f;
   }
   return inv_freq;
-}
-
-int DecoderConfig::kv_capacity(int layer, int max_context) const {
-  return layer_is_sliding[static_cast<size_t>(layer)] ? std::min(sliding_window, max_context)
-                                                       : max_context;
 }
 
 std::shared_ptr<DecoderWeights> DecoderWeights::load(const std::string& directory) {
@@ -256,10 +377,27 @@ std::shared_ptr<DecoderWeights> DecoderWeights::load(const std::string& director
     w->tied_lm_head = true;
   }
   w->final_norm = vec("model.norm", c.hidden_size);
-  const int64_t q_out = static_cast<int64_t>(c.num_heads) * c.head_dim;
-  const int64_t kv_out = static_cast<int64_t>(c.num_kv_heads) * c.head_dim;
+  if (c.per_layer_input > 0) {
+    const int64_t width = static_cast<int64_t>(c.num_layers) * c.per_layer_input;
+    const Json& cfg = text_config(w->raw_config);
+    w->embed_per_layer = linear("model.embed_tokens_per_layer");
+    w->per_layer_model_proj = linear("model.per_layer_model_projection");
+    w->per_layer_proj_norm = vec("model.per_layer_projection_norm", c.per_layer_input);
+    LK_CHECK(w->embed_per_layer.rows == cfg.int_or("vocab_size_per_layer_input", c.vocab_size) &&
+                 w->embed_per_layer.cols == width,
+             arch + ": embed_tokens_per_layer shape mismatch");
+    LK_CHECK(w->per_layer_model_proj.rows == width && w->per_layer_model_proj.cols == c.hidden_size,
+             arch + ": per_layer_model_projection shape mismatch");
+  }
   for (int i = 0; i < c.num_layers; ++i) {
     const std::string base = "model.layers." + std::to_string(i);
+    const int64_t dim = c.head_dim_of(i);
+    const int64_t q_out = static_cast<int64_t>(c.num_heads) * dim;
+    const int64_t kv_out = static_cast<int64_t>(c.kv_heads_of(i)) * dim;
+    const int64_t inter = c.intermediate_of(i);
+    // KV-shared layers attend over another layer's keys and values, so their
+    // own k/v weights (absent from converted checkpoints) are never bound.
+    const bool own_kv = !c.shares_kv(i);
     DecoderLayer layer;
     layer.attn_norm = vec(base + ".input_layernorm", c.hidden_size);
     if (c.sandwich_norms) {
@@ -271,8 +409,8 @@ std::shared_ptr<DecoderWeights> DecoderWeights::load(const std::string& director
       layer.mlp_norm = vec(base + ".post_attention_layernorm", c.hidden_size);
     }
     if (c.qk_norm) {
-      layer.q_norm = vec(base + ".self_attn.q_norm", c.head_dim);
-      layer.k_norm = vec(base + ".self_attn.k_norm", c.head_dim);
+      layer.q_norm = vec(base + ".self_attn.q_norm", dim);
+      if (own_kv) layer.k_norm = vec(base + ".self_attn.k_norm", dim);
     }
     if (c.qkv_bias) {
       layer.q_bias = bias(base + ".self_attn.q_proj", q_out);
@@ -288,29 +426,44 @@ std::shared_ptr<DecoderWeights> DecoderWeights::load(const std::string& director
       LK_CHECK(!ck.contains(p + base + module + ".bias"), base + module + ": unexpected bias for " + arch);
     }
     layer.q_proj = linear(base + ".self_attn.q_proj");
-    layer.k_proj = linear(base + ".self_attn.k_proj");
-    layer.v_proj = linear(base + ".self_attn.v_proj");
+    if (own_kv) {
+      layer.k_proj = linear(base + ".self_attn.k_proj");
+      if (!c.k_eq_v(i)) layer.v_proj = linear(base + ".self_attn.v_proj");
+      LK_CHECK(layer.k_proj.rows == kv_out && layer.k_proj.cols == c.hidden_size &&
+                   (c.k_eq_v(i) || (layer.v_proj.rows == kv_out && layer.v_proj.cols == c.hidden_size)),
+               base + ": k/v shape");
+    }
     layer.o_proj = linear(base + ".self_attn.o_proj");
     layer.gate_proj = linear(base + ".mlp.gate_proj");
     layer.up_proj = linear(base + ".mlp.up_proj");
     layer.down_proj = linear(base + ".mlp.down_proj");
     LK_CHECK(layer.q_proj.rows == q_out && layer.q_proj.cols == c.hidden_size, base + ": q_proj shape");
-    LK_CHECK(layer.k_proj.rows == kv_out && layer.v_proj.rows == kv_out, base + ": k/v shape");
     LK_CHECK(layer.o_proj.rows == c.hidden_size && layer.o_proj.cols == q_out, base + ": o_proj shape");
-    LK_CHECK(layer.gate_proj.rows == c.intermediate_size && layer.up_proj.rows == c.intermediate_size &&
-                 layer.down_proj.cols == c.intermediate_size,
+    LK_CHECK(layer.gate_proj.rows == inter && layer.up_proj.rows == inter && layer.down_proj.cols == inter &&
+                 layer.gate_proj.cols == c.hidden_size && layer.up_proj.cols == c.hidden_size &&
+                 layer.down_proj.rows == c.hidden_size,
              base + ": mlp shape");
+    if (c.per_layer_input > 0) {
+      layer.per_layer_gate = linear(base + ".per_layer_input_gate");
+      layer.per_layer_proj = linear(base + ".per_layer_projection");
+      layer.per_layer_norm = vec(base + ".post_per_layer_input_norm", c.hidden_size);
+      LK_CHECK(layer.per_layer_gate.rows == c.per_layer_input && layer.per_layer_gate.cols == c.hidden_size &&
+                   layer.per_layer_proj.rows == c.hidden_size && layer.per_layer_proj.cols == c.per_layer_input,
+               base + ": per-layer input shape");
+    }
+    if (c.layer_scalars) load_vector(ck, p + base + ".layer_scalar", 1, &layer.layer_scalar);
     w->layers.push_back(std::move(layer));
   }
   return w;
 }
 
 size_t DecoderWeights::matrix_bytes() const {
-  size_t total = embed.weight_bytes() + (tied_lm_head ? 0 : lm_head.weight_bytes());
+  size_t total = embed.weight_bytes() + (tied_lm_head ? 0 : lm_head.weight_bytes()) +
+                 embed_per_layer.weight_bytes() + per_layer_model_proj.weight_bytes();
   for (const auto& l : layers) {
     total += l.q_proj.weight_bytes() + l.k_proj.weight_bytes() + l.v_proj.weight_bytes() +
              l.o_proj.weight_bytes() + l.gate_proj.weight_bytes() + l.up_proj.weight_bytes() +
-             l.down_proj.weight_bytes();
+             l.down_proj.weight_bytes() + l.per_layer_gate.weight_bytes() + l.per_layer_proj.weight_bytes();
   }
   return total;
 }
@@ -337,8 +490,8 @@ double attention(const DecoderConfig& c, int layer, int start, int n) {
     const int pos = start + t;
     keys += sliding ? std::min(pos + 1, c.sliding_window) : pos + 1;
   }
-  const double head_bytes = 4.0 * c.head_dim;
-  return head_bytes * (2.0 * n * c.num_heads + 2.0 * keys * c.num_kv_heads);
+  const double head_bytes = 4.0 * c.head_dim_of(layer);
+  return head_bytes * (2.0 * n * c.num_heads + 2.0 * keys * c.kv_heads_of(layer));
 }
 
 }  // namespace traffic
@@ -353,6 +506,10 @@ void rms_norm(const float* x, const float* weight, int64_t size, float eps, floa
   double sum = 0.0;
   for (int64_t i = 0; i < size; ++i) sum += static_cast<double>(x[i]) * x[i];
   const float inv = static_cast<float>(1.0 / std::sqrt(sum / static_cast<double>(size) + eps));
+  if (weight == nullptr) {
+    for (int64_t i = 0; i < size; ++i) out[i] = x[i] * inv;
+    return;
+  }
   for (int64_t i = 0; i < size; ++i) out[i] = x[i] * inv * (offset + weight[i]);
 }
 
@@ -387,10 +544,23 @@ class DecoderCpu final : public Model {
       : w_(std::move(weights)), c_(w_->config), pool_(options.cpu_threads),
         max_context_(options.max_context), chunk_(std::max(1, options.prefill_chunk)) {
     LK_CHECK(max_context_ > 0, "max_context must be positive");
-    kv_k_.resize(static_cast<size_t>(c_.num_layers));
-    kv_v_.resize(static_cast<size_t>(c_.num_layers));
+    const size_t layers = static_cast<size_t>(c_.num_layers);
+    kv_k_.resize(layers);
+    kv_v_.resize(layers);
+    capacity_.resize(layers);
     for (int l = 0; l < c_.num_layers; ++l) {
-      size_t size = static_cast<size_t>(c_.num_kv_heads) * c_.kv_capacity(l, max_context_) * c_.head_dim;
+      max_q_ = std::max<size_t>(max_q_, static_cast<size_t>(c_.num_heads) * c_.head_dim_of(l));
+      max_kv_ = std::max<size_t>(max_kv_, static_cast<size_t>(c_.kv_heads_of(l)) * c_.head_dim_of(l));
+      max_inter_ = std::max<size_t>(max_inter_, static_cast<size_t>(c_.intermediate_of(l)));
+      if (c_.shares_kv(l)) continue;
+      // Each pass writes its keys and values before attending, so a sliding
+      // ring also holds the window behind the pass's first token: KV-shared
+      // layers read the same ring after it has been written.
+      const int capacity = c_.layer_is_sliding[static_cast<size_t>(l)]
+                               ? std::min(c_.sliding_window + chunk_ - 1, max_context_)
+                               : max_context_;
+      capacity_[static_cast<size_t>(l)] = capacity;
+      const size_t size = static_cast<size_t>(c_.kv_heads_of(l)) * capacity * c_.head_dim_of(l);
       kv_k_[static_cast<size_t>(l)].assign(size, 0.0f);
       kv_v_[static_cast<size_t>(l)].assign(size, 0.0f);
     }
@@ -423,45 +593,32 @@ class DecoderCpu final : public Model {
   }
 
  private:
-  const float* key_ptr(int layer, int kv, int pos, int chunk_start, const float* chunk_k) const {
-    if (c_.layer_is_sliding[static_cast<size_t>(layer)] && pos >= chunk_start) {
-      return chunk_k + (static_cast<size_t>(pos - chunk_start) * c_.num_kv_heads + kv) * c_.head_dim;
-    }
-    int capacity = c_.kv_capacity(layer, max_context_);
-    int slot = pos % capacity;
-    return kv_k_[static_cast<size_t>(layer)].data() +
-           (static_cast<size_t>(kv) * capacity + slot) * c_.head_dim;
-  }
-
-  const float* value_ptr(int layer, int kv, int pos, int chunk_start, const float* chunk_v) const {
-    if (c_.layer_is_sliding[static_cast<size_t>(layer)] && pos >= chunk_start) {
-      return chunk_v + (static_cast<size_t>(pos - chunk_start) * c_.num_kv_heads + kv) * c_.head_dim;
-    }
-    int capacity = c_.kv_capacity(layer, max_context_);
-    int slot = pos % capacity;
-    return kv_v_[static_cast<size_t>(layer)].data() +
-           (static_cast<size_t>(kv) * capacity + slot) * c_.head_dim;
+  // Key or value `kv` of position `pos` in `layer`'s ring.
+  const float* cached(const std::vector<std::vector<float>>& cache, int layer, int kv, int pos) const {
+    const int capacity = capacity_[static_cast<size_t>(layer)];
+    const size_t slot = static_cast<size_t>(kv) * capacity + pos % capacity;
+    return cache[static_cast<size_t>(layer)].data() + slot * c_.head_dim_of(layer);
   }
 
   void store_kv(int layer, int pos, const float* k, const float* v) {
-    int capacity = c_.kv_capacity(layer, max_context_);
-    int slot = pos % capacity;
-    for (int kv = 0; kv < c_.num_kv_heads; ++kv) {
-      size_t dst = (static_cast<size_t>(kv) * capacity + slot) * c_.head_dim;
-      std::copy_n(k + static_cast<size_t>(kv) * c_.head_dim, c_.head_dim,
-                  kv_k_[static_cast<size_t>(layer)].data() + dst);
-      std::copy_n(v + static_cast<size_t>(kv) * c_.head_dim, c_.head_dim,
-                  kv_v_[static_cast<size_t>(layer)].data() + dst);
+    const int capacity = capacity_[static_cast<size_t>(layer)];
+    const int D = c_.head_dim_of(layer);
+    for (int kv = 0; kv < c_.kv_heads_of(layer); ++kv) {
+      const size_t dst = (static_cast<size_t>(kv) * capacity + pos % capacity) * D;
+      std::copy_n(k + static_cast<size_t>(kv) * D, D, kv_k_[static_cast<size_t>(layer)].data() + dst);
+      std::copy_n(v + static_cast<size_t>(kv) * D, D, kv_v_[static_cast<size_t>(layer)].data() + dst);
     }
   }
 
-  void apply_rope(float* vec, int pos, const std::vector<double>& inv_freq) const {
-    const int half = c_.head_dim / 2;
+  static void apply_rope(float* vec, int dims, int pos, const std::vector<double>& inv_freq) {
+    const int half = dims / 2;
     for (int i = 0; i < half; ++i) {
-      double angle = static_cast<double>(pos) * inv_freq[static_cast<size_t>(i)];
-      float cs = static_cast<float>(std::cos(angle));
-      float sn = static_cast<float>(std::sin(angle));
-      float a = vec[i], b = vec[i + half];
+      const double f = inv_freq[static_cast<size_t>(i)];
+      if (f == 0.0) continue;  // a dimension partial rotation leaves alone
+      const double angle = static_cast<double>(pos) * f;
+      const float cs = static_cast<float>(std::cos(angle));
+      const float sn = static_cast<float>(std::sin(angle));
+      const float a = vec[i], b = vec[i + half];
       vec[i] = a * cs - b * sn;
       vec[i + half] = b * cs + a * sn;
     }
@@ -486,20 +643,51 @@ class DecoderCpu final : public Model {
     }
   }
 
+  // Gemma 4's per-layer inputs for the pass, [n, layers, P]: the token's
+  // per-layer embedding times sqrt(P), plus the normed projection of the
+  // scaled token embedding (in x_) times hidden^-0.5, all times 2^-0.5 (each
+  // constant rounded to BF16).
+  void per_layer_inputs(const int32_t* tokens, int n) {
+    const int64_t P = c_.per_layer_input, width = static_cast<int64_t>(c_.num_layers) * P;
+    const size_t sn = static_cast<size_t>(n);
+    Section section(profiler_, "per_layer_input",
+                    profiler_ ? traffic::linear(w_->per_layer_model_proj, n) +
+                                    traffic::embed(w_->embed_per_layer, n) + traffic::rows(width, n, 2)
+                              : 0.0);
+    pl_.resize(sn * width);
+    row_.resize(static_cast<size_t>(width));
+    matmul(w_->per_layer_model_proj, x_.data(), n, pl_.data(), pool_);
+    const float projection_scale = bf16_round(1.0f / std::sqrt(static_cast<float>(c_.hidden_size)));
+    const float embed_scale = bf16_round(std::sqrt(static_cast<float>(P)));
+    const float input_scale = bf16_round(1.0f / std::sqrt(2.0f));
+    for (int t = 0; t < n; ++t) {
+      LK_CHECK(tokens[t] < w_->embed_per_layer.rows, "token id has no per-layer embedding");
+      dequantize_row(w_->embed_per_layer, tokens[t], row_.data());
+      for (int64_t l = 0; l < c_.num_layers; ++l) {
+        float* out = pl_.data() + static_cast<size_t>(t) * width + l * P;
+        for (int64_t i = 0; i < P; ++i) out[i] *= projection_scale;
+        norm(out, w_->per_layer_proj_norm, P, out);
+        const float* lookup = row_.data() + l * P;
+        for (int64_t i = 0; i < P; ++i) out[i] = (out[i] + lookup[i] * embed_scale) * input_scale;
+      }
+    }
+  }
+
   void forward(const int32_t* tokens, int n, bool want_logits) {
     LK_CHECK(position_ + n <= max_context_, "context length exceeded");
-    const int H = c_.num_heads, KV = c_.num_kv_heads, D = c_.head_dim;
-    const int64_t hidden = c_.hidden_size, inter = c_.intermediate_size;
+    LK_CHECK(n <= chunk_, "a forward pass is longer than the prefill chunk");
+    const int H = c_.num_heads;
+    const int64_t hidden = c_.hidden_size;
     const size_t sn = static_cast<size_t>(n);
     x_.resize(sn * hidden);
     h_.resize(sn * hidden);
     r_.resize(sn * hidden);
-    q_.resize(sn * H * D);
-    k_.resize(sn * KV * D);
-    v_.resize(sn * KV * D);
-    attn_.resize(sn * H * D);
-    gate_.resize(sn * inter);
-    up_.resize(sn * inter);
+    q_.resize(sn * max_q_);
+    k_.resize(sn * max_kv_);
+    v_.resize(sn * max_kv_);
+    attn_.resize(sn * max_q_);
+    gate_.resize(sn * max_inter_);
+    up_.resize(sn * max_inter_);
 
     for (int t = 0; t < n; ++t) {
       LK_CHECK(tokens[t] >= 0 && tokens[t] < c_.vocab_size, "token id out of range");
@@ -514,9 +702,9 @@ class DecoderCpu final : public Model {
         }
       }
     }
+    if (c_.per_layer_input > 0) per_layer_inputs(tokens, n);
 
     const int start = position_;
-    const int group = H / KV;
     // Section traffic is computed only while profiling.
     const bool profiling = profiler_ != nullptr;
     const double norm_bytes = profiling ? traffic::rows(hidden, n, 2) + 4.0 * hidden : 0.0;
@@ -524,21 +712,31 @@ class DecoderCpu final : public Model {
     for (int l = 0; l < c_.num_layers; ++l) {
       const DecoderLayer& L = w_->layers[static_cast<size_t>(l)];
       const bool sliding = c_.layer_is_sliding[static_cast<size_t>(l)];
+      const bool own_kv = !c_.shares_kv(l);
+      const int D = c_.head_dim_of(l), KV = c_.kv_heads_of(l);
+      const int64_t inter = c_.intermediate_of(l);
       {
         Section section(profiler_, "norm", norm_bytes);
         for (int t = 0; t < n; ++t) norm(x_.data() + t * hidden, L.attn_norm, hidden, h_.data() + t * hidden);
       }
       {
         Section section(profiler_, "qkv",
-                        profiling ? traffic::linear(L.q_proj, n) + traffic::linear(L.k_proj, n) +
-                                        traffic::linear(L.v_proj, n)
+                        profiling ? traffic::linear(L.q_proj, n) +
+                                        (own_kv ? traffic::linear(L.k_proj, n) : 0.0) +
+                                        (own_kv && !c_.k_eq_v(l) ? traffic::linear(L.v_proj, n) : 0.0)
                                   : 0.0);
         matmul(L.q_proj, h_.data(), n, q_.data(), pool_);
-        matmul(L.k_proj, h_.data(), n, k_.data(), pool_);
-        matmul(L.v_proj, h_.data(), n, v_.data(), pool_);
+        if (own_kv) {
+          matmul(L.k_proj, h_.data(), n, k_.data(), pool_);
+          if (c_.k_eq_v(l)) {
+            std::copy_n(k_.data(), sn * KV * D, v_.data());  // values are the raw key projection
+          } else {
+            matmul(L.v_proj, h_.data(), n, v_.data(), pool_);
+          }
+        }
       }
       {
-        Section section(profiler_, "rope_kv", profiling ? traffic::rows(D, n, 2 * H + 4 * KV) : 0.0);
+        Section section(profiler_, "rope_kv", profiling ? traffic::rows(D, n, 2 * H + (own_kv ? (c_.v_norm ? 6 : 4) * KV : 0)) : 0.0);
         if (c_.qkv_bias) {
           for (int t = 0; t < n; ++t) {
             add_bias(q_.data() + static_cast<size_t>(t) * H * D, L.q_bias);
@@ -551,33 +749,25 @@ class DecoderCpu final : public Model {
           for (int hh = 0; hh < H; ++hh) {
             float* qv = q_.data() + (static_cast<size_t>(t) * H + hh) * D;
             if (c_.qk_norm) norm(qv, L.q_norm, D, qv);
-            apply_rope(qv, start + t, inv_freq);
+            apply_rope(qv, D, start + t, inv_freq);
           }
+          if (!own_kv) continue;
           for (int kv = 0; kv < KV; ++kv) {
             float* kvec = k_.data() + (static_cast<size_t>(t) * KV + kv) * D;
             if (c_.qk_norm) norm(kvec, L.k_norm, D, kvec);
-            apply_rope(kvec, start + t, inv_freq);
+            apply_rope(kvec, D, start + t, inv_freq);
+            if (c_.v_norm) {
+              float* vvec = v_.data() + (static_cast<size_t>(t) * KV + kv) * D;
+              rms_norm(vvec, nullptr, D, c_.rms_norm_eps, 0.0f, vvec);
+            }
           }
-        }
-        // Global layers attend through the cache, so write the chunk first.
-        // Sliding layers read the chunk directly and update the ring after.
-        if (!sliding) {
-          for (int t = 0; t < n; ++t) {
-            store_kv(l, start + t, k_.data() + static_cast<size_t>(t) * KV * D,
-                     v_.data() + static_cast<size_t>(t) * KV * D);
-          }
+          store_kv(l, start + t, k_.data() + static_cast<size_t>(t) * KV * D,
+                   v_.data() + static_cast<size_t>(t) * KV * D);
         }
       }
       {
         Section section(profiler_, "attention", profiling ? traffic::attention(c_, l, start, n) : 0.0);
-        attend(l, start, n, sliding, group);
-        if (sliding) {
-          const int first = std::max(0, n - c_.kv_capacity(l, max_context_));
-          for (int t = first; t < n; ++t) {
-            store_kv(l, start + t, k_.data() + static_cast<size_t>(t) * KV * D,
-                     v_.data() + static_cast<size_t>(t) * KV * D);
-          }
-        }
+        attend(l, start, n, sliding);
       }
       {
         Section section(profiler_, "o_proj", profiling ? traffic::linear(L.o_proj, n) : 0.0);
@@ -612,6 +802,11 @@ class DecoderCpu final : public Model {
         Section section(profiler_, "residual", residual_bytes);
         add_residual(n, L.mlp_post_norm);
       }
+      if (c_.per_layer_input > 0) gate_per_layer_input(L, l, n);
+      if (L.layer_scalar != 1.0f) {
+        Section section(profiler_, "residual", profiling ? traffic::rows(hidden, n, 2) : 0.0);
+        for (size_t i = 0; i < sn * hidden; ++i) x_[i] *= L.layer_scalar;
+      }
     }
     position_ += n;
     if (!want_logits) return;
@@ -627,10 +822,37 @@ class DecoderCpu final : public Model {
     }
   }
 
-  // Attention for the n tokens of this pass (queries in q_, keys and values
-  // through key_ptr/value_ptr) into attn_.
-  void attend(int l, int start, int n, bool sliding, int group) {
-    const int H = c_.num_heads, D = c_.head_dim;
+  // x += norm(per_layer_projection(gelu(per_layer_input_gate(x)) * input)),
+  // with this layer's slice of the pass's per-layer inputs.
+  void gate_per_layer_input(const DecoderLayer& L, int l, int n) {
+    const int64_t P = c_.per_layer_input, width = static_cast<int64_t>(c_.num_layers) * P;
+    Section section(profiler_, "per_layer_input",
+                    profiler_ ? traffic::linear(L.per_layer_gate, n) + traffic::linear(L.per_layer_proj, n) +
+                                    traffic::rows(P, n, 1) + traffic::rows(c_.hidden_size, n, 2)
+                              : 0.0);
+    gate_.resize(std::max(gate_.size(), static_cast<size_t>(n * P)));
+    matmul(L.per_layer_gate, x_.data(), n, gate_.data(), pool_);
+    for (int t = 0; t < n; ++t) {
+      float* g = gate_.data() + static_cast<size_t>(t) * P;
+      const float* input = pl_.data() + static_cast<size_t>(t) * width + static_cast<int64_t>(l) * P;
+      for (int64_t i = 0; i < P; ++i) g[i] = gelu_tanh(g[i]) * input[i];
+    }
+    matmul(L.per_layer_proj, gate_.data(), n, r_.data(), pool_);
+    const int64_t hidden = c_.hidden_size;
+    for (int t = 0; t < n; ++t) {
+      float* xr = x_.data() + t * hidden;
+      float* rr = r_.data() + t * hidden;
+      norm(rr, L.per_layer_norm, hidden, rr);
+      for (int64_t i = 0; i < hidden; ++i) xr[i] += rr[i];
+    }
+  }
+
+  // Attention for the n tokens of this pass (queries in q_) over the keys and
+  // values in the ring of layer l's KV source, into attn_.
+  void attend(int l, int start, int n, bool sliding) {
+    const int H = c_.num_heads, D = c_.head_dim_of(l);
+    const int group = H / c_.kv_heads_of(l);
+    const int source = c_.kv_source(l);
     pool_.parallel_for(static_cast<size_t>(n) * H, [&](size_t begin, size_t end) {
       std::vector<float> scores;
       for (size_t item = begin; item < end; ++item) {
@@ -643,7 +865,7 @@ class DecoderCpu final : public Model {
         scores.resize(static_cast<size_t>(pos - lo + 1));
         float max_score = -std::numeric_limits<float>::infinity();
         for (int j = lo; j <= pos; ++j) {
-          const float* kvec = key_ptr(l, kv, j, start, k_.data());
+          const float* kvec = cached(kv_k_, source, kv, j);
           float dot = 0.0f;
           for (int d = 0; d < D; ++d) dot += qv[d] * kvec[d];
           dot *= c_.attn_scale;
@@ -662,7 +884,7 @@ class DecoderCpu final : public Model {
         std::fill(out, out + D, 0.0f);
         for (int j = lo; j <= pos; ++j) {
           const float p = scores[static_cast<size_t>(j - lo)] / denom;
-          const float* vvec = value_ptr(l, kv, j, start, v_.data());
+          const float* vvec = cached(kv_v_, source, kv, j);
           for (int d = 0; d < D; ++d) out[d] += p * vvec[d];
         }
       }
@@ -675,9 +897,12 @@ class DecoderCpu final : public Model {
   int max_context_;
   int chunk_;
   int position_ = 0;
+  size_t max_q_ = 0, max_kv_ = 0, max_inter_ = 0;  // per-token widths, the largest over layers
+  std::vector<int> capacity_;                       // ring positions per layer; 0 for KV-shared layers
   std::vector<std::vector<float>> kv_k_, kv_v_;
   std::vector<double> inv_freq_local_, inv_freq_global_;
   std::vector<float> x_, h_, r_, q_, k_, v_, attn_, gate_, up_, logits_;
+  std::vector<float> pl_, row_;  // per-layer inputs [n, layers * P] and an embedding row
 };
 
 }  // namespace

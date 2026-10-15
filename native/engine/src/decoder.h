@@ -1,9 +1,11 @@
-// Dense decoder-only transformers (Gemma 3, Llama 3.x, Mistral, Qwen 2/2.5,
-// Qwen 3): configuration, weight binding, and the CPU backend. One
-// configuration describes how the families differ (norm style and
-// placement, activation, per-head Q/K norm, q/k/v biases, RoPE bases and
-// scaling, sliding windows, logit soft-capping), and every backend
-// implements all of it, so a family is a config parser rather than a fork.
+// Dense decoder-only transformers (Gemma 3, Gemma 4, Llama 3.x, Mistral,
+// Qwen 2/2.5, Qwen 3): configuration, weight binding, and the CPU backend.
+// One configuration describes how the families differ (norm style and
+// placement, activation, per-head Q/K norm, q/k/v biases, RoPE bases,
+// scaling and partial rotation, sliding windows, logit soft-capping, and
+// Gemma 4's per-layer geometry, KV sharing and per-layer inputs), so a family
+// is a config parser rather than a fork. Backends that lack a feature refuse
+// the config (see uniform_layers()).
 #pragma once
 
 #include <memory>
@@ -60,10 +62,42 @@ struct DecoderConfig {
   std::vector<int32_t> eos_token_ids;
   std::string weight_prefix;  // "" or "language_model."
 
+  // Gemma 4. Per-layer vectors are empty when every layer uses the fields
+  // above.
+  std::vector<int> layer_head_dim;
+  std::vector<int> layer_kv_heads;
+  std::vector<int> layer_intermediate;
+  // The layer whose keys and values a layer attends over: itself, or for
+  // KV-shared layers the last earlier layer of the same kind.
+  std::vector<int> layer_kv_source;
+  std::vector<bool> layer_k_eq_v;   // values are the raw key projection
+  bool v_norm = false;              // scale-free RMSNorm on values
+  // Full layers rotate only this fraction of their dimensions, with
+  // exponents over the whole head size ("proportional" RoPE).
+  float global_partial_rotary = 1.0f;
+  int per_layer_input = 0;          // hidden_size_per_layer_input; 0 disables
+  bool layer_scalars = false;       // each layer's output times its layer_scalar
+
   static DecoderConfig from_json(const Json& raw);
-  // RoPE inverse frequencies (head_dim / 2 of them) for a layer kind.
+  // RoPE inverse frequencies (half the layer kind's head size); rotations a
+  // partial layer kind skips have frequency 0.
   std::vector<double> rope_inv_freq(bool sliding) const;
-  int kv_capacity(int layer, int max_context) const;
+
+  int head_dim_of(int layer) const { return layer_head_dim.empty() ? head_dim : layer_head_dim[static_cast<size_t>(layer)]; }
+  int kv_heads_of(int layer) const { return layer_kv_heads.empty() ? num_kv_heads : layer_kv_heads[static_cast<size_t>(layer)]; }
+  int intermediate_of(int layer) const {
+    return layer_intermediate.empty() ? intermediate_size : layer_intermediate[static_cast<size_t>(layer)];
+  }
+  int kv_source(int layer) const { return layer_kv_source.empty() ? layer : layer_kv_source[static_cast<size_t>(layer)]; }
+  bool shares_kv(int layer) const { return kv_source(layer) != layer; }
+  bool k_eq_v(int layer) const { return !layer_k_eq_v.empty() && layer_k_eq_v[static_cast<size_t>(layer)]; }
+  // True when every layer has the same geometry and none of Gemma 4's
+  // additions are used: what the Metal backend implements today.
+  bool uniform_layers() const {
+    return layer_head_dim.empty() && layer_kv_heads.empty() && layer_intermediate.empty() &&
+           layer_kv_source.empty() && layer_k_eq_v.empty() && !v_norm && global_partial_rotary == 1.0f &&
+           per_layer_input == 0 && !layer_scalars;
+  }
 };
 
 bool is_supported_decoder(const Json& raw);
@@ -73,7 +107,12 @@ struct DecoderLayer {
   // q_norm and k_norm only with qk_norm.
   std::vector<float> attn_norm, attn_post_norm, mlp_norm, mlp_post_norm, q_norm, k_norm;
   std::vector<float> q_bias, k_bias, v_bias;  // only with qkv_bias
+  // k_proj and v_proj are empty (rows 0) in KV-shared layers, v_proj with k_eq_v.
   Linear q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj;
+  // Per-layer inputs (Gemma 4): gate [P, hidden], projection [hidden, P].
+  Linear per_layer_gate, per_layer_proj;
+  std::vector<float> per_layer_norm;
+  float layer_scalar = 1.0f;
 };
 
 // Weights bound to a mapped checkpoint (zero-copy for matrices).
@@ -84,6 +123,10 @@ struct DecoderWeights {
   Linear embed;
   Linear lm_head;
   std::vector<float> final_norm;
+  // Per-layer inputs (Gemma 4): a [vocab, layers * P] embedding and a
+  // [layers * P, hidden] projection of the scaled token embedding.
+  Linear embed_per_layer, per_layer_model_proj;
+  std::vector<float> per_layer_proj_norm;
   std::vector<DecoderLayer> layers;
   bool tied_lm_head = false;
 

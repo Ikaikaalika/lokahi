@@ -15,8 +15,16 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from lokahi.fixtures import TinyDenseSpec, TinyGemma3Spec, write_tiny_dense, write_tiny_gemma3
-from lokahi.oracles import Gemma3Reference, LlamaFamilyReference
+from lokahi.fixtures import (
+    TinyDenseSpec,
+    TinyGemma3Spec,
+    TinyGemma4Spec,
+    write_tiny_dense,
+    write_tiny_gemma3,
+    write_tiny_gemma4,
+)
+from lokahi.formats.safetensors import read_safetensors
+from lokahi.oracles import Gemma3Reference, Gemma4Reference, LlamaFamilyReference
 
 TOKENS = [2, 5, 9, 33, 100, 7, 7, 7, 400, 3, 2, 11, 90, 91, 92, 93, 17, 18, 19, 20, 21, 22]
 
@@ -70,7 +78,28 @@ DENSE_VARIANTS = {
                                             rope_theta=1e6, rope_scaling={"rope_type": "linear", "factor": 2.0},
                                             seed=6),
 }
-VARIANTS = sorted(GEMMA3_VARIANTS) + sorted(DENSE_VARIANTS)
+GEMMA4_VARIANTS = {
+    # E2B's shape: sliding and full head sizes, proportional partial RoPE on
+    # full layers, the last two layers sharing KV with double-wide MLPs,
+    # per-layer inputs, tied embeddings, text_config and language_model.
+    "gemma4-e2b-shape": TinyGemma4Spec(),
+    # 31B's attention: values are the raw keys on full layers, which have their
+    # own kv head count; untied, flat config, 8-bit, no KV sharing or
+    # per-layer inputs.
+    "gemma4-k-eq-v-untied-flat": TinyGemma4Spec(
+        num_key_value_heads=2, num_global_key_value_heads=1, attention_k_eq_v=True, num_kv_shared_layers=0,
+        hidden_size_per_layer_input=0, use_double_wide_mlp=False, tie_word_embeddings=False, nested=False,
+        sliding_window=5, global_partial_rotary_factor=0.5, group_size=64, bits=8, seed=7,
+    ),
+    # Shared sliding and full layers over k_eq_v sources, single-width MLPs,
+    # no soft-cap.
+    "gemma4-shared-both-kinds": TinyGemma4Spec(
+        num_hidden_layers=8, sliding_window_pattern=4, num_kv_shared_layers=3, use_double_wide_mlp=False,
+        hidden_size_per_layer_input=16, group_size=16, final_logit_softcapping=None, attention_k_eq_v=True,
+        num_key_value_heads=2, num_global_key_value_heads=1, seed=8,
+    ),
+}
+VARIANTS = sorted(GEMMA3_VARIANTS) + sorted(GEMMA4_VARIANTS) + sorted(DENSE_VARIANTS)
 
 
 @pytest.fixture(scope="module", params=VARIANTS)
@@ -79,14 +108,24 @@ def fixture_model(request, tmp_path_factory):
     if request.param in GEMMA3_VARIANTS:
         write_tiny_gemma3(directory, GEMMA3_VARIANTS[request.param])
         return directory, Gemma3Reference.load(directory)
+    if request.param in GEMMA4_VARIANTS:
+        write_tiny_gemma4(directory, GEMMA4_VARIANTS[request.param])
+        return directory, Gemma4Reference.load(directory)
     write_tiny_dense(directory, DENSE_VARIANTS[request.param])
     return directory, LlamaFamilyReference.load(directory)
+
+
+def _skip_unsupported(directory: Path, backend: str) -> None:
+    config = json.loads((directory / "config.json").read_text())
+    if backend == "metal" and (config.get("text_config") or config)["model_type"].startswith("gemma4"):
+        pytest.skip("the Metal backend does not implement Gemma 4 yet")
 
 
 @pytest.mark.parametrize("backend", _backends())
 @pytest.mark.parametrize(("prefill", "chunk"), [(len(TOKENS), 512), (5, 512), (1, 512), (17, 3)])
 def test_logits_match_oracle(native_cli, fixture_model, backend, prefill, chunk, tmp_path):
     directory, oracle = fixture_model
+    _skip_unsupported(directory, backend)
     out = tmp_path / "logits.bin"
     report = _run(
         native_cli,
@@ -110,6 +149,7 @@ def test_logits_match_oracle(native_cli, fixture_model, backend, prefill, chunk,
 @pytest.mark.parametrize("backend", _backends())
 def test_greedy_generation_matches_full_recompute(native_cli, fixture_model, backend):
     directory, oracle = fixture_model
+    _skip_unsupported(directory, backend)
     prompt = TOKENS[:6]
     report = _run(
         native_cli,
@@ -191,6 +231,7 @@ def test_unexpected_bias_fails_closed(native_cli, tmp_path):
 @pytest.mark.parametrize("backend", _backends())
 def test_profile_attributes_every_section_without_changing_tokens(native_cli, fixture_model, backend):
     directory, oracle = fixture_model
+    _skip_unsupported(directory, backend)
     prompt, steps = TOKENS[:9], 6
     report = _run(native_cli, "profile", "--model", str(directory), "--backend", backend,
                   "--tokens", ",".join(map(str, prompt)), "--max-new", str(steps))
@@ -208,9 +249,83 @@ def test_profile_attributes_every_section_without_changing_tokens(native_cli, fi
         total = sum(s["seconds"] for s in sections.values())
         assert total <= report[phase]["wall_seconds"] * 1.05 + 1e-3
     # Every decode step reads every layer weight and the vocabulary projection;
-    # with tied embeddings that is all of weight_bytes.
+    # with tied embeddings that is all of weight_bytes but the tables only
+    # gathered from (Gemma 4's per-layer embeddings).
     decode = {section["name"]: section for section in report["decode"]["sections"]}
-    linear = ("qkv", "o_proj", "mlp_up", "down_proj", "mlp")  # CPU splits the MLP; Metal fuses it
+    linear = ("qkv", "o_proj", "mlp_up", "down_proj", "mlp", "per_layer_input")  # CPU splits the MLP; Metal fuses it
     linear_bytes = sum(decode[name]["bytes"] for name in linear if name in decode) + decode["lm_head"]["bytes"]
     tied = oracle.w["lm_head"] is oracle.w["model.embed_tokens"]
-    assert linear_bytes / steps >= report["weight_bytes"] * (1.0 if tied else 0.5)
+    read = report["weight_bytes"] - _gathered_table_bytes(directory)
+    assert linear_bytes / steps >= read * (1.0 if tied else 0.5)
+
+
+def _gathered_table_bytes(directory: Path) -> int:
+    total = 0
+    for shard in directory.glob("*.safetensors"):
+        tensors, _ = read_safetensors(shard)
+        total += sum(array.nbytes for name, (_, array) in tensors.items() if ".embed_tokens_per_layer." in name)
+    return total
+
+
+def _gemma4_error(native_cli: Path, directory: Path, backend: str = "cpu") -> str:
+    result = subprocess.run(
+        [str(native_cli), "info", "--model", str(directory), "--backend", backend], capture_output=True, text=True
+    )
+    assert result.returncode != 0
+    return result.stderr
+
+
+def test_gemma4_fixtures_exercise_every_feature(tmp_path):
+    # Guards the fixtures: each Gemma 4 mechanism must be live in some variant.
+    e2b = Gemma4Reference.load(write_tiny_gemma4(tmp_path / "e2b", GEMMA4_VARIANTS["gemma4-e2b-shape"]))
+    cfg = e2b.config
+    assert [cfg.kv_source(i) for i in range(6)] == [0, 1, 2, 3, 3, 2]
+    assert {cfg.head_size(i) for i in range(6)} == {64, 128}
+    full = cfg.inv_freq(2)
+    assert (full == 0).sum() == 48 and (full > 0).sum() == 16  # 0.25 of 128 dims rotate
+    assert "model.layers.4.self_attn.k_proj" not in e2b.w and "model.layers.3.self_attn.k_proj" in e2b.w
+    assert e2b.w["model.layers.4.mlp.gate_proj"].shape[0] == 2 * e2b.w["model.layers.3.mlp.gate_proj"].shape[0]
+    assert "model.embed_tokens_per_layer" in e2b.w
+    assert all(abs(float(e2b.w[f"model.layers.{i}.layer_scalar"][0]) - 1.0) > 1e-3 for i in range(6))
+
+    both = Gemma4Reference.load(write_tiny_gemma4(tmp_path / "both", GEMMA4_VARIANTS["gemma4-shared-both-kinds"]))
+    cfg = both.config
+    assert [cfg.kv_source(i) for i in range(5, 8)] == [4, 4, 3] and cfg.k_eq_v(3) and cfg.kv_heads(3) == 1
+    assert "model.layers.3.self_attn.v_proj" not in both.w and "model.layers.2.self_attn.v_proj" in both.w
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"enable_moe_block": True}, "gemma4: mixture-of-experts blocks are not supported yet"),
+        ({"num_kv_shared_layers": 4}, "gemma4: a shared layer has no earlier layer of its kind"),
+        ({"rope_parameters": {"full_attention": {"rope_type": "yarn", "factor": 4.0}}},
+         "gemma4: full rope_type 'yarn' is not supported"),
+        ({"rope_parameters": {"sliding_attention": {"rope_type": "default", "partial_rotary_factor": 0.5}}},
+         "gemma4: partial rotation on sliding layers"),
+        ({"hidden_activation": "silu"}, "gemma4: unsupported activation silu"),
+    ],
+)
+def test_unsupported_gemma4_configurations_fail_closed(native_cli, tmp_path, change, message):
+    directory = write_tiny_gemma4(tmp_path / "model", TinyGemma4Spec(extra=change))
+    assert message in _gemma4_error(native_cli, directory)
+
+
+def test_gemma4_missing_layer_scalar_fails_closed(native_cli, tmp_path):
+    directory = write_tiny_gemma4(tmp_path / "model", TinyGemma4Spec())
+    path = directory / "model.safetensors"
+    tensors, metadata = read_safetensors(path)
+    del tensors["language_model.model.layers.3.layer_scalar"]
+    from lokahi.formats.safetensors import write_safetensors
+
+    write_safetensors(path, tensors, metadata=metadata)
+    assert "layers.3.layer_scalar" in _gemma4_error(native_cli, directory)
+
+
+def test_gemma4_runs_on_the_cpu_backend_only(native_cli, tmp_path):
+    directory = write_tiny_gemma4(tmp_path / "model", TinyGemma4Spec())
+    # auto falls back to the CPU backend, which implements Gemma 4.
+    info = _run(native_cli, "info", "--model", str(directory), "--backend", "auto")
+    assert (info["architecture"], info["backend"]) == ("gemma4", "cpu")
+    if "metal" in _backends():
+        assert "the Metal backend does not implement" in _gemma4_error(native_cli, directory, "metal")
