@@ -1,4 +1,4 @@
-// Metal backend for dense decoders.
+// Metal backend for dense decoders (Gemma 3, Gemma 4 and the Llama family).
 //
 // One serial compute encoder per command buffer runs a whole prefill (all
 // chunks) or one decode step: embedding, every layer, the last-row
@@ -59,13 +59,19 @@ struct GpuLinear {
 
 struct GpuLayer {
   GpuLinear q, k, v, o, gate, up, down;
+  GpuLinear pl_gate, pl_proj;  // Gemma 4's per-layer input gate and projection
   // Norms and biases a family does not have are bound to a placeholder and
   // never read.
-  BufRef attn_norm, attn_post_norm, mlp_norm, mlp_post_norm, q_norm, k_norm, q_bias, k_bias, v_bias;
+  BufRef attn_norm, attn_post_norm, mlp_norm, mlp_post_norm, q_norm, k_norm, q_bias, k_bias, v_bias, pl_norm;
+  // A KV-shared layer's caches and capacity are its source layer's.
   id<MTLBuffer> k_cache = nil;
   id<MTLBuffer> v_cache = nil;
   int capacity = 0;
   bool sliding = false;
+  int head_dim = 0, kv_heads = 0, inter = 0;
+  bool own_kv = true;  // computes and stores its own keys and values
+  bool k_eq_v = false;  // values are the raw key projection
+  float scalar = 1.0f;  // Gemma 4's layer_scalar
 };
 
 // Packs read-only host regions into a few large GPU buffers.
@@ -124,7 +130,7 @@ class WeightArena {
 // Parameter blocks; layouts match the structs in decoder_kernels.metal.
 struct EmbedParams { int cols; int n; float scale; };
 struct NormParams { int cols; float eps; float offset; };
-struct ResidualNormParams { int cols; float eps; float offset; int post_norm; int has_next; };
+struct ResidualNormParams { int cols; float eps; float offset; int post_norm; int has_next; float scale; };
 struct QmvParams { int rows; int cols; };
 struct GluParams { int rows; int cols; int silu; };
 struct QkvParams { int q_rows; int kv_rows; int cols; };
@@ -133,8 +139,10 @@ struct ElementwiseParams { int count; };
 struct GluMulParams { int count; int silu; };
 struct RopeParams {
   int heads; int kv_heads; int head_dim; int start_pos; int capacity; float eps; float offset; int qk_norm;
-  int qkv_bias;
+  int qkv_bias; int v_norm;
 };
+struct PerLayerCombineParams { int size; int layers; float eps; float offset; float proj_scale; float input_scale; };
+struct PerLayerGateParams { int size; int layers; int layer; int count; };
 struct AttnParams {
   int heads; int kv_heads; int head_dim; int start_pos; int window; int capacity; int block; int n_blocks;
   float scale; float softcap;
@@ -284,17 +292,25 @@ class DecoderMetal final : public Model {
     };
     check(w_->embed);
     check(w_->lm_head);
-    for (const auto& L : w_->layers) {
-      for (const Linear* l : {&L.q_proj, &L.k_proj, &L.v_proj, &L.o_proj, &L.gate_proj, &L.up_proj,
-                              &L.down_proj}) {
-        check(*l);
-      }
+    if (c_.per_layer_input > 0) {
+      check(w_->embed_per_layer);
+      check(w_->per_layer_model_proj);
     }
-    const int dpl = c_.head_dim / 32;
-    LK_CHECK(c_.head_dim % 32 == 0 && (dpl == 2 || dpl == 4 || dpl == 8),
-             "metal: head_dim must be 64, 128 or 256");
-    const int group = c_.num_heads / c_.num_kv_heads;
-    LK_CHECK(group >= 1 && group <= 8, "metal: heads per kv head must be between 1 and 8");
+    for (int i = 0; i < c_.num_layers; ++i) {
+      const DecoderLayer& L = w_->layers[static_cast<size_t>(i)];
+      for (const Linear* l : {&L.q_proj, &L.o_proj, &L.gate_proj, &L.up_proj, &L.down_proj}) check(*l);
+      if (!c_.shares_kv(i)) check(L.k_proj);
+      if (!c_.shares_kv(i) && !c_.k_eq_v(i)) check(L.v_proj);
+      if (c_.per_layer_input > 0) {
+        check(L.per_layer_gate);
+        check(L.per_layer_proj);
+      }
+      const int dim = c_.head_dim_of(i), dpl = dim / 32;
+      LK_CHECK(dim % 32 == 0 && (dpl == 2 || dpl == 4 || dpl == 8 || dpl == 16),
+               "metal: head_dim must be 64, 128, 256 or 512");
+      const int group = c_.num_heads / c_.kv_heads_of(i);
+      LK_CHECK(group >= 1 && group <= 8, "metal: heads per kv head must be between 1 and 8");
+    }
   }
 
   GpuLinear add_linear(WeightArena& arena, const Linear& l, std::vector<std::pair<GpuLinear*, std::array<size_t, 3>>>& fix,
@@ -326,9 +342,19 @@ class DecoderMetal final : public Model {
       lm_head_ = add_linear(arena, w_->lm_head, linear_fix, &lm_head_);
     }
     add_vector(w_->final_norm, &final_norm_);
+    if (c_.per_layer_input > 0) {
+      embed_per_layer_ = add_linear(arena, w_->embed_per_layer, linear_fix, &embed_per_layer_);
+      per_layer_model_proj_ = add_linear(arena, w_->per_layer_model_proj, linear_fix, &per_layer_model_proj_);
+      add_vector(w_->per_layer_proj_norm, &per_layer_proj_norm_);
+    }
+    for (int i = 0; i < c_.num_layers; ++i) {
+      max_head_dim_ = std::max(max_head_dim_, c_.head_dim_of(i));
+      max_kv_width_ = std::max(max_kv_width_, c_.kv_heads_of(i) * c_.head_dim_of(i));
+      max_inter_ = std::max(max_inter_, c_.intermediate_of(i));
+    }
     // Bound in place of norms a family does not have; kernels never read it.
-    placeholder_data_.assign(static_cast<size_t>(
-                                 std::max({c_.hidden_size, c_.head_dim, c_.num_heads * c_.head_dim})),
+    placeholder_data_.assign(static_cast<size_t>(std::max({c_.hidden_size, max_head_dim_, c_.num_heads * max_head_dim_,
+                                                            c_.per_layer_input})),
                              0.0f);
     add_vector(placeholder_data_, &placeholder_);
 
@@ -346,10 +372,22 @@ class DecoderMetal final : public Model {
     for (size_t i = 0; i < w_->layers.size(); ++i) {
       const DecoderLayer& L = w_->layers[i];
       GpuLayer& G = layers_[i];
+      const int layer = static_cast<int>(i);
+      G.head_dim = c_.head_dim_of(layer);
+      G.kv_heads = c_.kv_heads_of(layer);
+      G.inter = c_.intermediate_of(layer);
+      G.own_kv = !c_.shares_kv(layer);
+      G.k_eq_v = c_.k_eq_v(layer);
+      G.scalar = L.layer_scalar;
       G.q = add_linear(arena, L.q_proj, linear_fix, &G.q);
-      G.k = add_linear(arena, L.k_proj, linear_fix, &G.k);
-      G.v = add_linear(arena, L.v_proj, linear_fix, &G.v);
+      if (G.own_kv) G.k = add_linear(arena, L.k_proj, linear_fix, &G.k);
+      if (G.own_kv && !G.k_eq_v) G.v = add_linear(arena, L.v_proj, linear_fix, &G.v);
       G.o = add_linear(arena, L.o_proj, linear_fix, &G.o);
+      if (c_.per_layer_input > 0) {
+        G.pl_gate = add_linear(arena, L.per_layer_gate, linear_fix, &G.pl_gate);
+        G.pl_proj = add_linear(arena, L.per_layer_proj, linear_fix, &G.pl_proj);
+      }
+      add_optional(L.per_layer_norm, &G.pl_norm);
       G.gate = add_linear(arena, L.gate_proj, linear_fix, &G.gate);
       G.up = add_linear(arena, L.up_proj, linear_fix, &G.up);
       G.down = add_linear(arena, L.down_proj, linear_fix, &G.down);
@@ -391,27 +429,42 @@ class DecoderMetal final : public Model {
 
   void allocate_state() {
     const size_t f = sizeof(float);
-    const size_t H = static_cast<size_t>(c_.num_heads), KV = static_cast<size_t>(c_.num_kv_heads);
-    const size_t D = static_cast<size_t>(c_.head_dim), hidden = static_cast<size_t>(c_.hidden_size);
+    const size_t H = static_cast<size_t>(c_.num_heads);
+    const size_t D = static_cast<size_t>(max_head_dim_), hidden = static_cast<size_t>(c_.hidden_size);
     const size_t chunk = static_cast<size_t>(chunk_);
     for (size_t i = 0; i < layers_.size(); ++i) {
       GpuLayer& G = layers_[i];
       G.sliding = c_.layer_is_sliding[i];
+      if (!G.own_kv) {  // reads its source layer's caches, allocated earlier
+        const GpuLayer& source = layers_[static_cast<size_t>(c_.kv_source(static_cast<int>(i)))];
+        G.k_cache = source.k_cache;
+        G.v_cache = source.v_cache;
+        G.capacity = source.capacity;
+        continue;
+      }
       // Sliding layers keep window + chunk slots so a whole chunk can be
       // written before its queries read the preceding window.
       G.capacity = G.sliding ? std::min(max_context_, c_.sliding_window + chunk_) : max_context_;
-      G.k_cache = private_buffer(KV * static_cast<size_t>(G.capacity) * D * f);
-      G.v_cache = private_buffer(KV * static_cast<size_t>(G.capacity) * D * f);
+      const size_t width = static_cast<size_t>(G.kv_heads) * static_cast<size_t>(G.head_dim);
+      G.k_cache = private_buffer(width * static_cast<size_t>(G.capacity) * f);
+      G.v_cache = private_buffer(width * static_cast<size_t>(G.capacity) * f);
     }
     x_ = private_buffer(chunk * hidden * f);
     h_ = private_buffer(chunk * hidden * f);
     r_ = private_buffer(chunk * hidden * f);
     q_ = private_buffer(chunk * H * D * f);
-    kt_ = private_buffer(chunk * KV * D * f);
-    vt_ = private_buffer(chunk * KV * D * f);
+    kt_ = private_buffer(chunk * static_cast<size_t>(max_kv_width_) * f);
+    vt_ = private_buffer(chunk * static_cast<size_t>(max_kv_width_) * f);
     attn_ = private_buffer(chunk * H * D * f);
-    gate_ = private_buffer(chunk * static_cast<size_t>(c_.intermediate_size) * f);
-    up_ = private_buffer(chunk * static_cast<size_t>(c_.intermediate_size) * f);
+    gate_ = private_buffer(chunk * static_cast<size_t>(max_inter_) * f);
+    up_ = private_buffer(chunk * static_cast<size_t>(max_inter_) * f);
+    if (c_.per_layer_input > 0) {
+      const size_t width = static_cast<size_t>(c_.num_layers) * static_cast<size_t>(c_.per_layer_input);
+      per_layer_ = private_buffer(chunk * width * f);
+      per_layer_lookup_ = private_buffer(chunk * width * f);
+      per_layer_proj_ = private_buffer(chunk * width * f);
+      per_layer_gate_ = private_buffer(chunk * static_cast<size_t>(c_.per_layer_input) * f);
+    }
     const size_t partials = std::max(H * kDecodeMaxBlocks, chunk * H * kPrefillMaxBlocks);
     part_o_ = private_buffer(partials * D * f);
     part_ml_ = private_buffer(partials * 2 * f);
@@ -521,7 +574,8 @@ class DecoderMetal final : public Model {
         threadsPerThreadgroup:MTLSizeMake(norm_threads(pso), 1, 1)];
   }
 
-  void encode_residual_norm(id<MTLComputeCommandEncoder> enc, const BufRef& w_post, const BufRef* w_next, int n) {
+  void encode_residual_norm(id<MTLComputeCommandEncoder> enc, const BufRef& w_post, const BufRef* w_next, int n,
+                            float scale = 1.0f) {
     id<MTLComputePipelineState> pso = pipeline("residual_norm_rows");
     [enc setComputePipelineState:pso];
     bind(enc, x_, 0, 0);
@@ -530,13 +584,18 @@ class DecoderMetal final : public Model {
     bind(enc, w_next ? *w_next : w_post, 3);
     bind(enc, h_, 0, 4);
     bytes(enc, ResidualNormParams{c_.hidden_size, c_.rms_norm_eps, c_.norm_offset, c_.sandwich_norms ? 1 : 0,
-                                  w_next ? 1 : 0},
+                                  w_next ? 1 : 0, scale},
           5);
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(n), 1, 1)
         threadsPerThreadgroup:MTLSizeMake(norm_threads(pso), 1, 1)];
   }
 
   void encode_qkv(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n) {
+    if (!G.own_kv || G.k_eq_v) {  // queries only, or queries and the keys that double as values
+      encode_qmm(enc, G.q, h_, n, q_);
+      if (G.own_kv) encode_qmm(enc, G.k, h_, n, kt_);
+      return;
+    }
     if (n == 1 && G.q.same_format(G.k) && G.q.same_format(G.v)) {
       [enc setComputePipelineState:quant_pipeline("qmv_qkv", G.q)];
       bind_weights(enc, G.q, 0);
@@ -566,15 +625,17 @@ class DecoderMetal final : public Model {
     bind(enc, G.q_norm, 5);
     bind(enc, G.k_norm, 6);
     bind(enc, G.sliding ? inv_freq_local_buf_ : inv_freq_global_buf_, 7);
-    bytes(enc, RopeParams{c_.num_heads, c_.num_kv_heads, c_.head_dim, start, G.capacity, c_.rms_norm_eps,
-                          c_.norm_offset, c_.qk_norm ? 1 : 0, c_.qkv_bias ? 1 : 0},
+    bytes(enc, RopeParams{c_.num_heads, G.kv_heads, G.head_dim, start, G.capacity, c_.rms_norm_eps,
+                          c_.norm_offset, c_.qk_norm ? 1 : 0, c_.qkv_bias ? 1 : 0, c_.v_norm ? 1 : 0},
           8);
     bind(enc, G.q_bias, 9);
     bind(enc, G.k_bias, 10);
     bind(enc, G.v_bias, 11);
-    [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(c_.num_heads + c_.num_kv_heads),
-                                          static_cast<NSUInteger>(n), 1)
-        threadsPerThreadgroup:MTLSizeMake(static_cast<NSUInteger>(c_.head_dim / 2), 1, 1)];
+    if (G.k_eq_v) bind(enc, kt_, 0, 2);  // values are the raw keys, before k_norm
+    // KV-shared layers only rotate their queries.
+    const int heads = c_.num_heads + (G.own_kv ? G.kv_heads : 0);
+    [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(heads), static_cast<NSUInteger>(n), 1)
+        threadsPerThreadgroup:MTLSizeMake(static_cast<NSUInteger>(G.head_dim / 2), 1, 1)];
   }
 
   void encode_attention(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n, int start) {
@@ -584,8 +645,8 @@ class DecoderMetal final : public Model {
     const int min_block = n == 1 ? 32 : 64;
     const int block = std::max(min_block, (keys_max + max_blocks - 1) / max_blocks);
     const int n_blocks = (keys_max + block - 1) / block;
-    const int group = c_.num_heads / c_.num_kv_heads;
-    const std::string name = "attn_partial_g" + std::to_string(group) + "_d" + std::to_string(c_.head_dim / 32);
+    const int group = c_.num_heads / G.kv_heads;
+    const std::string name = "attn_partial_g" + std::to_string(group) + "_d" + std::to_string(G.head_dim / 32);
     [enc setComputePipelineState:pipeline(name)];
     bind(enc, q_, 0, 0);
     bind(enc, G.k_cache, 0, 1);
@@ -593,19 +654,60 @@ class DecoderMetal final : public Model {
     bind(enc, part_o_, 0, 3);
     bind(enc, part_ml_, 0, 4);
     bytes(enc,
-          AttnParams{c_.num_heads, c_.num_kv_heads, c_.head_dim, start, window, G.capacity, block, n_blocks,
+          AttnParams{c_.num_heads, G.kv_heads, G.head_dim, start, window, G.capacity, block, n_blocks,
                      c_.attn_scale, c_.attn_logit_softcapping},
           5);
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(n_blocks),
-                                          static_cast<NSUInteger>(c_.num_kv_heads), static_cast<NSUInteger>(n))
+                                          static_cast<NSUInteger>(G.kv_heads), static_cast<NSUInteger>(n))
         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     [enc setComputePipelineState:pipeline("attn_reduce")];
     bind(enc, part_o_, 0, 0);
     bind(enc, part_ml_, 0, 1);
     bind(enc, attn_, 0, 2);
-    bytes(enc, ReduceParams{c_.num_heads, c_.head_dim, n_blocks}, 3);
+    bytes(enc, ReduceParams{c_.num_heads, G.head_dim, n_blocks}, 3);
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(c_.num_heads), static_cast<NSUInteger>(n), 1)
-        threadsPerThreadgroup:MTLSizeMake(static_cast<NSUInteger>(c_.head_dim), 1, 1)];
+        threadsPerThreadgroup:MTLSizeMake(static_cast<NSUInteger>(G.head_dim), 1, 1)];
+  }
+
+  // Gemma 4's per-layer inputs for the pass into per_layer_: the per-layer
+  // embedding lookup (times sqrt(P)) plus the normed projection of the
+  // scaled embedding in x_.
+  void encode_per_layer_inputs(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> tokens, size_t tokens_offset, int n) {
+    const int width = c_.num_layers * c_.per_layer_input;
+    [enc setComputePipelineState:quant_pipeline("embed_rows", embed_per_layer_)];
+    bind_weights(enc, embed_per_layer_, 0);
+    bind(enc, tokens, tokens_offset, 3);
+    bind(enc, per_layer_lookup_, 0, 4);
+    bytes(enc, EmbedParams{width, n, c_.per_layer_embed_scale}, 5);
+    [enc dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(width), static_cast<NSUInteger>(n), 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    encode_qmm(enc, per_layer_model_proj_, x_, n, per_layer_proj_);
+    id<MTLComputePipelineState> pso = pipeline("per_layer_combine");
+    [enc setComputePipelineState:pso];
+    bind(enc, per_layer_proj_, 0, 0);
+    bind(enc, per_layer_lookup_, 0, 1);
+    bind(enc, per_layer_proj_norm_, 2);
+    bind(enc, per_layer_, 0, 3);
+    bytes(enc, PerLayerCombineParams{c_.per_layer_input, c_.num_layers, c_.rms_norm_eps, c_.norm_offset,
+                                     c_.per_layer_projection_scale, c_.per_layer_input_scale},
+          4);
+    const NSUInteger threads = std::min<NSUInteger>(
+        std::max<NSUInteger>(32, static_cast<NSUInteger>((c_.per_layer_input + 31) / 32 * 32)),
+        std::min<NSUInteger>(256, [pso maxTotalThreadsPerThreadgroup] / 32 * 32));
+    [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(c_.num_layers), static_cast<NSUInteger>(n), 1)
+        threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+  }
+
+  // r_ = per_layer_projection(gelu(per_layer_input_gate(x)) * this layer's input).
+  void encode_per_layer_gate(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int layer, int n) {
+    encode_qmm(enc, G.pl_gate, x_, n, per_layer_gate_);
+    [enc setComputePipelineState:pipeline("per_layer_gate")];
+    bind(enc, per_layer_gate_, 0, 0);
+    bind(enc, per_layer_, 0, 1);
+    const int count = n * c_.per_layer_input;
+    bytes(enc, PerLayerGateParams{c_.per_layer_input, c_.num_layers, layer, count}, 2);
+    encode_elementwise(enc, count);
+    encode_qmm(enc, G.pl_proj, per_layer_gate_, n, r_);
   }
 
   void encode_mlp(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n) {
@@ -625,7 +727,7 @@ class DecoderMetal final : public Model {
       [enc setComputePipelineState:pipeline("glu_mul")];
       bind(enc, gate_, 0, 0);
       bind(enc, up_, 0, 1);
-      const int count = n * c_.intermediate_size;
+      const int count = n * G.inter;
       bytes(enc, GluMulParams{count, silu}, 2);
       encode_elementwise(enc, count);
     }
@@ -661,6 +763,14 @@ class DecoderMetal final : public Model {
     [enc dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(c_.hidden_size), static_cast<NSUInteger>(n), 1)
         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
     section(enc, "embed", profiling ? traffic::embed(w_->embed, n) : 0.0);
+    if (c_.per_layer_input > 0) {
+      encode_per_layer_inputs(enc, tokens, tokens_offset, n);
+      const int64_t width = static_cast<int64_t>(c_.num_layers) * c_.per_layer_input;
+      section(enc, "per_layer_input",
+              profiling ? traffic::linear(w_->per_layer_model_proj, n) + traffic::embed(w_->embed_per_layer, n) +
+                              traffic::rows(width, n, 2)
+                        : 0.0);
+    }
     encode_rms_norm(enc, x_, layers_[0].attn_norm, h_, n);
     section(enc, "norm", profiling ? traffic::rows(hidden, n, 2) + 4.0 * hidden : 0.0);
 
@@ -673,11 +783,12 @@ class DecoderMetal final : public Model {
       const int layer = static_cast<int>(l);
       encode_qkv(enc, G, n);
       section(enc, "qkv",
-              profiling ? traffic::linear(L.q_proj, n) + traffic::linear(L.k_proj, n) + traffic::linear(L.v_proj, n)
+              profiling ? traffic::linear(L.q_proj, n) + (G.own_kv ? traffic::linear(L.k_proj, n) : 0.0) +
+                              (G.own_kv && !G.k_eq_v ? traffic::linear(L.v_proj, n) : 0.0)
                         : 0.0);
       encode_rope(enc, G, n, start);
       section(enc, "rope_kv",
-              profiling ? traffic::rows(c_.head_dim, n, 2 * c_.num_heads + 4 * c_.num_kv_heads) : 0.0);
+              profiling ? traffic::rows(G.head_dim, n, 2 * c_.num_heads + (G.own_kv ? 4 * G.kv_heads : 0)) : 0.0);
       encode_attention(enc, G, n, start);
       section(enc, "attention", profiling ? traffic::attention(c_, layer, start, n) : 0.0);
       encode_qmm(enc, G.o, attn_, n, r_);
@@ -687,10 +798,22 @@ class DecoderMetal final : public Model {
       encode_mlp(enc, G, n);
       section(enc, "mlp",
               profiling ? traffic::linear(L.gate_proj, n) + traffic::linear(L.up_proj, n) +
-                              traffic::linear(L.down_proj, n) + traffic::rows(c_.intermediate_size, n, 1)
+                              traffic::linear(L.down_proj, n) + traffic::rows(G.inter, n, 1)
                         : 0.0);
       const BufRef* next = l + 1 < layers_.size() ? &layers_[l + 1].attn_norm : &final_norm_;
-      encode_residual_norm(enc, G.mlp_post_norm, next, n);
+      if (c_.per_layer_input > 0) {
+        // x += post_ff_norm(mlp); x += norm(per-layer input); x *= scalar.
+        encode_residual_norm(enc, G.mlp_post_norm, nullptr, n);
+        section(enc, "residual_norm", residual_bytes);
+        encode_per_layer_gate(enc, G, layer, n);
+        section(enc, "per_layer_input",
+                profiling ? traffic::linear(L.per_layer_gate, n) + traffic::linear(L.per_layer_proj, n) +
+                                traffic::rows(c_.per_layer_input, n, 2)
+                          : 0.0);
+        encode_residual_norm(enc, G.pl_norm, next, n, G.scalar);
+      } else {
+        encode_residual_norm(enc, G.mlp_post_norm, next, n, G.scalar);
+      }
       section(enc, "residual_norm", residual_bytes);
     }
     if (!last) return;
@@ -770,15 +893,19 @@ class DecoderMetal final : public Model {
   id<MTLLibrary> library_ = nil;
   std::map<std::string, id<MTLComputePipelineState>> pipelines_;
 
-  GpuLinear embed_, lm_head_;
+  GpuLinear embed_, lm_head_, embed_per_layer_, per_layer_model_proj_;
   bool tied_ = false;
-  BufRef final_norm_, placeholder_, inv_freq_local_buf_, inv_freq_global_buf_;
+  BufRef final_norm_, placeholder_, inv_freq_local_buf_, inv_freq_global_buf_, per_layer_proj_norm_;
+  int max_head_dim_ = 0, max_kv_width_ = 0, max_inter_ = 0;  // the largest over layers
   std::vector<float> inv_freq_local_, inv_freq_global_, placeholder_data_;
   std::vector<GpuLayer> layers_;
   size_t device_weight_bytes_ = 0;
 
   id<MTLBuffer> x_ = nil, h_ = nil, r_ = nil, q_ = nil, kt_ = nil, vt_ = nil, attn_ = nil, gate_ = nil, up_ = nil;
   id<MTLBuffer> part_o_ = nil, part_ml_ = nil;
+  // Gemma 4's per-layer inputs [chunk, layers * P], their two parts, and one
+  // layer's gate [chunk, P].
+  id<MTLBuffer> per_layer_ = nil, per_layer_lookup_ = nil, per_layer_proj_ = nil, per_layer_gate_ = nil;
   id<MTLBuffer> logits_ = nil, token_ = nil, history_ = nil, prompt_ = nil;
   std::vector<id<MTLCommandBuffer>> pending_;
   // The command buffer encode_forward is appending to (sections replace it
@@ -804,9 +931,9 @@ std::string metal_device_name() {
 }
 
 std::unique_ptr<Model> make_decoder_metal(std::shared_ptr<DecoderWeights> weights, const LoadOptions& options) {
-  LK_CHECK(weights->config.uniform_layers(),
-           weights->config.architecture + ": the Metal backend does not implement per-layer geometry, KV sharing or "
-           "per-layer inputs yet; use --backend cpu");
+  LK_CHECK(weights->config.metal_implements(),
+           weights->config.architecture + ": the Metal backend does not implement mixture-of-experts layers or "
+           "attention sinks yet; use --backend cpu");
   return std::make_unique<DecoderMetal>(std::move(weights), options);
 }
 
