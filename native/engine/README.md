@@ -24,7 +24,7 @@ cmake --build build/engine -j
 | Area | State | Evidence |
 |---|---|---|
 | Decoders on CPU: Gemma 3, Gemma 4 (dense; E2B/E4B and 31B layouts), Llama 3.x, Mistral, Qwen 2/2.5, Qwen 3, Qwen 3 MoE, GPT-OSS, GLM-4.5 | Implemented | Correctness: matches the NumPy oracles (`oracles/gemma3.py`, `oracles/gemma4.py`, `oracles/llama.py`) within 2e-4 relative; greedy tokens exact (`tests/test_native_engine.py`). Qwen 3 MoE fixtures cover stacked (MLX) and per-expert (Transformers) weights, renormalized and raw top-k, dense layers between sparse ones, and route far from ties on the router's real inputs. GPT-OSS fixtures mirror the 20B layout (MXFP4 experts behind affine overrides, sinks, alternating windows, untruncated YaRN) and are guarded so the SwiGLU clamps bind and the sinks move the logits; the published 20B config parses to the expected layer map, router and YaRN ramp. GLM-4.5 fixtures cover the Air layout and DeepSeek V3-style group-limited routing, and are guarded so the groups and the correction bias each change some token's experts. Gemma 4 fixtures cover KV sharing of both layer kinds, `attention_k_eq_v`, partial RoPE, per-layer inputs and layer scalars, and every non-equivalent mutation of those features fails the suite. The published E2B config parses to the expected layer map (`tests/engine_tests.cpp`) |
-| Dense decoders on Metal (Gemma 3, Gemma 4 and the dense Llama family) | Implemented; correctness verified on a virtual GPU | Hosted macOS CI runs the Metal suites against the oracles on its paravirtual device (correctness only, no performance claims); hardware runs wait for the self-hosted runner. Gemma 4 covers 512-wide heads, KV sharing, `attention_k_eq_v`, the V norm, partial RoPE, per-layer inputs and layer scalars. Mixture-of-experts models and MXFP4 weights are refused (`--backend auto` picks the CPU) until their kernels land |
+| Decoders on Metal (Gemma 3, Gemma 4, the dense Llama family and Qwen 3 MoE) | Implemented; correctness verified on a virtual GPU | Hosted macOS CI runs the Metal suites against the oracles on its paravirtual device (correctness only, no performance claims); hardware runs wait for the self-hosted runner. Gemma 4 covers 512-wide heads, KV sharing, `attention_k_eq_v`, the V norm, partial RoPE, per-layer inputs and layer scalars. Qwen 3 MoE routes on the GPU (`moe_route`) and runs each token's experts with gathered matrix-vector kernels over stacked expert weights. GPT-OSS, GLM-4.5 and MXFP4 weights are refused (`--backend auto` picks the CPU) until their kernels land |
 | Oracles vs MLX-LM (`gemma3_text`, `gemma4`, `llama`, `qwen2`, `qwen3`, `qwen3_moe`, `gpt_oss`, `glm4_moe`) | Written | Runs on the self-hosted Mac (`tests/test_mlx_crosscheck.py`) |
 | MLX affine 2/4/8-bit weights, BF16/F16 scales, per-module bit overrides | Implemented | Unit tests; MLX cross-check on Apple Silicon |
 | MLX MXFP4 weights (E2M1 codes, E8M0 scale per 32; GPT-OSS's expert format), on CPU | Implemented | Correctness: unit tests against hand-computed rows, the OCP encodings, and oracle parity on MXFP4 MLPs and experts (`tests/test_native_engine.py`); `mx.dequantize` cross-check on Apple Silicon. Per-module overrides follow `mlx.nn.quantize`: keys an override omits take its mode's defaults. Metal refuses MXFP4 for now |
@@ -43,7 +43,7 @@ evidence against a fresh MLX-LM control.
 
 **Model families.** `DecoderConfig` describes how the supported families
 differ. The CPU backend implements every option; the Metal backend
-implements every column but no mixture of experts (or GPT-OSS) yet:
+implements every column (Qwen 3 MoE included) but not yet GPT-OSS or GLM-4.5:
 
 | Option | Gemma 3 | Gemma 4 | Llama 3.x | Mistral | Qwen 2/2.5 | Qwen 3 / Qwen 3 MoE |
 |---|---|---|---|---|---|---|
@@ -165,8 +165,8 @@ reported with its total time, its call count and the minimum memory traffic
 its math requires. Sections follow each backend's own fused work, so the
 names differ:
 
-- **Metal:** embed, norm, qkv, rope_kv, attention, o_proj, residual_norm, mlp,
-  lm_head and sample. Each section is its own command buffer, and its time is
+- **Metal:** embed, norm, qkv, rope_kv, attention, o_proj, residual_norm, mlp
+  (or router and experts), per_layer_input (Gemma 4), lm_head and sample. Each section is its own command buffer, and its time is
   that buffer's GPU time.
 - **CPU:** embed, norm, qkv, rope_kv, attention, o_proj, residual, mlp_up,
   down_proj, router and experts (mixture of experts), per_layer_input
