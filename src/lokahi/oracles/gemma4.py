@@ -26,6 +26,12 @@ checkpoints are converted for:
   embedding, scaled by ``hidden_size ** -0.5``, all times ``2 ** -0.5``. Each
   layer gates it with ``gelu(per_layer_input_gate(x))``, projects it back,
   norms it and adds it;
+* with ``enable_moe_block`` (26B-A4B), a mixture of experts runs beside each
+  dense MLP: ``x += post_ff_norm(post_ff_norm_1(mlp(pre_ff_norm(x))) +
+  post_ff_norm_2(experts(pre_ff_norm_2(x))))``. The router reads
+  ``rms(x) * scale * hidden ** -0.5``, takes the softmax of its top
+  ``top_k_experts`` logits (lower index first on ties) and multiplies each
+  weight by ``per_expert_scale``; the experts are GELU-gated;
 * each layer's output is multiplied by its ``layer_scalar``;
 * the MLP is GeGLU with the tanh GELU, and logits are soft-capped;
 * with images (``logits(..., injected, blocks)``), the image features replace
@@ -69,12 +75,13 @@ class Gemma4Config:
     hidden_size_per_layer_input: int
     final_logit_softcapping: float | None
     bidirectional_vision: bool = False  # use_bidirectional_attention == "vision"
+    num_experts: int = 0  # with enable_moe_block
+    top_k_experts: int = 0
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "Gemma4Config":
         cfg = dict(raw.get("text_config") or raw)
-        if cfg.get("enable_moe_block"):
-            raise NotImplementedError("Gemma 4 MoE blocks")
+        moe = bool(cfg.get("enable_moe_block"))
         layers = int(cfg["num_hidden_layers"])
         types = cfg.get("layer_types")
         if not types:
@@ -103,6 +110,8 @@ class Gemma4Config:
             hidden_size_per_layer_input=int(cfg.get("hidden_size_per_layer_input") or 0),
             final_logit_softcapping=cfg.get("final_logit_softcapping"),
             bidirectional_vision=cfg.get("use_bidirectional_attention") == "vision",
+            num_experts=int(cfg["num_experts"]) if moe else 0,
+            top_k_experts=int(cfg["top_k_experts"]) if moe else 0,
         )
 
     def sliding(self, layer: int) -> bool:
@@ -252,6 +261,34 @@ class Gemma4Reference:
             out[:, head, :] = (probs @ v[:, kv_head, :]).astype(np.float32)
         return out.reshape(n, heads * dim) @ self.w[f"{prefix}.o_proj"].T
 
+    def route(self, index: int, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """The chosen experts ``[n, k]`` and their weights for the layer's input ``x``."""
+
+        cfg = self.config
+        prefix = f"model.layers.{index}.router"
+        routed = _rms(x, cfg.rms_norm_eps) * self.w[f"{prefix}.scale"] * np.float32(cfg.hidden_size**-0.5)
+        logits = (routed @ self.w[f"{prefix}.proj"].T).astype(np.float64)
+        k = cfg.top_k_experts
+        order = np.argsort(-logits, axis=-1, kind="stable")[:, :k]  # ties to the lower index
+        top = np.take_along_axis(logits, order, axis=-1)
+        weights = np.exp(top - top.max(axis=-1, keepdims=True))
+        weights /= weights.sum(axis=-1, keepdims=True)
+        return order, (weights * self.w[f"{prefix}.per_expert_scale"][order]).astype(np.float32)
+
+    def _experts(self, index: int, x: np.ndarray) -> np.ndarray:
+        prefix = f"model.layers.{index}"
+        chosen, weights = self.route(index, x)
+        h = self._norm(f"{prefix}.pre_feedforward_layernorm_2", x)
+        gate = self.w[f"{prefix}.experts.switch_glu.gate_proj"]
+        up = self.w[f"{prefix}.experts.switch_glu.up_proj"]
+        down = self.w[f"{prefix}.experts.switch_glu.down_proj"]
+        out = np.zeros_like(x)
+        for t in range(x.shape[0]):
+            for e, weight in zip(chosen[t], weights[t]):
+                act = _gelu_tanh(gate[e] @ h[t]) * (up[e] @ h[t])
+                out[t] += weight * (down[e] @ act)
+        return out
+
     def logits(self, token_ids: Sequence[int], injected: Mapping[int, np.ndarray] | None = None,
                blocks: Sequence[tuple[int, int]] = ()) -> np.ndarray:
         """Return ``[len(token_ids), vocab]`` float32 logits.
@@ -284,6 +321,9 @@ class Gemma4Reference:
             mlp = (_gelu_tanh(h @ self.w[f"{prefix}.mlp.gate_proj"].T) * (h @ self.w[f"{prefix}.mlp.up_proj"].T)) @ (
                 self.w[f"{prefix}.mlp.down_proj"].T
             )
+            if cfg.num_experts:
+                mlp = self._norm(f"{prefix}.post_feedforward_layernorm_1", mlp) + self._norm(
+                    f"{prefix}.post_feedforward_layernorm_2", self._experts(index, x))
             x = x + self._norm(f"{prefix}.post_feedforward_layernorm", mlp)
             if per_layer is not None:
                 gate = _gelu_tanh(x @ self.w[f"{prefix}.per_layer_input_gate"].T) * per_layer[:, index, :]
