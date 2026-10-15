@@ -349,6 +349,7 @@ class DecoderMetal final : public Model {
       check(w_->per_layer_model_proj);
     }
     LK_CHECK(c_.num_experts <= 256, "metal: at most 256 experts");
+    LK_CHECK(!c_.experts_beside_mlp, "metal: Gemma 4's mixture of experts runs on the CPU only so far; use --backend cpu");
     for (int i = 0; i < c_.num_layers; ++i) {
       const DecoderLayer& L = w_->layers[static_cast<size_t>(i)];
       for (const Linear* l : {&L.q_proj, &L.o_proj}) check(*l);

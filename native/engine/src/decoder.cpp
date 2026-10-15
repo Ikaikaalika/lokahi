@@ -126,7 +126,6 @@ DecoderConfig gemma4_config(const Json& raw) {
   const Json& cfg = text_config(raw);
   DecoderConfig c;
   c.architecture = "gemma4";
-  LK_CHECK(!flag(cfg, "enable_moe_block"), "gemma4: mixture-of-experts blocks are not supported yet");
   LK_CHECK(!flag(cfg, "attention_bias"), "gemma4: attention_bias is not supported");
   LK_CHECK(!flag(cfg, "use_bidirectional_attention"), "gemma4: bidirectional attention is not supported");
   // "vision": image tokens see each other on sliding layers only
@@ -210,6 +209,21 @@ DecoderConfig gemma4_config(const Json& raw) {
     }
     c.layer_kv_source.push_back(source);
     c.layer_intermediate.push_back(c.intermediate_size * (double_wide && source != i ? 2 : 1));
+  }
+  // 26B-A4B: experts beside every dense MLP, routed by the softmax of the
+  // top-k logits (Transformers' renormalized top-k of a full softmax).
+  if (flag(cfg, "enable_moe_block")) {
+    c.num_experts = static_cast<int>(cfg.at("num_experts").as_int());
+    c.experts_per_token = static_cast<int>(cfg.at("top_k_experts").as_int());
+    const Json* moe = cfg.find("moe_intermediate_size");
+    c.moe_intermediate = static_cast<int>(moe != nullptr && moe->is_number() ? moe->as_int()
+                                                                              : cfg.at("expert_intermediate_size").as_int());
+    LK_CHECK(c.num_experts > 0 && c.experts_per_token > 0 && c.experts_per_token <= c.num_experts && c.moe_intermediate > 0,
+             "gemma4: invalid mixture-of-experts sizes");
+    c.router = DecoderConfig::Router::TopKSoftmax;
+    c.router_module = "router.proj";
+    c.experts_beside_mlp = true;
+    c.layer_moe.assign(static_cast<size_t>(c.num_layers), true);
   }
   c.per_layer_input = static_cast<int>(cfg.int_or("hidden_size_per_layer_input", 0));
   c.per_layer_embed_scale = bf16_round(std::sqrt(static_cast<float>(c.per_layer_input)));
@@ -514,10 +528,12 @@ void bind_experts(const DecoderWeights& w, DecoderLayer& layer, const std::strin
   std::vector<float>* biases[] = {&layer.expert_gate_bias, &layer.expert_up_bias, &layer.expert_down_bias};
   const char* names[] = {"gate_proj", "up_proj", "down_proj"};
   for (int k = 0; k < 3; ++k) {
-    // Stacked [experts, rows, cols]: MLX-LM's switch_mlp (Qwen) or experts
-    // (GPT-OSS); otherwise one module per expert.
+    // Stacked [experts, rows, cols]: MLX-LM's switch_mlp (Qwen), experts
+    // (GPT-OSS) or MLX-VLM's experts.switch_glu (Gemma 4); otherwise one
+    // module per expert.
     std::string stacked = p + base + ".mlp.switch_mlp." + names[k];
     if (!ck.contains(stacked + ".weight")) stacked = p + base + ".mlp.experts." + names[k];
+    if (!ck.contains(stacked + ".weight")) stacked = p + base + ".experts.switch_glu." + names[k];
     const bool is_stacked = ck.contains(stacked + ".weight");
     if (is_stacked) {
       *stacks[k] = bind_expert_linears(ck, w.raw_config, stacked, stacked);
@@ -663,9 +679,19 @@ std::shared_ptr<DecoderWeights> DecoderWeights::load(const std::string& director
     layer.o_proj = linear(base + ".self_attn.o_proj");
     LK_CHECK(layer.q_proj.rows == q_out && layer.q_proj.cols == c.hidden_size, base + ": q_proj shape");
     LK_CHECK(layer.o_proj.rows == c.hidden_size && layer.o_proj.cols == q_out, base + ": o_proj shape");
-    if (c.is_moe(i)) {
-      bind_experts(*w, layer, base);
-    } else {
+    if (c.is_moe(i)) bind_experts(*w, layer, base);
+    if (c.is_moe(i) && c.experts_beside_mlp) {
+      layer.mlp_post_norm_1 = vec(base + ".post_feedforward_layernorm_1", c.hidden_size);
+      layer.expert_norm = vec(base + ".pre_feedforward_layernorm_2", c.hidden_size);
+      layer.expert_post_norm = vec(base + ".post_feedforward_layernorm_2", c.hidden_size);
+      layer.router_input_scale.resize(static_cast<size_t>(c.hidden_size));
+      load_vector(ck, p + base + ".router.scale", c.hidden_size, layer.router_input_scale.data());
+      const float root = 1.0f / std::sqrt(static_cast<float>(c.hidden_size));
+      for (float& scale : layer.router_input_scale) scale *= root;
+      layer.per_expert_scale.resize(static_cast<size_t>(c.num_experts));
+      load_vector(ck, p + base + ".router.per_expert_scale", c.num_experts, layer.per_expert_scale.data());
+    }
+    if (!c.is_moe(i) || c.experts_beside_mlp) {
       layer.gate_proj = linear(base + ".mlp.gate_proj");
       layer.up_proj = linear(base + ".mlp.up_proj");
       layer.down_proj = linear(base + ".mlp.down_proj");
@@ -1078,8 +1104,8 @@ class DecoderCpu final : public Model {
         Section section(profiler_, "norm", norm_bytes);
         for (int t = 0; t < n; ++t) norm(x_.data() + t * hidden, L.mlp_norm, hidden, h_.data() + t * hidden);
       }
-      if (c_.is_moe(l)) {
-        experts(L, n);
+      if (c_.is_moe(l) && !c_.experts_beside_mlp) {
+        experts(L, n, h_.data(), h_.data());
       } else {
         {
           Section section(profiler_, "mlp_up",
@@ -1093,6 +1119,7 @@ class DecoderCpu final : public Model {
         Section section(profiler_, "down_proj", profiling ? traffic::linear(L.down_proj, n) : 0.0);
         matmul(L.down_proj, gate_.data(), n, r_.data(), pool_);
       }
+      if (c_.is_moe(l) && c_.experts_beside_mlp) experts_beside_mlp(L, n);
       {
         Section section(profiler_, "residual", residual_bytes);
         add_residual(n, L.mlp_post_norm);
@@ -1190,7 +1217,36 @@ class DecoderCpu final : public Model {
   // (softmax over all experts, renormalized with norm_topk_prob, or a softmax
   // over the chosen logits). Experts run once per pass over the tokens routed
   // to them.
-  void experts(const DecoderLayer& L, int n) {
+  // Gemma 4's experts beside the dense MLP, whose output is in r_: r_ becomes
+  // mlp_post_norm_1(r_) + expert_post_norm(experts(expert_norm(x))), routed
+  // on rms(x) * router_input_scale.
+  void experts_beside_mlp(const DecoderLayer& L, int n) {
+    const int64_t hidden = c_.hidden_size;
+    const size_t sn = static_cast<size_t>(n);
+    dense_out_.resize(sn * hidden);
+    router_in_.resize(sn * hidden);
+    {
+      Section section(profiler_, "norm", profiler_ ? traffic::rows(hidden, n, 6) + 12.0 * hidden : 0.0);
+      for (int t = 0; t < n; ++t) {
+        const size_t row = static_cast<size_t>(t) * hidden;
+        norm(r_.data() + row, L.mlp_post_norm_1, hidden, dense_out_.data() + row);
+        norm(x_.data() + row, L.router_input_scale, hidden, router_in_.data() + row);
+        norm(x_.data() + row, L.expert_norm, hidden, h_.data() + row);
+      }
+    }
+    experts(L, n, router_in_.data(), h_.data());
+    Section section(profiler_, "norm", profiler_ ? traffic::rows(hidden, n, 3) + 4.0 * hidden : 0.0);
+    for (int t = 0; t < n; ++t) {
+      float* row = r_.data() + static_cast<size_t>(t) * hidden;
+      norm(row, L.expert_post_norm, hidden, row);
+      const float* dense = dense_out_.data() + static_cast<size_t>(t) * hidden;
+      for (int64_t i = 0; i < hidden; ++i) row[i] += dense[i];
+    }
+  }
+
+  // The layer's experts into r_: routed on `router_in` rows, run on
+  // `expert_in` rows (both [n, hidden]; the shared expert, if any, too).
+  void experts(const DecoderLayer& L, int n, const float* router_in, const float* expert_in) {
     const int E = c_.num_experts, K = c_.experts_per_token;
     const int64_t hidden = c_.hidden_size, inter = c_.moe_intermediate;
     const size_t sn = static_cast<size_t>(n);
@@ -1199,7 +1255,7 @@ class DecoderCpu final : public Model {
     weight_.resize(sn * K);
     {
       Section section(profiler_, "router", profiler_ ? traffic::linear(L.router, n) : 0.0);
-      matmul(L.router, h_.data(), n, route_.data(), pool_);
+      matmul(L.router, router_in, n, route_.data(), pool_);
       std::vector<int> order(static_cast<size_t>(E));
       std::vector<double> probs(static_cast<size_t>(E));
       for (int t = 0; t < n; ++t) {
@@ -1227,7 +1283,9 @@ class DecoderCpu final : public Model {
         for (int j = 0; j < K; ++j) {
           const int e = order[static_cast<size_t>(j)];
           chosen_[static_cast<size_t>(t) * K + j] = e;
-          weight_[static_cast<size_t>(t) * K + j] = static_cast<float>(probs[static_cast<size_t>(e)] * scale);
+          float weight = static_cast<float>(probs[static_cast<size_t>(e)] * scale);
+          if (!L.per_expert_scale.empty()) weight *= L.per_expert_scale[static_cast<size_t>(e)];
+          weight_[static_cast<size_t>(t) * K + j] = weight;
         }
       }
     }
@@ -1259,8 +1317,8 @@ class DecoderCpu final : public Model {
     if (c_.shared_intermediate > 0) {  // the shared expert sees every token
       expert_gate_.resize(sn * c_.shared_intermediate);
       expert_up_.resize(sn * c_.shared_intermediate);
-      matmul(L.shared_gate, h_.data(), n, expert_gate_.data(), pool_);
-      matmul(L.shared_up, h_.data(), n, expert_up_.data(), pool_);
+      matmul(L.shared_gate, expert_in, n, expert_gate_.data(), pool_);
+      matmul(L.shared_up, expert_in, n, expert_up_.data(), pool_);
       gated_activation(expert_gate_.data(), expert_up_.data(), sn * c_.shared_intermediate);
       matmul(L.shared_down, expert_gate_.data(), n, r_.data(), pool_);
     }
@@ -1274,7 +1332,7 @@ class DecoderCpu final : public Model {
       expert_up_.resize(sm * inter);
       expert_out_.resize(sm * hidden);
       for (int i = 0; i < m; ++i) {
-        std::copy_n(h_.data() + static_cast<size_t>(tokens[static_cast<size_t>(i)].first) * hidden, hidden,
+        std::copy_n(expert_in + static_cast<size_t>(tokens[static_cast<size_t>(i)].first) * hidden, hidden,
                     expert_in_.data() + static_cast<size_t>(i) * hidden);
       }
       matmul(L.expert_gate[static_cast<size_t>(e)], expert_in_.data(), m, expert_gate_.data(), pool_);
@@ -1386,6 +1444,7 @@ class DecoderCpu final : public Model {
   // Mixture of experts: router logits [n, E], each token's experts and
   // weights [n, K], and one expert's gathered inputs and activations.
   std::vector<float> route_, weight_, expert_in_, expert_gate_, expert_up_, expert_out_;
+  std::vector<float> dense_out_, router_in_;  // Gemma 4: the dense branch's output, the router's input
   std::vector<int> chosen_;
 };
 

@@ -143,12 +143,23 @@ GEMMA4_VARIANTS = {
     ),
     # Shared sliding and full layers over k_eq_v sources, single-width MLPs,
     # no soft-cap.
+    # 26B-A4B: a mixture of experts beside every dense MLP (defined with its
+    # fixture guard below).
+    "gemma4-26b-a4b-moe": None,
     "gemma4-shared-both-kinds": TinyGemma4Spec(
         num_hidden_layers=8, sliding_window_pattern=4, num_kv_shared_layers=3, use_double_wide_mlp=False,
         final_logit_softcapping=None, attention_k_eq_v=True, num_key_value_heads=2, num_global_key_value_heads=1,
         seed=8,
     ),
 }
+# Gemma 4 26B-A4B's layout: 31B's attention plus a mixture of experts beside
+# every dense MLP; untied so greedy continuations discriminate.
+GEMMA4_MOE = TinyGemma4Spec(
+    num_key_value_heads=2, num_global_key_value_heads=1, attention_k_eq_v=True, num_kv_shared_layers=0,
+    hidden_size_per_layer_input=0, use_double_wide_mlp=False, enable_moe_block=True, tie_word_embeddings=False,
+    seed=41,
+)
+GEMMA4_VARIANTS["gemma4-26b-a4b-moe"] = GEMMA4_MOE
 VARIANTS = sorted(GEMMA3_VARIANTS) + sorted(GEMMA4_VARIANTS) + sorted(DENSE_VARIANTS)
 
 
@@ -178,6 +189,8 @@ def _dense_mxfp4(config: dict) -> bool:
 
 def _skip_unsupported(directory: Path, backend: str) -> None:
     config = json.loads((directory / "config.json").read_text())
+    if backend == "metal" and (config.get("text_config") or config).get("enable_moe_block"):
+        pytest.skip("the Metal backend runs Gemma 4's mixture of experts in a later commit")
     if backend == "metal" and (config.get("text_config") or config)["model_type"] in CPU_ONLY:
         pytest.skip("the Metal backend does not implement this architecture yet")
     if backend == "metal" and _dense_mxfp4(config):
@@ -387,7 +400,8 @@ def test_gemma4_fixtures_exercise_every_feature(tmp_path):
 @pytest.mark.parametrize(
     ("change", "message"),
     [
-        ({"enable_moe_block": True}, "gemma4: mixture-of-experts blocks are not supported yet"),
+        ({"enable_moe_block": True, "num_experts": 8, "top_k_experts": 9, "moe_intermediate_size": 64},
+         "gemma4: invalid mixture-of-experts sizes"),
         ({"num_kv_shared_layers": 4}, "gemma4: a shared layer has no earlier layer of its kind"),
         ({"rope_parameters": {"full_attention": {"rope_type": "yarn", "factor": 4.0}}},
          "gemma4: full rope_type 'yarn' is not supported"),
@@ -399,6 +413,17 @@ def test_gemma4_fixtures_exercise_every_feature(tmp_path):
 def test_unsupported_gemma4_configurations_fail_closed(native_cli, tmp_path, change, message):
     directory = write_tiny_gemma4(tmp_path / "model", TinyGemma4Spec(extra=change))
     assert message in _load_error(native_cli, directory)
+
+
+def test_gemma4_moe_without_its_router_scales_fails_closed(native_cli, tmp_path):
+    directory = write_tiny_gemma4(tmp_path / "model", GEMMA4_MOE)
+    path = directory / "model.safetensors"
+    tensors, metadata = read_safetensors(path)
+    del tensors["language_model.model.layers.2.router.per_expert_scale"]
+    from lokahi.formats.safetensors import write_safetensors
+
+    write_safetensors(path, tensors, metadata=metadata)
+    assert "layers.2.router.per_expert_scale" in _load_error(native_cli, directory)
 
 
 def test_gemma4_missing_layer_scalar_fails_closed(native_cli, tmp_path):
@@ -450,15 +475,6 @@ def test_unsupported_quantization_fails_closed(native_cli, tmp_path, override, m
     config["quantization"]["model.layers.0.mlp.up_proj"] = override
     (directory / "config.json").write_text(json.dumps(config))
     assert message in _load_error(native_cli, directory)
-
-
-# Gemma 4 26B-A4B's layout: 31B's attention plus a mixture of experts beside
-# every dense MLP; untied so greedy continuations discriminate.
-GEMMA4_MOE = TinyGemma4Spec(
-    num_key_value_heads=2, num_global_key_value_heads=1, attention_k_eq_v=True, num_kv_shared_layers=0,
-    hidden_size_per_layer_input=0, use_double_wide_mlp=False, enable_moe_block=True, tie_word_embeddings=False,
-    seed=41,
-)
 
 
 def test_gemma4_moe_fixture_routes_far_from_ties_and_every_part_matters(tmp_path):

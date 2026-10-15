@@ -123,6 +123,13 @@ struct DecoderConfig {
   bool router_bias = false;
   bool expert_bias = false;     // biases on every expert projection
   float swiglu_limit = 7.0f;    // ClampedSwiglu
+  // Gemma 4 (26B-A4B): the experts run beside the layer's dense MLP instead
+  // of replacing it. The router reads rms(x) * router_input_scale of the
+  // layer's residual input x, the experts read expert_norm(x), each branch
+  // is post-normed (mlp_post_norm_1, expert_post_norm) and their sum goes
+  // through the usual post-feedforward norm. Each routing weight is also
+  // multiplied by its expert's per_expert_scale.
+  bool experts_beside_mlp = false;
 
   static DecoderConfig from_json(const Json& raw);
   // RoPE inverse frequencies (half the layer kind's head size); rotations a
@@ -157,6 +164,9 @@ struct DecoderLayer {
   std::vector<Linear> expert_gate, expert_up, expert_down;
   std::vector<float> router_bias, expert_gate_bias, expert_up_bias, expert_down_bias;
   std::vector<float> router_correction;          // SigmoidGrouped's selection bias
+  // With experts_beside_mlp: router.scale times hidden^-0.5, the per-expert
+  // weight scales, and the extra norms.
+  std::vector<float> router_input_scale, per_expert_scale, mlp_post_norm_1, expert_norm, expert_post_norm;
   Linear shared_gate, shared_up, shared_down;    // the shared expert, with shared_intermediate
   // Per-layer inputs (Gemma 4): gate [P, hidden], projection [hidden, P].
   Linear per_layer_gate, per_layer_proj;
