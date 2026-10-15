@@ -2,8 +2,10 @@
 // family).
 //
 // Activations are float32. Linear weights are MLX affine-quantized codes with
-// BF16 or F16 per-group scales and biases. Quantization parameters are
-// function constants so each pipeline is specialized at load time.
+// BF16 or F16 per-group scales and biases, or (in the matrix-vector kernels)
+// MXFP4: E2M1 codes with one E8M0 exponent per 32 values. Quantization
+// parameters are function constants so each pipeline is specialized at load
+// time.
 #include <metal_stdlib>
 #include <metal_simdgroup_matrix>
 using namespace metal;
@@ -11,6 +13,21 @@ using namespace metal;
 constant int QBITS [[function_constant(0)]];
 constant int QGROUP [[function_constant(1)]];
 constant bool QSCALE_BF16 [[function_constant(2)]];
+constant bool QMXFP4 [[function_constant(3)]];
+
+// E2M1 values by code, in MLX's order, and an E8M0 exponent as MLX decodes it.
+constant float kFp4[16] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+                           -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+inline float e8m0(uchar e) { return as_type<float>(e == 0 ? 0x00400000u : uint(e) << 23); }
+
+// Dot product of 16 consecutive E2M1 codes with x.
+inline float fp4dot16(const device uint* w, thread const float* x) {
+  const uint2 ww = *reinterpret_cast<const device uint2*>(w);
+  float acc = 0.0f;
+  for (int j = 0; j < 8; ++j) acc += kFp4[(ww.x >> (4 * j)) & 0xFu] * x[j];
+  for (int j = 0; j < 8; ++j) acc += kFp4[(ww.y >> (4 * j)) & 0xFu] * x[8 + j];
+  return acc;
+}
 
 inline float scale_at(const device ushort* values, int index) {
   ushort bits = values[index];
@@ -45,9 +62,14 @@ inline float gelu_tanh(float x) {
 
 inline float silu(float x) { return x / (1.0f + precise::exp(-x)); }
 
-// The gated MLP's activation: SiLU when `use_silu`, else tanh GELU.
-inline float glu(float gate, float up, int use_silu) {
-  return (use_silu != 0 ? silu(gate) : gelu_tanh(gate)) * up;
+// The gated MLP's activation: act 1 is SiLU, 0 tanh GELU, 2 GPT-OSS's
+// clamped SwiGLU min(g, L) * sigmoid(1.702 * min(g, L)) * (clip(u, -L, L) + 1).
+inline float glu(float gate, float up, int act, float limit = 7.0f) {
+  if (act == 2) {
+    const float g = min(gate, limit);
+    return g / (1.0f + precise::exp(-1.702f * g)) * (clamp(up, -limit, limit) + 1.0f);
+  }
+  return (act != 0 ? silu(gate) : gelu_tanh(gate)) * up;
 }
 
 // Threadgroup-wide sum. `scratch` holds one float per simdgroup.
@@ -203,9 +225,20 @@ inline void qmv_accumulate(const device uint* w, const device ushort* scales,
       xv[4 * j + 2] = v.z;
       xv[4 * j + 3] = v.w;
     }
+    const int g = k0 / QGROUP;
+    if (QMXFP4) {  // no biases; one exponent byte per group
+      const device uchar* exponents = reinterpret_cast<const device uchar*>(scales);
+      for (int r = 0; r < QMV_ROWS; ++r) {
+        const int row = row0 + r;
+        if (row < rows) {
+          const device uint* wr = w + row * words_per_row + k0 * QBITS / 32;
+          acc[r] += e8m0(exponents[row * groups_per_row + g]) * fp4dot16(wr, xv);
+        }
+      }
+      continue;
+    }
     float xsum = 0.0f;
     for (int j = 0; j < 16; ++j) xsum += xv[j];
-    const int g = k0 / QGROUP;
     for (int r = 0; r < QMV_ROWS; ++r) {
       const int row = row0 + r;
       if (row < rows) {
@@ -329,16 +362,22 @@ struct MoeRouteParams {
   int k;
   int topk_softmax;   // 1: softmax over the chosen logits; 0: softmax over all experts
   int norm_topk;      // with softmax over all experts, renormalize over the chosen
+  int has_bias;       // add the router bias first (GPT-OSS)
 };
 
 // One simdgroup per token. Ties go to the lower expert index.
-kernel void moe_route(const device float* logits [[buffer(0)]],
+kernel void moe_route(device float* logits [[buffer(0)]],
                       device int* chosen [[buffer(1)]],
                       device float* weights [[buffer(2)]],
                       constant MoeRouteParams& p [[buffer(3)]],
+                      const device float* bias [[buffer(4)]],
                       uint t [[threadgroup_position_in_grid]],
                       uint lane [[thread_index_in_simdgroup]]) {
-  const device float* l = logits + int(t) * p.experts;
+  device float* l = logits + int(t) * p.experts;
+  if (p.has_bias != 0) {
+    for (int e = int(lane); e < p.experts; e += 32) l[e] += bias[e];
+    simdgroup_barrier(mem_flags::mem_device);
+  }
   float top = -INFINITY;
   for (int e = int(lane); e < p.experts; e += 32) top = max(top, l[e]);
   top = simd_max(top);
@@ -359,7 +398,8 @@ kernel void moe_route(const device float* logits [[buffer(0)]],
       }
     }
     const float winner = simd_max(best);
-    const int e = simd_min(best == winner ? index : (1 << 30));
+    // NaN logits would leave no winner; never hand an out-of-range expert on.
+    const int e = min(simd_min(best == winner ? index : (1 << 30)), p.experts - 1);
     taken[e >> 5] |= 1u << (e & 31);
     const float weight = exp(l[e] - top);
     kept += weight;
@@ -374,12 +414,21 @@ kernel void moe_route(const device float* logits [[buffer(0)]],
   }
 }
 
+// Expert e's scales in a stacked tensor: MXFP4 exponents are bytes, affine
+// scales and biases two-byte values.
+inline const device ushort* expert_scales(const device ushort* scales, int e, int groups) {
+  if (QMXFP4) return reinterpret_cast<const device ushort*>(reinterpret_cast<const device uchar*>(scales) + e * groups);
+  return scales + e * groups;
+}
+
 struct GatherParams {
   int rows;
   int cols;
   int k;            // slots per token
   int input_rows;   // 1: input row t = pair / k; 0: input row = pair
-  int silu;
+  int act;          // glu's activation (gate and up kernel)
+  int has_bias;     // per-expert output biases [experts, rows]
+  float limit;      // the clamped SwiGLU's limit
 };
 
 // y[pair, :] = act(gate_e(x)) * up_e(x) with e = chosen[pair].
@@ -393,6 +442,8 @@ kernel void qmv_gather_glu(const device uint* wg [[buffer(0)]],
                            device float* y [[buffer(7)]],
                            constant GatherParams& p [[buffer(8)]],
                            const device int* chosen [[buffer(9)]],
+                           const device float* gate_bias [[buffer(10)]],
+                           const device float* up_bias [[buffer(11)]],
                            uint2 tg [[threadgroup_position_in_grid]],
                            uint sg [[simdgroup_index_in_threadgroup]],
                            uint lane [[thread_index_in_simdgroup]]) {
@@ -404,12 +455,20 @@ kernel void qmv_gather_glu(const device uint* wg [[buffer(0)]],
   const device float* xr = x + (p.input_rows != 0 ? pair / p.k : pair) * p.cols;
   float gate[QMV_ROWS] = {0.0f, 0.0f, 0.0f, 0.0f};
   float up[QMV_ROWS] = {0.0f, 0.0f, 0.0f, 0.0f};
-  qmv_accumulate(wg + e * words, sg_scales + e * groups, bg + e * groups, xr, row0, p.rows, p.cols, lane, gate);
-  qmv_accumulate(wu + e * words, su + e * groups, bu + e * groups, xr, row0, p.rows, p.cols, lane, up);
+  qmv_accumulate(wg + e * words, expert_scales(sg_scales, e, groups), bg + e * groups, xr, row0, p.rows, p.cols, lane,
+                 gate);
+  qmv_accumulate(wu + e * words, expert_scales(su, e, groups), bu + e * groups, xr, row0, p.rows, p.cols, lane, up);
   for (int r = 0; r < QMV_ROWS; ++r) {
-    const float g = simd_sum(gate[r]);
-    const float u = simd_sum(up[r]);
-    if (lane == 0 && row0 + r < p.rows) y[pair * p.rows + row0 + r] = glu(g, u, p.silu);
+    float g = simd_sum(gate[r]);
+    float u = simd_sum(up[r]);
+    const int row = row0 + r;
+    if (lane == 0 && row < p.rows) {
+      if (p.has_bias != 0) {
+        g += gate_bias[e * p.rows + row];
+        u += up_bias[e * p.rows + row];
+      }
+      y[pair * p.rows + row] = glu(g, u, p.act, p.limit);
+    }
   }
 }
 
@@ -421,6 +480,7 @@ kernel void qmv_gather(const device uint* w [[buffer(0)]],
                        device float* y [[buffer(4)]],
                        constant GatherParams& p [[buffer(5)]],
                        const device int* chosen [[buffer(6)]],
+                       const device float* out_bias [[buffer(7)]],
                        uint2 tg [[threadgroup_position_in_grid]],
                        uint sg [[simdgroup_index_in_threadgroup]],
                        uint lane [[thread_index_in_simdgroup]]) {
@@ -431,11 +491,26 @@ kernel void qmv_gather(const device uint* w [[buffer(0)]],
   const int words = p.rows * (p.cols * QBITS / 32), groups = p.rows * (p.cols / QGROUP);
   const device float* xr = x + (p.input_rows != 0 ? pair / p.k : pair) * p.cols;
   float acc[QMV_ROWS] = {0.0f, 0.0f, 0.0f, 0.0f};
-  qmv_accumulate(w + e * words, scales + e * groups, biases + e * groups, xr, row0, p.rows, p.cols, lane, acc);
+  qmv_accumulate(w + e * words, expert_scales(scales, e, groups), biases + e * groups, xr, row0, p.rows, p.cols, lane,
+                 acc);
   for (int r = 0; r < QMV_ROWS; ++r) {
     const float total = simd_sum(acc[r]);
-    if (lane == 0 && row0 + r < p.rows) y[pair * p.rows + row0 + r] = total;
+    const int row = row0 + r;
+    if (lane == 0 && row < p.rows) y[pair * p.rows + row] = total + (p.has_bias != 0 ? out_bias[e * p.rows + row] : 0.0f);
   }
+}
+
+struct BiasParams {
+  int cols;
+  int count;  // n_rows * cols
+};
+
+// rows[t, :] += bias (GPT-OSS's attention output bias).
+kernel void add_bias_rows(device float* rows [[buffer(0)]],
+                          const device float* bias [[buffer(1)]],
+                          constant BiasParams& p [[buffer(2)]],
+                          uint gid [[thread_position_in_grid]]) {
+  if (int(gid) < p.count) rows[gid] += bias[int(gid) % p.cols];
 }
 
 struct MoeCombineParams {
@@ -895,6 +970,7 @@ struct ReduceParams {
   int heads;
   int head_dim;
   int n_blocks;
+  int has_sinks;  // one more logit per head that attends to nothing (GPT-OSS)
 };
 
 // Grid: threadgroups (heads, n_tokens), head_dim threads each.
@@ -902,18 +978,19 @@ kernel void attn_reduce(const device float* part_o [[buffer(0)]],
                         const device float* part_ml [[buffer(1)]],
                         device float* out [[buffer(2)]],
                         constant ReduceParams& p [[buffer(3)]],
+                        const device float* sinks [[buffer(4)]],
                         uint2 tgp [[threadgroup_position_in_grid]],
                         uint2 tid2 [[thread_position_in_threadgroup]]) {
   const uint d = tid2.x;
   const int head = int(tgp.x);
   const int t = int(tgp.y);
   const int base = (t * p.heads + head) * p.n_blocks;
-  float m_max = -INFINITY;
+  float m_max = p.has_sinks != 0 ? sinks[head] : -INFINITY;
   for (int b = 0; b < p.n_blocks; ++b) {
     if (part_ml[2 * (base + b) + 1] > 0.0f) m_max = max(m_max, part_ml[2 * (base + b)]);
   }
   float numer = 0.0f;
-  float denom = 0.0f;
+  float denom = p.has_sinks != 0 ? exp(sinks[head] - m_max) : 0.0f;
   for (int b = 0; b < p.n_blocks; ++b) {
     const float l = part_ml[2 * (base + b) + 1];
     if (l == 0.0f) continue;

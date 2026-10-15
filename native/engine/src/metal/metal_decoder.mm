@@ -51,9 +51,11 @@ struct GpuLinear {
   int bits = 0;
   int group = 0;
   bool bf16 = true;
+  bool mxfp4 = false;  // scales hold E8M0 exponents; no biases
 
   bool same_format(const GpuLinear& other) const {
-    return bits == other.bits && group == other.group && bf16 == other.bf16 && cols == other.cols;
+    return bits == other.bits && group == other.group && bf16 == other.bf16 && cols == other.cols &&
+           mxfp4 == other.mxfp4;
   }
 };
 
@@ -61,7 +63,8 @@ struct GpuLinear {
 struct GpuExperts {
   BufRef words, scales, biases;
   int rows = 0, cols = 0, bits = 0, group = 0;
-  bool bf16 = true;
+  bool bf16 = true, mxfp4 = false;
+  BufRef bias;  // [experts, rows] (GPT-OSS), or the placeholder
   GpuLinear format() const {
     GpuLinear l;
     l.rows = rows;
@@ -69,6 +72,7 @@ struct GpuExperts {
     l.bits = bits;
     l.group = group;
     l.bf16 = bf16;
+    l.mxfp4 = mxfp4;
     return l;
   }
 };
@@ -78,6 +82,7 @@ struct GpuLayer {
   GpuLinear router;                          // mixture-of-experts layers
   GpuExperts expert_gate, expert_up, expert_down;
   bool moe = false;
+  BufRef o_bias, sinks, router_bias;          // GPT-OSS, or the placeholder
   GpuLinear pl_gate, pl_proj;  // Gemma 4's per-layer input gate and projection
   // Norms and biases a family does not have are bound to a placeholder and
   // never read.
@@ -162,14 +167,15 @@ struct RopeParams {
 };
 struct PerLayerCombineParams { int size; int layers; float eps; float offset; float proj_scale; float input_scale; };
 struct PerLayerGateParams { int size; int layers; int layer; int count; };
-struct MoeRouteParams { int experts; int k; int topk_softmax; int norm_topk; };
-struct GatherParams { int rows; int cols; int k; int input_rows; int silu; };
+struct MoeRouteParams { int experts; int k; int topk_softmax; int norm_topk; int has_bias; };
+struct GatherParams { int rows; int cols; int k; int input_rows; int act; int has_bias; float limit; };
 struct MoeCombineParams { int cols; int k; int count; };
 struct AttnParams {
   int heads; int kv_heads; int head_dim; int start_pos; int window; int capacity; int block; int n_blocks;
   float scale; float softcap;
 };
-struct ReduceParams { int heads; int head_dim; int n_blocks; };
+struct ReduceParams { int heads; int head_dim; int n_blocks; int has_sinks; };
+struct BiasParams { int cols; int count; };
 struct ArgmaxParams { int vocab; int history_index; };
 struct SampleParams {
   int vocab;
@@ -305,12 +311,17 @@ class DecoderMetal final : public Model {
   // ---- setup --------------------------------------------------------------
 
   void validate() const {
-    auto check = [&](const Linear& l) {
+    // Experts run only through the matrix-vector kernels, which also read
+    // MXFP4; other matrices must be affine.
+    auto check_any = [&](const Linear& l) {
       LK_CHECK(l.quant.quantized(), "metal: " + l.name + " is not quantized; use --backend cpu");
-      LK_CHECK(!l.quant.mxfp4(), "metal: " + l.name + " is mxfp4, which the Metal kernels do not implement yet; "
-               "use --backend cpu");
       LK_CHECK(l.cols % 32 == 0 && l.quant.group_size % 32 == 0,
                "metal: " + l.name + " needs cols and group_size divisible by 32");
+    };
+    auto check = [&](const Linear& l) {
+      check_any(l);
+      LK_CHECK(!l.quant.mxfp4(), "metal: " + l.name + " is mxfp4, which the Metal kernels implement only for "
+               "experts so far; use --backend cpu");
     };
     check(w_->embed);
     check(w_->lm_head);
@@ -325,11 +336,11 @@ class DecoderMetal final : public Model {
       if (c_.is_moe(i)) {
         check(L.router);
         for (const auto* experts : {&L.expert_gate, &L.expert_up, &L.expert_down}) {
-          for (const Linear& e : *experts) check(e);
+          for (const Linear& e : *experts) check_any(e);
         }
         const Linear &g = L.expert_gate[0], &u = L.expert_up[0];
         LK_CHECK(g.quant.bits == u.quant.bits && g.quant.group_size == u.quant.group_size &&
-                     g.scale_dtype == u.scale_dtype,
+                     g.quant.mode == u.quant.mode && g.scale_dtype == u.scale_dtype,
                  "metal: expert gate and up projections must share a format");
       } else {
         for (const Linear* l : {&L.gate_proj, &L.up_proj, &L.down_proj}) check(*l);
@@ -371,15 +382,18 @@ class DecoderMetal final : public Model {
     target->bits = first.quant.bits;
     target->group = first.quant.group_size;
     target->bf16 = first.scale_dtype == DType::BF16;
+    target->mxfp4 = first.quant.mxfp4();
     const size_t words = static_cast<size_t>(first.rows * first.words_per_row()) * 4;
-    const size_t scales = static_cast<size_t>(first.rows * first.groups_per_row()) * 2;
+    // MXFP4 groups carry one exponent byte and no biases (a 4-byte stand-in).
+    const size_t scales = static_cast<size_t>(first.rows * first.groups_per_row()) * (target->mxfp4 ? 1 : 2);
     std::array<size_t, 3> ids{};
-    const std::array<size_t, 3> sizes = {words, scales, scales};
+    const std::array<size_t, 3> sizes = {words, scales, target->mxfp4 ? 0 : scales};
     for (int part = 0; part < 3; ++part) {
-      std::vector<uint8_t>& stage = staged_.emplace_back(sizes[part] * experts.size());
-      for (size_t e = 0; e < experts.size(); ++e) {
-        const void* source = part == 0 ? static_cast<const void*>(experts[e].words)
-                             : part == 1 ? static_cast<const void*>(experts[e].scales)
+      std::vector<uint8_t>& stage = staged_.emplace_back(std::max<size_t>(4, sizes[part] * experts.size()));
+      for (size_t e = 0; e < experts.size() && sizes[part] > 0; ++e) {
+        const void* source = part == 0   ? static_cast<const void*>(experts[e].words)
+                             : part == 1 ? (target->mxfp4 ? static_cast<const void*>(experts[e].exponents)
+                                                          : static_cast<const void*>(experts[e].scales))
                                          : static_cast<const void*>(experts[e].biases);
         std::memcpy(stage.data() + e * sizes[part], source, sizes[part]);
       }
@@ -451,6 +465,12 @@ class DecoderMetal final : public Model {
         add_experts(arena, L.expert_up, &G.expert_up);
         add_experts(arena, L.expert_down, &G.expert_down);
       }
+      add_optional(L.router_bias, &G.router_bias);
+      add_optional(L.expert_gate_bias, &G.expert_gate.bias);
+      add_optional(L.expert_up_bias, &G.expert_up.bias);
+      add_optional(L.expert_down_bias, &G.expert_down.bias);
+      add_optional(L.o_bias, &G.o_bias);
+      add_optional(L.sinks, &G.sinks);
       if (c_.per_layer_input > 0) {
         G.pl_gate = add_linear(arena, L.per_layer_gate, linear_fix, &G.pl_gate);
         G.pl_proj = add_linear(arena, L.per_layer_proj, linear_fix, &G.pl_proj);
@@ -573,15 +593,16 @@ class DecoderMetal final : public Model {
 
   id<MTLComputePipelineState> quant_pipeline(const std::string& name, const GpuLinear& l) {
     const std::string key = name + "/" + std::to_string(l.bits) + "/" + std::to_string(l.group) + "/" +
-                            (l.bf16 ? "bf16" : "f16");
+                            (l.bf16 ? "bf16" : "f16") + (l.mxfp4 ? "/mxfp4" : "");
     auto it = pipelines_.find(key);
     if (it != pipelines_.end()) return it->second;
     MTLFunctionConstantValues* values = [MTLFunctionConstantValues new];
     int bits = l.bits, group = l.group;
-    bool bf16 = l.bf16;
+    bool bf16 = l.bf16, mxfp4 = l.mxfp4;
     [values setConstantValue:&bits type:MTLDataTypeInt atIndex:0];
     [values setConstantValue:&group type:MTLDataTypeInt atIndex:1];
     [values setConstantValue:&bf16 type:MTLDataTypeBool atIndex:2];
+    [values setConstantValue:&mxfp4 type:MTLDataTypeBool atIndex:3];
     NSError* error = nil;
     id<MTLFunction> function = [library_ newFunctionWithName:@(name.c_str()) constantValues:values error:&error];
     LK_CHECK(function != nil, "metal: kernel " + key + ": " + ns_error(error));
@@ -749,7 +770,8 @@ class DecoderMetal final : public Model {
     bind(enc, part_o_, 0, 0);
     bind(enc, part_ml_, 0, 1);
     bind(enc, attn_, 0, 2);
-    bytes(enc, ReduceParams{c_.num_heads, G.head_dim, n_blocks}, 3);
+    bytes(enc, ReduceParams{c_.num_heads, G.head_dim, n_blocks, c_.attention_sinks ? 1 : 0}, 3);
+    bind(enc, G.sinks, 4);
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(c_.num_heads), static_cast<NSUInteger>(n), 1)
         threadsPerThreadgroup:MTLSizeMake(static_cast<NSUInteger>(G.head_dim), 1, 1)];
   }
@@ -804,14 +826,17 @@ class DecoderMetal final : public Model {
     bind(enc, chosen_, 0, 1);
     bind(enc, expert_weights_, 0, 2);
     bytes(enc, MoeRouteParams{c_.num_experts, c_.experts_per_token,
-                              c_.router == DecoderConfig::Router::TopKSoftmax ? 1 : 0, c_.norm_topk_prob ? 1 : 0},
+                              c_.router == DecoderConfig::Router::TopKSoftmax ? 1 : 0, c_.norm_topk_prob ? 1 : 0,
+                              c_.router_bias ? 1 : 0},
           3);
+    bind(enc, G.router_bias, 4);
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(n), 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
   }
 
   void encode_experts(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n) {
     const int K = c_.experts_per_token, I = c_.moe_intermediate, pairs = n * K;
-    const int silu = c_.activation == Activation::Silu ? 1 : 0;
+    const int act = c_.activation == Activation::ClampedSwiglu ? 2 : c_.activation == Activation::Silu ? 1 : 0;
+    const int has_bias = c_.expert_bias ? 1 : 0;
     [enc setComputePipelineState:quant_pipeline("qmv_gather_glu", G.expert_gate.format())];
     bind(enc, G.expert_gate.words, 0);
     bind(enc, G.expert_gate.scales, 1);
@@ -821,8 +846,10 @@ class DecoderMetal final : public Model {
     bind(enc, G.expert_up.biases, 5);
     bind(enc, h_, 0, 6);
     bind(enc, expert_hidden_, 0, 7);
-    bytes(enc, GatherParams{I, c_.hidden_size, K, 1, silu}, 8);
+    bytes(enc, GatherParams{I, c_.hidden_size, K, 1, act, has_bias, c_.swiglu_limit}, 8);
     bind(enc, chosen_, 0, 9);
+    bind(enc, G.expert_gate.bias, 10);
+    bind(enc, G.expert_up.bias, 11);
     [enc dispatchThreadgroups:MTLSizeMake(qmv_groups(I), static_cast<NSUInteger>(pairs), 1)
         threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
     [enc setComputePipelineState:quant_pipeline("qmv_gather", G.expert_down.format())];
@@ -831,8 +858,9 @@ class DecoderMetal final : public Model {
     bind(enc, G.expert_down.biases, 2);
     bind(enc, expert_hidden_, 0, 3);
     bind(enc, expert_out_, 0, 4);
-    bytes(enc, GatherParams{c_.hidden_size, I, K, 0, 0}, 5);
+    bytes(enc, GatherParams{c_.hidden_size, I, K, 0, 0, has_bias, c_.swiglu_limit}, 5);
     bind(enc, chosen_, 0, 6);
+    bind(enc, G.expert_down.bias, 7);
     [enc dispatchThreadgroups:MTLSizeMake(qmv_groups(c_.hidden_size), static_cast<NSUInteger>(pairs), 1)
         threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
     [enc setComputePipelineState:pipeline("moe_combine")];
@@ -849,7 +877,9 @@ class DecoderMetal final : public Model {
   double expert_traffic(const DecoderLayer& L, int n) const {
     const int32_t* chosen = static_cast<const int32_t*>([chosen_ contents]);
     std::vector<int> count(static_cast<size_t>(c_.num_experts), 0);
-    for (int i = 0; i < n * c_.experts_per_token; ++i) ++count[static_cast<size_t>(chosen[i])];
+    for (int i = 0; i < n * c_.experts_per_token; ++i) {
+      if (chosen[i] >= 0 && chosen[i] < c_.num_experts) ++count[static_cast<size_t>(chosen[i])];
+    }
     double bytes = 0.0;
     for (int e = 0; e < c_.num_experts; ++e) {
       const int m = count[static_cast<size_t>(e)];
@@ -943,6 +973,14 @@ class DecoderMetal final : public Model {
       encode_attention(enc, G, n, start);
       section(enc, "attention", profiling ? traffic::attention(c_, layer, start, n) : 0.0);
       encode_qmm(enc, G.o, attn_, n, r_);
+      if (c_.o_bias) {
+        [enc setComputePipelineState:pipeline("add_bias_rows")];
+        bind(enc, r_, 0, 0);
+        bind(enc, G.o_bias, 1);
+        const int count = n * c_.hidden_size;
+        bytes(enc, BiasParams{c_.hidden_size, count}, 2);
+        encode_elementwise(enc, count);
+      }
       section(enc, "o_proj", profiling ? traffic::linear(L.o_proj, n) : 0.0);
       encode_residual_norm(enc, G.attn_post_norm, &G.mlp_norm, n);
       section(enc, "residual_norm", residual_bytes);

@@ -559,7 +559,7 @@ void test_gpt_oss_config() {
   EXPECT(c.architecture == "gpt_oss" && c.num_layers == 24 && c.num_experts == 32 && c.experts_per_token == 4);
   EXPECT(c.moe_intermediate == 2880 && c.sliding_window == 128 && c.qkv_bias && c.o_bias && c.attention_sinks);
   EXPECT(c.router == DecoderConfig::Router::TopKSoftmax && c.router_module == "mlp.router" && c.expert_bias);
-  EXPECT(c.activation == Activation::ClampedSwiglu && c.swiglu_limit == 7.0f && !c.metal_implements());
+  EXPECT(c.activation == Activation::ClampedSwiglu && c.swiglu_limit == 7.0f && c.metal_implements());
   for (int l = 0; l < 24; ++l) EXPECT(c.layer_is_sliding[static_cast<size_t>(l)] == (l % 2 == 0) && c.is_moe(l));
   EXPECT(c.eos_token_ids == std::vector<int32_t>({200002}));
   // YaRN's attention factor 0.1 ln 32 + 1, squared into the logit scale.

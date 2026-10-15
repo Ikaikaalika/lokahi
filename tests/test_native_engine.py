@@ -164,20 +164,23 @@ def fixture_model(request, tmp_path_factory):
     return directory, LlamaFamilyReference.load(directory)
 
 
-CPU_ONLY = ("gpt_oss", "glm4_moe")  # the Metal backend refuses these for now
+CPU_ONLY = ("glm4_moe",)  # the Metal backend refuses these for now
 
 
-def _uses_mxfp4(config: dict) -> bool:
+def _dense_mxfp4(config: dict) -> bool:
+    """Whether a matrix other than an expert is MXFP4 (Metal reads MXFP4 only for experts)."""
+
     quant = config.get("quantization") or {}
-    return quant.get("mode") == "mxfp4" or any(isinstance(v, dict) and v.get("mode") == "mxfp4" for v in quant.values())
+    overrides = [k for k, v in quant.items() if isinstance(v, dict) and v.get("mode") == "mxfp4"]
+    return any(".experts." not in k and ".switch_mlp." not in k for k in overrides)
 
 
 def _skip_unsupported(directory: Path, backend: str) -> None:
     config = json.loads((directory / "config.json").read_text())
     if backend == "metal" and (config.get("text_config") or config)["model_type"] in CPU_ONLY:
         pytest.skip("the Metal backend does not implement this architecture yet")
-    if backend == "metal" and _uses_mxfp4(config):
-        pytest.skip("the Metal backend does not implement mxfp4 weights yet")
+    if backend == "metal" and _dense_mxfp4(config):
+        pytest.skip("the Metal backend implements mxfp4 only for experts so far")
 
 
 @pytest.mark.parametrize("backend", _backends())
@@ -393,11 +396,10 @@ def test_gemma4_missing_layer_scalar_fails_closed(native_cli, tmp_path):
     assert "layers.3.layer_scalar" in _load_error(native_cli, directory)
 
 
-@pytest.mark.parametrize("architecture", ["gpt_oss", "glm4_moe", "llama-mxfp4"])
+@pytest.mark.parametrize("architecture", ["glm4_moe", "llama-mxfp4"])
 def test_cpu_only_models_fall_back_to_the_cpu(native_cli, tmp_path, architecture):
-    if architecture in ("gpt_oss", "glm4_moe"):
-        variant = "gpt-oss-affine-top3" if architecture == "gpt_oss" else "glm4-moe-air"
-        directory = write_tiny_dense(tmp_path / "model", DENSE_VARIANTS[variant])
+    if architecture == "glm4_moe":
+        directory = write_tiny_dense(tmp_path / "model", DENSE_VARIANTS["glm4-moe-air"])
     else:
         directory = write_tiny_dense(tmp_path / "model", TinyDenseSpec(mxfp4_mlp=True, eight_bit_mlp_layers=()))
     # auto falls back to the CPU backend, which implements every architecture and format.
