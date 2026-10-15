@@ -12,8 +12,9 @@
 //                     [--max-new N] [--warmups W]
 //   lokahi tokenize   --model DIR (--text TEXT | --texts-file F.json) [--no-special]
 //   lokahi detokenize --model DIR (--tokens 1,2 | --ids-file F.json) [--keep-special]
+//                     [--stream [--stops-file S.json]]
 //   lokahi pretokenize --model DIR (--text TEXT | --texts-file F.json)
-//   lokahi run        --model DIR --prompt TEXT [--max-new N]
+//   lokahi run        --model DIR --prompt TEXT [--max-new N] [sampling flags]
 //
 // `run` streams generated text to stdout; every other command prints one
 // JSON object on stdout.
@@ -36,6 +37,7 @@
 #include "json.h"
 #include "safetensors.h"
 #include "sampling.h"
+#include "text_stream.h"
 #include "tokenizer.h"
 
 #if defined(LOKAHI_WITH_METAL)
@@ -276,9 +278,39 @@ int cmd_tokenize(const Args& args) {
   return 0;
 }
 
+// Each id list through a TextStream: the text every push returned, the
+// finish text last, and the token after which a stop string ended it.
+std::string stream_texts(const Tokenizer& tokenizer, const Json& lists, const Args& args) {
+  std::vector<std::string> stops;
+  if (args.has("stops-file")) {
+    const Json list = Json::parse(read_text_file(args.get("stops-file")));
+    for (const Json& stop : list.as_array()) stops.push_back(stop.as_string());
+  }
+  std::string out = "{\"streams\":[";
+  for (size_t i = 0; i < lists.as_array().size(); ++i) {
+    TextStream stream(tokenizer, stops, !args.has("keep-special"));
+    std::string deltas;
+    long stopped_after = -1;
+    const auto& list = lists.as_array()[i].as_array();
+    for (size_t k = 0; k < list.size(); ++k) {
+      deltas += (k ? "," : "") + json_string(stream.push(static_cast<int32_t>(list[k].as_int())));
+      if (stream.stopped() && stopped_after < 0) stopped_after = static_cast<long>(k);
+    }
+    deltas += (list.empty() ? "" : ",") + json_string(stream.finish());
+    out += (i ? "," : "") + std::string("{\"deltas\":[") + deltas + "],\"stopped_after\":" +
+           std::to_string(stopped_after) + ",\"text\":" + json_string(stream.text()) + "}";
+  }
+  return out + "]}";
+}
+
 int cmd_detokenize(const Args& args) {
   Tokenizer tokenizer = load_tokenizer(args);
   const bool skip = !args.has("keep-special");
+  if (args.has("stream")) {
+    LK_CHECK(args.has("ids-file"), "--stream needs --ids-file");
+    std::printf("%s\n", stream_texts(tokenizer, Json::parse(read_text_file(args.get("ids-file"))), args).c_str());
+    return 0;
+  }
   if (args.has("ids-file")) {
     Json lists = Json::parse(read_text_file(args.get("ids-file")));
     std::string out = "{\"texts\":[";
@@ -328,22 +360,19 @@ int cmd_run(const Args& args) {
   auto model = load_model(args.get("model"), load_options(args));
   std::vector<int32_t> prompt = tokenizer.encode(args.get("prompt"), true);
   std::vector<int32_t> generated;
-  size_t emitted = 0;
-  auto emit = [&](const std::string& text) {
-    LK_CHECK(text.size() >= emitted, "streaming decode went backwards");
-    std::fwrite(text.data() + emitted, 1, text.size() - emitted, stdout);
+  TextStream stream(tokenizer, {});
+  auto emit = [](const std::string& text) {
+    std::fwrite(text.data(), 1, text.size(), stdout);
     std::fflush(stdout);
-    emitted = text.size();
   };
   auto on_token = [&](int32_t token) {
     generated.push_back(token);
-    const size_t stable = tokenizer.stable_prefix(generated, true);
-    emit(tokenizer.decode(std::vector<int32_t>(generated.begin(), generated.begin() + static_cast<long>(stable)), true));
+    emit(stream.push(token));
     return true;
   };
   GenerationTiming timing;
-  model->generate_greedy(prompt, args.get_int("max-new", 256), true, &timing, on_token);
-  emit(tokenizer.decode(generated, true));
+  model->generate(prompt, args.get_int("max-new", 256), sampling_options(args), true, &timing, on_token);
+  emit(stream.finish());
   std::printf("\n");
   const double decode_rate = generated.size() > 1 ? (generated.size() - 1) / timing.decode_seconds : 0.0;
   std::fprintf(stderr, "[%s] prompt %zu tokens in %.1f ms; %zu tokens at %.1f tok/s\n", model->backend(),
