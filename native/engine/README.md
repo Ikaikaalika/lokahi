@@ -23,9 +23,9 @@ cmake --build build/engine -j
 
 | Area | State | Evidence |
 |---|---|---|
-| Dense decoders on CPU: Gemma 3, Gemma 4 (dense; E2B/E4B and 31B layouts), Llama 3.x, Mistral, Qwen 2/2.5, Qwen 3 | Implemented | Correctness: matches the NumPy oracles (`oracles/gemma3.py`, `oracles/gemma4.py`, `oracles/llama.py`) within 2e-4 relative; greedy tokens exact (`tests/test_native_engine.py`). Gemma 4 fixtures cover KV sharing of both layer kinds, `attention_k_eq_v`, partial RoPE, per-layer inputs and layer scalars, and every non-equivalent mutation of those features fails the suite. The published E2B config parses to the expected layer map (`tests/engine_tests.cpp`) |
-| Dense decoders on Metal (Gemma 3 and the Llama family) | Implemented, awaiting first hardware run | Builds on hosted macOS CI; execution and parity run on the self-hosted runner. Gemma 4 is refused (`--backend auto` picks the CPU) until its kernels land |
-| Oracles vs MLX-LM (`gemma3_text`, `gemma4`, `llama`, `qwen2`, `qwen3`) | Written | Runs on the self-hosted Mac (`tests/test_mlx_crosscheck.py`) |
+| Decoders on CPU: Gemma 3, Gemma 4 (dense; E2B/E4B and 31B layouts), Llama 3.x, Mistral, Qwen 2/2.5, Qwen 3, Qwen 3 MoE | Implemented | Correctness: matches the NumPy oracles (`oracles/gemma3.py`, `oracles/gemma4.py`, `oracles/llama.py`) within 2e-4 relative; greedy tokens exact (`tests/test_native_engine.py`). Qwen 3 MoE fixtures cover stacked (MLX) and per-expert (Transformers) weights, renormalized and raw top-k, dense layers between sparse ones, and route far from ties on the router's real inputs. Gemma 4 fixtures cover KV sharing of both layer kinds, `attention_k_eq_v`, partial RoPE, per-layer inputs and layer scalars, and every non-equivalent mutation of those features fails the suite. The published E2B config parses to the expected layer map (`tests/engine_tests.cpp`) |
+| Dense decoders on Metal (Gemma 3 and the dense Llama family) | Implemented, awaiting first hardware run | Builds on hosted macOS CI; execution and parity run on the self-hosted runner. Gemma 4 and Qwen 3 MoE are refused (`--backend auto` picks the CPU) until their kernels land |
+| Oracles vs MLX-LM (`gemma3_text`, `gemma4`, `llama`, `qwen2`, `qwen3`, `qwen3_moe`) | Written | Runs on the self-hosted Mac (`tests/test_mlx_crosscheck.py`) |
 | MLX affine 2/4/8-bit weights, BF16/F16 scales, per-module bit overrides | Implemented | Unit tests; MLX cross-check on Apple Silicon |
 | Tokenizer: SentencePiece-style BPE (Gemma, Llama 2, Mistral) from `tokenizer.json` | Implemented | Correctness: identical ids and text to Hugging Face `tokenizers` on trained fixtures (byte fallback, unknown fusion, added tokens, Metaspace) and a 262k-entry synthetic vocabulary (`tests/test_tokenizer.py`) |
 | Tokenizer: byte-level BPE (Llama 3, Qwen, GPT-OSS, DeepSeek, GLM) | Implemented | Correctness: identical words, ids and text to Hugging Face `tokenizers` for the Qwen 3, Llama 3, GLM, GPT-OSS o200k, DeepSeek V3 and GPT-2 configurations on text from every Unicode plane (`tests/test_tokenizer_bytelevel.py`); regex engine fuzzed against the reference's Oniguruma |
@@ -42,9 +42,9 @@ evidence against a fresh MLX-LM control.
 
 **Model families.** `DecoderConfig` describes how the supported families
 differ. The CPU backend implements every option; the Metal backend
-implements every column but Gemma 4:
+implements every column but Gemma 4, and no mixture of experts yet:
 
-| Option | Gemma 3 | Gemma 4 | Llama 3.x | Mistral | Qwen 2/2.5 | Qwen 3 |
+| Option | Gemma 3 | Gemma 4 | Llama 3.x | Mistral | Qwen 2/2.5 | Qwen 3 / Qwen 3 MoE |
 |---|---|---|---|---|---|---|
 | RMSNorm scale | `1 + w` | `w` | `w` | `w` | `w` | `w` |
 | Norms after each sublayer | yes | yes | no | no | no | no |
@@ -56,6 +56,7 @@ implements every column but Gemma 4:
 | Per-layer geometry | no | full layers' own head size; with `attention_k_eq_v`, values are the raw keys and full layers have their own kv head count | no | no | no | no |
 | KV sharing | no | the last `num_kv_shared_layers` layers attend over the last unshared layer of their kind | no | no | no | no |
 | Per-layer inputs | no | a per-layer token embedding plus a projection of the embedding, gated into each layer; each layer's output times its `layer_scalar` | no | no | no | no |
+| Mixture of experts | no | not yet (26B-A4B fails at load) | no | no | no | Qwen 3 MoE: a softmax router picks the top `num_experts_per_tok` SiLU-gated experts, renormalized with `norm_topk_prob`, in the layers `decoder_sparse_step` and `mlp_only_layers` select; MLX's stacked `switch_mlp` or per-expert weights |
 
 A family is a config parser in `decoder.cpp`. Options outside this table
 (o_proj or MLP biases, YaRN, partial rotary outside Gemma 4, other
@@ -149,7 +150,8 @@ names differ:
   lm_head and sample. Each section is its own command buffer, and its time is
   that buffer's GPU time.
 - **CPU:** embed, norm, qkv, rope_kv, attention, o_proj, residual, mlp_up,
-  down_proj, per_layer_input (Gemma 4) and lm_head. Times are host time.
+  down_proj, router and experts (mixture of experts), per_layer_input
+  (Gemma 4) and lm_head. Times are host time.
 
 The per-section synchronization makes profiled runs slower than `bench`. Use
 the shares to choose work, and `bench` to measure it.
