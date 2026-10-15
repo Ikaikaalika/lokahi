@@ -5,12 +5,15 @@
 #include <cstring>
 #include <fstream>
 #include <functional>
+#include <initializer_list>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <unistd.h>
 
+#include "decoder.h"
 #include "half.h"
 #include "json.h"
 #include "quant.h"
@@ -415,6 +418,77 @@ void test_sampling() {
   EXPECT(throws([] { validate_sampling(SamplingParams{1.0f, 1.0f, 0, 1.5f, 0}); }));
 }
 
+// The text configuration of mlx-community/gemma-4-e2b-it-4bit, as published.
+static const char* kGemma4E2BConfig = R"({
+  "model_type": "gemma4", "eos_token_id": [1, 106, 50], "tie_word_embeddings": true,
+  "quantization": {"group_size": 64, "bits": 4, "mode": "affine"},
+  "text_config": {
+    "attention_bias": false, "attention_k_eq_v": false, "enable_moe_block": false, "eos_token_id": 1,
+    "expert_intermediate_size": null, "final_logit_softcapping": 30.0, "global_head_dim": 512, "head_dim": 256,
+    "hidden_activation": "gelu_pytorch_tanh", "hidden_size": 1536, "hidden_size_per_layer_input": 256,
+    "intermediate_size": 6144,
+    "layer_types": ["sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention",
+      "full_attention", "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention",
+      "full_attention", "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention",
+      "full_attention", "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention",
+      "full_attention", "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention",
+      "full_attention", "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention",
+      "full_attention", "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention",
+      "full_attention"],
+    "max_position_embeddings": 131072, "model_type": "gemma4_text", "num_attention_heads": 8, "num_experts": null,
+    "num_global_key_value_heads": null, "num_hidden_layers": 35, "num_key_value_heads": 1,
+    "num_kv_shared_layers": 20, "rms_norm_eps": 1e-06,
+    "rope_parameters": {
+      "full_attention": {"partial_rotary_factor": 0.25, "rope_theta": 1000000.0, "rope_type": "proportional"},
+      "sliding_attention": {"rope_theta": 10000.0, "rope_type": "default"}},
+    "sliding_window": 512, "tie_word_embeddings": true, "top_k_experts": null,
+    "use_bidirectional_attention": null, "use_double_wide_mlp": true, "vocab_size": 262144,
+    "vocab_size_per_layer_input": 262144}
+})";
+
+void test_gemma4_config() {
+  const DecoderConfig c = DecoderConfig::from_json(Json::parse(kGemma4E2BConfig));
+  EXPECT(c.architecture == "gemma4" && c.num_layers == 35 && !c.uniform_layers());
+  EXPECT(c.eos_token_ids == std::vector<int32_t>({1, 106, 50}));
+  EXPECT(c.embed_scale == 39.25f);  // sqrt(1536) rounded to BF16
+  EXPECT(c.norm_offset == 0.0f && c.attn_scale == 1.0f && c.v_norm && c.per_layer_input == 256);
+  for (int l = 0; l < c.num_layers; ++l) {
+    const bool full = l % 5 == 4;
+    EXPECT(c.layer_is_sliding[static_cast<size_t>(l)] == !full);
+    EXPECT(c.head_dim_of(l) == (full ? 512 : 256) && c.kv_heads_of(l) == 1 && !c.k_eq_v(l));
+    // Layers 15-34 attend over the last unshared layer of their kind: 13 or 14.
+    EXPECT(c.kv_source(l) == (l < 15 ? l : full ? 14 : 13));
+    EXPECT(c.intermediate_of(l) == (l < 15 ? 6144 : 12288));
+  }
+  const std::vector<double> global = c.rope_inv_freq(false), local = c.rope_inv_freq(true);
+  EXPECT(global.size() == 256 && local.size() == 128);
+  int rotated = 0;
+  for (double f : global) rotated += f != 0.0;
+  EXPECT(rotated == 64 && global[0] == 1.0 && global[63] != 0.0 && global[64] == 0.0);
+  EXPECT(std::fabs(global[1] / std::pow(1e6, -2.0 / 512) - 1.0) < 1e-12);
+  EXPECT(std::fabs(local[1] / std::pow(1e4, -2.0 / 256) - 1.0) < 1e-12 && local[127] != 0.0);
+
+  // The same document with text_config fields replaced.
+  auto with = [](std::initializer_list<std::pair<const char*, const char*>> changes) {
+    std::string text = kGemma4E2BConfig;
+    for (const auto& [key, value] : changes) {
+      const std::string field = "\"" + std::string(key) + "\": ";
+      const size_t at = text.find(field) + field.size();
+      text.replace(at, text.find_first_of(",}", at) - at, value);
+    }
+    return Json::parse(text);
+  };
+  EXPECT(throws([&] { DecoderConfig::from_json(with({{"enable_moe_block", "true"}})); }));
+  EXPECT(throws([&] { DecoderConfig::from_json(with({{"use_bidirectional_attention", "true"}})); }));
+  EXPECT(throws([&] { DecoderConfig::from_json(with({{"num_kv_shared_layers", "35"}})); }));
+  // num_global_key_value_heads applies to k_eq_v (full) layers only.
+  EXPECT(DecoderConfig::from_json(with({{"num_global_key_value_heads", "4"}})).kv_heads_of(4) == 1);
+  const DecoderConfig keqv =
+      DecoderConfig::from_json(with({{"attention_k_eq_v", "true"}, {"num_global_key_value_heads", "4"}}));
+  EXPECT(keqv.k_eq_v(4) && !keqv.k_eq_v(3) && keqv.kv_heads_of(4) == 4 && keqv.kv_heads_of(3) == 1);
+  EXPECT(keqv.kv_heads_of(34) == 4 && keqv.kv_source(34) == 14);
+}
+
 int main() {
   test_json();
   test_half();
@@ -427,6 +501,7 @@ int main() {
   test_tokenizer_stable_prefix();
   test_byte_level_stable_prefix();
   test_sampling();
+  test_gemma4_config();
   if (g_failures) {
     std::fprintf(stderr, "%d expectation(s) failed\n", g_failures);
     return 1;
