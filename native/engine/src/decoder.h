@@ -1,5 +1,6 @@
 // Decoder-only transformers (Gemma 3, Gemma 4, Llama 3.x, Mistral, Qwen 2/2.5,
-// Qwen 3, Qwen 3 MoE): configuration, weight binding, and the CPU backend.
+// Qwen 3, Qwen 3 MoE, GPT-OSS): configuration, weight binding, and the CPU
+// backend.
 // One configuration describes how the families differ (norm style and
 // placement, activation, per-head Q/K norm, q/k/v biases, RoPE bases,
 // scaling and partial rotation, sliding windows, logit soft-capping, and
@@ -20,15 +21,20 @@
 
 namespace lokahi {
 
-enum class Activation { GeluTanh, Silu };
+// ClampedSwiglu is GPT-OSS's expert activation:
+// min(g, L) * sigmoid(1.702 * min(g, L)) * (clamp(u, -L, L) + 1).
+enum class Activation { GeluTanh, Silu, ClampedSwiglu };
 
 // RoPE frequency scaling from `rope_scaling` (Hugging Face semantics).
 struct RopeScaling {
-  enum class Kind { None, Linear, Llama3 } kind = Kind::None;
+  enum class Kind { None, Linear, Llama3, Yarn } kind = Kind::None;
   double factor = 1.0;
   double low_freq_factor = 1.0;      // llama3
   double high_freq_factor = 4.0;     // llama3
-  double original_max_positions = 8192.0;  // llama3
+  double original_max_positions = 8192.0;  // llama3, yarn
+  double beta_fast = 32.0;           // yarn
+  double beta_slow = 1.0;            // yarn
+  bool truncate = true;              // yarn: round the correction range outward
 };
 
 struct DecoderConfig {
@@ -60,6 +66,8 @@ struct DecoderConfig {
   std::vector<bool> layer_is_sliding;
   float final_logit_softcapping = 0.0f;  // 0 disables
   float attn_logit_softcapping = 0.0f;
+  bool o_bias = false;           // a bias on the attention output projection (GPT-OSS)
+  bool attention_sinks = false;  // a learned per-head logit in each softmax that attends to nothing
   std::vector<int32_t> eos_token_ids;
   std::string weight_prefix;  // "" or "language_model."
 
@@ -87,6 +95,13 @@ struct DecoderConfig {
   int moe_intermediate = 0;
   bool norm_topk_prob = false;
   std::vector<bool> layer_moe;
+  // Softmax: softmax over all experts, then the top k (Qwen 3 MoE).
+  // TopKSoftmax: the top k router logits, then a softmax over them (GPT-OSS).
+  enum class Router { Softmax, TopKSoftmax } router = Router::Softmax;
+  std::string router_module = "mlp.gate";  // relative to the layer
+  bool router_bias = false;
+  bool expert_bias = false;     // biases on every expert projection
+  float swiglu_limit = 7.0f;    // ClampedSwiglu
 
   static DecoderConfig from_json(const Json& raw);
   // RoPE inverse frequencies (half the layer kind's head size); rotations a
@@ -107,7 +122,7 @@ struct DecoderConfig {
   bool uniform_layers() const {
     return layer_head_dim.empty() && layer_kv_heads.empty() && layer_intermediate.empty() &&
            layer_kv_source.empty() && layer_k_eq_v.empty() && !v_norm && global_partial_rotary == 1.0f &&
-           per_layer_input == 0 && !layer_scalars && num_experts == 0;
+           per_layer_input == 0 && !layer_scalars && num_experts == 0 && !o_bias && !attention_sinks;
   }
 };
 
@@ -118,12 +133,15 @@ struct DecoderLayer {
   // q_norm and k_norm only with qk_norm.
   std::vector<float> attn_norm, attn_post_norm, mlp_norm, mlp_post_norm, q_norm, k_norm;
   std::vector<float> q_bias, k_bias, v_bias;  // only with qkv_bias
+  std::vector<float> o_bias, sinks;            // only with o_bias, attention_sinks
   // k_proj and v_proj are empty (rows 0) in KV-shared layers, v_proj with k_eq_v;
   // gate_proj, up_proj and down_proj in mixture-of-experts layers.
   Linear q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj;
-  // Mixture of experts: the router [experts, hidden] and one view per expert.
+  // Mixture of experts: the router [experts, hidden] and one view per expert;
+  // biases [experts * rows] only with router_bias and expert_bias.
   Linear router;
   std::vector<Linear> expert_gate, expert_up, expert_down;
+  std::vector<float> router_bias, expert_gate_bias, expert_up_bias, expert_down_bias;
   // Per-layer inputs (Gemma 4): gate [P, hidden], projection [hidden, P].
   Linear per_layer_gate, per_layer_proj;
   std::vector<float> per_layer_norm;

@@ -130,6 +130,8 @@ def load_dense_weights(model_dir: Path) -> tuple[dict[str, Any], dict[str, np.nd
             dense[strip(name)] = _tensor_f32(dtype, array)
             continue
         if not name.endswith(".weight"):
+            # Plain tensors such as GPT-OSS's self_attn.sinks.
+            dense[strip(name)] = _tensor_f32(dtype, array)
             continue
         module = name[: -len(".weight")]
         scales = tensors.get(module + ".scales")

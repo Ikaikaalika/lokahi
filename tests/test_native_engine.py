@@ -39,6 +39,12 @@ def _run(cli: Path, *args: str) -> dict:
     return json.loads(result.stdout.strip().splitlines()[-1])
 
 
+# GPT-OSS's YaRN: the correction range is not rounded (truncate false).
+GPT_OSS_YARN = {"rope_type": "yarn", "factor": 32.0, "beta_fast": 32.0, "beta_slow": 1.0,
+                "original_max_position_embeddings": 4096, "truncate": False}
+# Qwen 3's long-context YaRN (factor 4 over 32k), truncated by default.
+QWEN3_YARN = {"rope_type": "yarn", "factor": 4.0, "original_max_position_embeddings": 32768}
+
 LLAMA3_SCALING = {
     "rope_type": "llama3",
     "factor": 32.0,
@@ -86,6 +92,22 @@ DENSE_VARIANTS = {
     "qwen3-moe-mxfp4-experts": TinyDenseSpec(model_type="qwen3_moe", head_dim=64, mlp_only_layers=(1,),
                                              mxfp4_mlp=True, seed=11),
     "llama-mxfp4-mlp": TinyDenseSpec(mxfp4_mlp=True, eight_bit_mlp_layers=(), seed=12),
+    # GPT-OSS 20B's layout: MXFP4 experts by default with affine overrides,
+    # biased attention with sinks, alternating windows, untruncated YaRN, a
+    # biased router (top-k, then softmax) and biased clamped-SwiGLU experts.
+    "gpt-oss-mxfp4-yarn": TinyDenseSpec(
+        model_type="gpt_oss", head_dim=64, num_hidden_layers=4, num_experts=8, num_experts_per_tok=2,
+        moe_intermediate_size=64, sliding_window=6, rope_theta=150000.0, rope_scaling=GPT_OSS_YARN, mxfp4_mlp=True,
+        seed=14,
+    ),
+    # Affine experts, top-3 of 6, truncated YaRN, a wider window.
+    "gpt-oss-affine-top3": TinyDenseSpec(
+        model_type="gpt_oss", head_dim=64, num_hidden_layers=4, num_experts=6, num_experts_per_tok=3,
+        moe_intermediate_size=64, sliding_window=9, rope_theta=150000.0,
+        rope_scaling={**GPT_OSS_YARN, "truncate": True}, seed=15,
+    ),
+    # Qwen 3 with long-context YaRN.
+    "qwen3-yarn": TinyDenseSpec(model_type="qwen3", head_dim=64, rope_theta=1e6, rope_scaling=QWEN3_YARN, seed=16),
     # Every other layer sparse, top-3 of 6 unnormalized, Transformers'
     # per-expert tensors, untied.
     "qwen3-moe-top3-of-6-per-expert": TinyDenseSpec(
@@ -130,7 +152,7 @@ def fixture_model(request, tmp_path_factory):
     return directory, LlamaFamilyReference.load(directory)
 
 
-CPU_ONLY = ("gemma4", "gemma4_text", "qwen3_moe")  # the Metal backend refuses these for now
+CPU_ONLY = ("gemma4", "gemma4_text", "qwen3_moe", "gpt_oss")  # the Metal backend refuses these for now
 
 
 def _uses_mxfp4(config: dict) -> bool:
@@ -226,7 +248,7 @@ def test_llama3_scaling_changes_the_fixture_output():
         ({"mlp_bias": True}, "mlp_bias is not supported"),
         ({"hidden_act": "gelu"}, "unsupported activation gelu"),
         ({"use_sliding_window": True}, "use_sliding_window is not supported"),
-        ({"rope_scaling": {"rope_type": "yarn", "factor": 4.0}}, "rope_scaling type 'yarn' is not supported"),
+        ({"rope_scaling": {"rope_type": "longrope", "factor": 4.0}}, "rope_scaling type 'longrope' is not supported"),
         ({"partial_rotary_factor": 0.5}, "partial_rotary_factor is not supported"),
         ({"tie_word_embeddings": False}, "tie_word_embeddings is false but the checkpoint has no lm_head"),
     ],
@@ -407,14 +429,15 @@ def test_unsupported_quantization_fails_closed(native_cli, tmp_path, override, m
 def test_moe_fixtures_route_far_from_ties(tmp_path):
     # Guards the fixtures: on the router's real inputs, the top-k choice must
     # be stable under float32 error, and every expert must serve some token.
-    for name in ("qwen3-moe-top2-of-8", "qwen3-moe-mxfp4-experts", "qwen3-moe-top3-of-6-per-expert"):
+    for name in ("qwen3-moe-top2-of-8", "qwen3-moe-mxfp4-experts", "qwen3-moe-top3-of-6-per-expert",
+                 "gpt-oss-mxfp4-yarn", "gpt-oss-affine-top3"):
         oracle = LlamaFamilyReference.load(write_tiny_dense(tmp_path / name, DENSE_VARIANTS[name]))
         k, route = oracle.config.num_experts_per_tok, oracle.route
         gaps: list[float] = []
         used: set[int] = set()
 
         def traced(layer, x):
-            ordered = -np.sort(-(x @ oracle.w[f"model.layers.{layer}.mlp.gate"].T), axis=-1)
+            ordered = -np.sort(-oracle.router_logits(layer, x), axis=-1)
             gaps.append(float((ordered[:, k - 1] - ordered[:, k]).min()))
             chosen, weights = route(layer, x)
             used.update(chosen.ravel().tolist())
@@ -424,6 +447,51 @@ def test_moe_fixtures_route_far_from_ties(tmp_path):
         oracle.logits(TOKENS)
         assert min(gaps) > 1e-3, name
         assert len(used) == oracle.config.num_experts, name
+
+
+def test_gpt_oss_fixtures_exercise_every_feature(tmp_path):
+    # Guards the fixtures: the clamps bind, sinks take probability mass, and
+    # untruncated YaRN differs from truncated YaRN.
+    from lokahi.oracles import LlamaFamilyConfig
+
+    spec = DENSE_VARIANTS["gpt-oss-mxfp4-yarn"]
+    oracle = LlamaFamilyReference.load(write_tiny_dense(tmp_path / "oss", spec))
+    gates: list[np.ndarray] = []
+    ups: list[np.ndarray] = []
+    experts = oracle._experts
+
+    def traced(prefix, x):
+        layer = int(prefix.split(".")[2])
+        chosen, _ = oracle.route(layer, x)
+        for t, row in enumerate(chosen):
+            for e in row:
+                gates.append(oracle.w[f"{prefix}.experts.gate_proj"][e] @ x[t] + oracle.w[f"{prefix}.experts.gate_proj.bias"][e])
+                ups.append(oracle.w[f"{prefix}.experts.up_proj"][e] @ x[t] + oracle.w[f"{prefix}.experts.up_proj.bias"][e])
+        return experts(prefix, x)
+
+    oracle._experts = traced
+    logits = oracle.logits(TOKENS)
+    gate, up = np.concatenate(gates), np.concatenate(ups)
+    assert (gate > 7).mean() > 0.005 and (np.abs(up) > 7).mean() > 0.005
+    del oracle._experts
+    for layer in range(spec.num_hidden_layers):  # a sink of -inf takes no mass
+        oracle.w[f"model.layers.{layer}.self_attn.sinks"] = np.full(spec.num_attention_heads, -1e30, np.float32)
+    assert np.abs(oracle.logits(TOKENS) - logits).max() > 0.05 * np.abs(logits).max()
+    untruncated = LlamaFamilyConfig.from_dict(spec.config())
+    truncated = LlamaFamilyConfig.from_dict(replace(spec, rope_scaling={**GPT_OSS_YARN, "truncate": True}).config())
+    assert not np.allclose(untruncated.inv_freq(), truncated.inv_freq())
+    assert abs(untruncated.attention_factor() - (0.1 * np.log(32.0) + 1.0)) < 1e-12
+
+
+def test_gpt_oss_without_sinks_fails_closed(native_cli, tmp_path):
+    directory = write_tiny_dense(tmp_path / "model", DENSE_VARIANTS["gpt-oss-affine-top3"])
+    path = directory / "model.safetensors"
+    tensors, metadata = read_safetensors(path)
+    del tensors["model.layers.1.self_attn.sinks"]
+    from lokahi.formats.safetensors import write_safetensors
+
+    write_safetensors(path, tensors, metadata=metadata)
+    assert "model.layers.1.self_attn.sinks" in _load_error(native_cli, directory)
 
 
 @pytest.mark.parametrize(

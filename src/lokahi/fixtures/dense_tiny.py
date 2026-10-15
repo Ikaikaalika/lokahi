@@ -1,13 +1,16 @@
 """Write tiny, randomly initialized Llama-family checkpoints in MLX layout.
 
-One writer covers Llama 3.x, Mistral, Qwen 2/2.5, Qwen 3 and Qwen 3 MoE with
-the same shapes and tensor names as their ``mlx-community`` checkpoints:
+One writer covers Llama 3.x, Mistral, Qwen 2/2.5, Qwen 3, Qwen 3 MoE and
+GPT-OSS with the same shapes and tensor names as their ``mlx-community``
+checkpoints:
 affine-quantized embeddings and projections with BF16 scales and biases,
 BF16 norm weights, grouped-query attention, optional ``llama3`` or linear
 RoPE scaling, Qwen 3's per-head q/k norms, Qwen 2's q/k/v biases, Mistral's
 optional sliding window, tied or untied ``lm_head``, per-module
-quantization overrides, and Qwen 3 MoE's stacked ``switch_mlp`` experts with
-an 8-bit router. It is correctness evidence only.
+quantization overrides, Qwen 3 MoE's stacked ``switch_mlp`` experts with
+an 8-bit router, and GPT-OSS's biased attention with sinks, alternating
+windows and biased MXFP4 experts behind a biased router. It is correctness
+evidence only.
 """
 from __future__ import annotations
 
@@ -27,6 +30,7 @@ ARCHITECTURES = {
     "qwen2": "Qwen2ForCausalLM",
     "qwen3": "Qwen3ForCausalLM",
     "qwen3_moe": "Qwen3MoeForCausalLM",
+    "gpt_oss": "GptOssForCausalLM",
 }
 QK_NORM = ("qwen3", "qwen3_moe")
 
@@ -72,20 +76,31 @@ class TinyDenseSpec:
         projections = ("gate_proj", "up_proj", "down_proj")
         if not self.sparse(layer):
             return [f"{base}.{proj}" for proj in projections]
+        if self.model_type == "gpt_oss":
+            return [f"{base}.experts.{proj}" for proj in projections]
         if self.stacked_experts:
             return [f"{base}.switch_mlp.{proj}" for proj in projections]
         return [f"{base}.experts.{e}.{proj}" for e in range(self.num_experts) for proj in projections]
 
     def sparse(self, layer: int) -> bool:
+        if self.model_type == "gpt_oss":
+            return True
         return (
             self.model_type == "qwen3_moe"
             and layer not in self.mlp_only_layers
             and (layer + 1) % self.decoder_sparse_step == 0
         )
 
+    def layer_types(self) -> list[str]:
+        """GPT-OSS alternates sliding and full layers."""
+
+        return ["sliding_attention" if i % 2 == 0 else "full_attention" for i in range(self.num_hidden_layers)]
+
     def config(self) -> dict:
         if self.model_type not in ARCHITECTURES:
             raise ValueError(f"unknown model_type {self.model_type!r}")
+        if self.model_type == "gpt_oss":
+            return self._gpt_oss_config()
         quant: dict = {"group_size": self.group_size, "bits": self.bits}
         for layer in self.eight_bit_mlp_layers:
             for proj in ("gate_proj", "up_proj", "down_proj"):
@@ -143,6 +158,54 @@ class TinyDenseSpec:
         config.update(self.extra)
         return config
 
+    def _gpt_oss_config(self) -> dict:
+        # mlx-community's layout: MXFP4 by default (the experts), with every
+        # other matrix overridden to affine and the router override naming no
+        # mode, which MLX reads as affine.
+        affine = {"group_size": self.group_size, "bits": self.bits, "mode": "affine"}
+        if self.mxfp4_mlp:
+            quant: dict = {"group_size": 32, "bits": 4, "mode": "mxfp4", "model.embed_tokens": affine, "lm_head": affine}
+            for layer in range(self.num_hidden_layers):
+                for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+                    quant[f"model.layers.{layer}.self_attn.{proj}"] = affine
+        else:
+            quant = {"group_size": self.group_size, "bits": self.bits}
+        for layer in range(self.num_hidden_layers):
+            quant[f"model.layers.{layer}.mlp.router"] = {"group_size": 64, "bits": 8}
+        config = {
+            "architectures": [ARCHITECTURES["gpt_oss"]],
+            "model_type": "gpt_oss",
+            "vocab_size": self.vocab_size,
+            "hidden_size": self.hidden_size,
+            "intermediate_size": self.moe_intermediate_size,
+            "num_hidden_layers": self.num_hidden_layers,
+            "num_attention_heads": self.num_attention_heads,
+            "num_key_value_heads": self.num_key_value_heads,
+            "head_dim": self.resolved_head_dim,
+            "num_local_experts": self.num_experts,
+            "num_experts_per_tok": self.num_experts_per_tok,
+            "experts_per_token": self.num_experts_per_tok,
+            "hidden_act": "silu",
+            "swiglu_limit": 7.0,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": self.rope_theta,
+            "rope_scaling": self.rope_scaling,
+            "sliding_window": self.sliding_window or 128,
+            "layer_types": self.layer_types(),
+            "attention_bias": True,
+            "attention_dropout": 0.0,
+            "initial_context_length": 4096,
+            "max_position_embeddings": 131072,
+            "eos_token_id": 2,
+            "pad_token_id": 0,
+            "tie_word_embeddings": False,
+            "output_router_logits": False,
+            "quantization": quant,
+            "quantization_config": quant,
+        }
+        config.update(self.extra)
+        return config
+
 
 def write_tiny_dense(directory: Path, spec: TinyDenseSpec = TinyDenseSpec()) -> Path:
     """Write ``config.json`` and ``model.safetensors`` into ``directory``."""
@@ -193,6 +256,22 @@ def write_tiny_dense(directory: Path, spec: TinyDenseSpec = TinyDenseSpec()) -> 
             vector(f"{base}.self_attn.k_proj.bias", kv_out, 0.0, 0.5)
             vector(f"{base}.self_attn.v_proj.bias", kv_out, 0.0, 0.5)
         linear(f"{base}.self_attn.o_proj", hidden, q_out, q_out**-0.5)
+        if spec.model_type == "gpt_oss":
+            for name, size in (("q_proj", q_out), ("k_proj", kv_out), ("v_proj", kv_out), ("o_proj", hidden)):
+                vector(f"{base}.self_attn.{name}.bias", size, 0.0, 0.3)
+            vector(f"{base}.self_attn.sinks", spec.num_attention_heads, 0.0, 1.5)
+            experts, moe = spec.num_experts, spec.moe_intermediate_size
+            linear(f"{base}.mlp.router", experts, hidden, hidden**-0.5 * 4.0)
+            vector(f"{base}.mlp.router.bias", experts, 0.0, 0.5)
+            # Wide gate and up projections and biases so the SwiGLU clamps
+            # (at 7) bind on some activations.
+            for name, rows, cols, std, bias in (("gate_proj", moe, hidden, hidden**-0.5 * 3.0, 3.0),
+                                                ("up_proj", moe, hidden, hidden**-0.5 * 3.0, 3.0),
+                                                ("down_proj", hidden, moe, moe**-0.5 * 0.2, 0.3)):
+                linear(f"{base}.mlp.experts.{name}", rows, cols, std, experts)
+                tensors[f"{base}.mlp.experts.{name}.bias"] = (
+                    "BF16", f32_to_bf16(rng.normal(0.0, bias, (experts, rows)).astype(np.float32)))
+            continue
         if spec.sparse(layer):
             experts, moe = spec.num_experts, spec.moe_intermediate_size
             # A wide router keeps the top-k choice far from ties.
@@ -211,7 +290,7 @@ def write_tiny_dense(directory: Path, spec: TinyDenseSpec = TinyDenseSpec()) -> 
         linear(f"{base}.mlp.up_proj", inter, hidden, hidden**-0.5)
         linear(f"{base}.mlp.down_proj", hidden, inter, inter**-0.5)
     vector("model.norm.weight", hidden, 1.0, 0.2)
-    if not spec.tie_word_embeddings:
+    if not spec.tie_word_embeddings or spec.model_type == "gpt_oss":  # GPT-OSS never ties
         linear("lm_head", spec.vocab_size, hidden, hidden**-0.5 * 4.0)
 
     (directory / "config.json").write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
