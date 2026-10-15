@@ -7,6 +7,7 @@ the serving path.
 
 from .gemma3 import Gemma3Config, Gemma3Reference
 from .gemma4 import Gemma4Config, Gemma4Reference
+from .gemma4_vision import Gemma4VisionConfig, Gemma4VisionReference
 from .llama import LlamaFamilyConfig, LlamaFamilyReference
 from .sampling import SamplingParams
 from .siglip import Gemma3VisionReference, SiglipConfig
@@ -17,6 +18,8 @@ __all__ = [
     "Gemma3VisionReference",
     "Gemma4Config",
     "Gemma4Reference",
+    "Gemma4VisionConfig",
+    "Gemma4VisionReference",
     "LlamaFamilyConfig",
     "LlamaFamilyReference",
     "SamplingParams",
