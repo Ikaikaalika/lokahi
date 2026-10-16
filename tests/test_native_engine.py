@@ -162,6 +162,14 @@ GEMMA4_VARIANTS = {
         final_logit_softcapping=None, attention_k_eq_v=True, num_key_value_heads=2, num_global_key_value_heads=1,
         seed=8,
     ),
+    # Gemma 4 12B (gemma4_unified): 31B's attention without per-layer inputs,
+    # KV sharing or experts, tied, its vision and audio configs alongside, at
+    # lmstudio-community's 5 bits in groups of 64.
+    "gemma4-unified-12b-shape": TinyGemma4Spec(
+        unified=True, num_key_value_heads=2, num_global_key_value_heads=1, attention_k_eq_v=True,
+        num_kv_shared_layers=0, hidden_size_per_layer_input=0, use_double_wide_mlp=False, bits=5, group_size=64,
+        seed=9,
+    ),
 }
 # Gemma 4 26B-A4B's layout: 31B's attention plus a mixture of experts beside
 # every dense MLP; untied so greedy continuations discriminate.
@@ -380,6 +388,43 @@ def test_kv_cache_defaults_to_f16_on_metal(native_cli, fixture_model, backend):
     _skip_unsupported(directory, backend)
     expected = "f16" if backend == "metal" and not _latent(directory) else "f32"
     assert _run(native_cli, "info", "--model", str(directory), "--backend", backend)["kv_cache"] == expected
+
+
+def test_gemma4_unified_runs_text_beside_a_tower_it_does_not(native_cli, tmp_path):
+    # Gemma 4 12B's checkpoints carry a gemma4_unified_vision tower and an
+    # audio tower. The text model loads and info says the tower is not
+    # supported; asking for images fails closed.
+    directory = write_tiny_gemma4(tmp_path / "model", GEMMA4_VARIANTS["gemma4-unified-12b-shape"])
+    info = _run(native_cli, "info", "--model", str(directory), "--backend", "cpu")
+    assert info["architecture"] == "gemma4_unified"
+    assert info["vision"] == {"supported": False, "model_type": "gemma4_unified_vision"}
+    image = tmp_path / "image.ppm"
+    image.write_bytes(b"P6\n16 16\n255\n" + bytes(16 * 16 * 3))
+    result = subprocess.run([str(native_cli), "generate", "--model", str(directory), "--backend", "cpu",
+                             "--tokens", "2,5,9", "--max-new", "2", "--images", str(image)],
+                            capture_output=True, text=True)
+    assert result.returncode != 0 and "unsupported vision tower 'gemma4_unified_vision'" in result.stderr
+
+
+_NO_PLE_OR_EXPERTS = "gemma4_unified: per-layer inputs and experts are not part of this model"
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"hidden_size_per_layer_input": 16}, _NO_PLE_OR_EXPERTS),
+        ({"enable_moe_block": True, "num_experts": 4, "top_k_experts": 2, "moe_intermediate_size": 64},
+         _NO_PLE_OR_EXPERTS),
+        ({"use_bidirectional_attention": "all"}, "gemma4_unified: use_bidirectional_attention 'all' is not supported"),
+        # Transformers would make the last layer full attention; the engine refuses.
+        ({"layer_types": ["sliding_attention", "sliding_attention", "full_attention", "sliding_attention",
+                          "full_attention", "sliding_attention"]},
+         "gemma4_unified: the last layer must be full_attention"),
+    ],
+)
+def test_unsupported_gemma4_unified_configurations_fail_closed(native_cli, tmp_path, change, message):
+    directory = write_tiny_gemma4(tmp_path / "model", GEMMA4_VARIANTS["gemma4-unified-12b-shape"])
+    assert message in _load_error(native_cli, _edit_text_config(directory, change))
 
 
 def test_unknown_kv_cache_type_fails_closed(native_cli, tmp_path):

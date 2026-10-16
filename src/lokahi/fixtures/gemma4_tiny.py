@@ -55,6 +55,7 @@ class TinyGemma4Spec:
     top_k_experts: int = 2
     moe_intermediate_size: int = 64
     nested: bool = True  # text_config and the language_model. prefix, as mlx-community ships it
+    unified: bool = False  # Gemma 4 12B's gemma4_unified, with its vision and audio configs
     group_size: int = 32
     bits: int = 4
     seed: int = 0
@@ -66,7 +67,7 @@ class TinyGemma4Spec:
 
     def text_config(self) -> dict:
         config = {
-            "model_type": "gemma4_text",
+            "model_type": "gemma4_unified_text" if self.unified else "gemma4_text",
             "vocab_size": self.vocab_size,
             "vocab_size_per_layer_input": self.vocab_size,
             "hidden_size": self.hidden_size,
@@ -108,7 +109,7 @@ class TinyGemma4Spec:
                 quant[f"{p}model.layers.{layer}.router.proj"] = {"group_size": self.group_size, "bits": 8}
         if not self.nested:
             return {**self.text_config(), "quantization": quant, "quantization_config": quant}
-        return {
+        config = {
             "architectures": ["Gemma4ForConditionalGeneration"],
             "model_type": "gemma4",
             "text_config": self.text_config(),
@@ -117,6 +118,16 @@ class TinyGemma4Spec:
             "quantization": quant,
             "quantization_config": quant,
         }
+        if self.unified:  # towers the text model ignores, as google/gemma-4-12B-it lists them
+            config.update({
+                "architectures": ["Gemma4UnifiedForConditionalGeneration"],
+                "model_type": "gemma4_unified",
+                "vision_config": {"model_type": "gemma4_unified_vision", "mm_embed_dim": self.hidden_size,
+                                  "mm_posemb_size": 1120, "output_proj_dims": self.hidden_size, "patch_size": 16,
+                                  "pooling_kernel_size": 3, "rms_norm_eps": 1e-6},
+                "audio_config": {"model_type": "gemma4_unified_audio", "audio_embed_dim": 640, "rms_norm_eps": 1e-6},
+            })
+        return config
 
 
 def write_tiny_gemma4(directory: Path, spec: TinyGemma4Spec = TinyGemma4Spec()) -> Path:

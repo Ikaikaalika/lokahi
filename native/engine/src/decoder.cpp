@@ -34,9 +34,11 @@ bool is_gemma3(const Json& raw) {
   return type == "gemma3_text" || type == "gemma3";
 }
 
+// Gemma 4, and Gemma 4 12B's gemma4_unified: Gemma 4's decoder without
+// per-layer inputs or experts.
 bool is_gemma4(const Json& raw) {
   const std::string type = model_type(raw);
-  return type == "gemma4_text" || type == "gemma4";
+  return type == "gemma4_text" || type == "gemma4" || type == "gemma4_unified" || type == "gemma4_unified_text";
 }
 
 bool is_llama_family(const Json& raw) {
@@ -208,14 +210,23 @@ DecoderConfig gemma3_config(const Json& raw) {
 DecoderConfig gemma4_config(const Json& raw) {
   const Json& cfg = text_config(raw);
   DecoderConfig c;
-  c.architecture = "gemma4";
-  LK_CHECK(!flag(cfg, "attention_bias"), "gemma4: attention_bias is not supported");
-  LK_CHECK(!flag(cfg, "use_bidirectional_attention"), "gemma4: bidirectional attention is not supported");
+  // Transformers' Gemma4UnifiedTextConfig: Gemma4TextConfig without per-layer
+  // inputs or experts, a 1024-token window and "vision" attention by default.
+  const bool unified = model_type(raw).rfind("gemma4_unified", 0) == 0;
+  c.architecture = unified ? "gemma4_unified" : "gemma4";
+  const std::string& arch = c.architecture;
+  LK_CHECK(!flag(cfg, "attention_bias"), arch + ": attention_bias is not supported");
   // "vision": image tokens see each other on sliding layers only
   // (Transformers' create_masks_for_vision_model); otherwise they are causal.
-  if (cfg.string_or("use_bidirectional_attention", "") == "vision") {
-    c.image_blocks = DecoderConfig::ImageBlocks::SlidingLayers;
+  // "all" (every token bidirectional, with a halved window) is not supported.
+  std::string bidirectional = unified ? "vision" : "";
+  if (const Json* mode = cfg.find("use_bidirectional_attention"); mode != nullptr && !mode->is_null()) {
+    LK_CHECK(mode->is_string(), arch + ": bidirectional attention is not supported");
+    bidirectional = mode->as_string();
   }
+  LK_CHECK(bidirectional.empty() || bidirectional == "vision",
+           arch + ": use_bidirectional_attention '" + bidirectional + "' is not supported");
+  if (bidirectional == "vision") c.image_blocks = DecoderConfig::ImageBlocks::SlidingLayers;
   c.vocab_size = static_cast<int>(cfg.at("vocab_size").as_int());
   c.hidden_size = static_cast<int>(cfg.at("hidden_size").as_int());
   c.intermediate_size = static_cast<int>(cfg.at("intermediate_size").as_int());
@@ -230,16 +241,20 @@ DecoderConfig gemma4_config(const Json& raw) {
   c.attn_scale = 1.0f;
   c.embed_scale = bf16_round(std::sqrt(static_cast<float>(c.hidden_size)));
   const std::string activation = cfg.string_or("hidden_activation", "gelu_pytorch_tanh");
-  LK_CHECK(activation == "gelu_pytorch_tanh", "gemma4: unsupported activation " + activation);
+  LK_CHECK(activation == "gelu_pytorch_tanh", arch + ": unsupported activation " + activation);
   c.activation = Activation::GeluTanh;
-  c.sliding_window = static_cast<int>(cfg.int_or("sliding_window", 512));
+  c.sliding_window = static_cast<int>(cfg.int_or("sliding_window", unified ? 1024 : 512));
   if (const Json* types = cfg.find("layer_types"); types != nullptr && types->is_array()) {
     for (const Json& kind : types->as_array()) c.layer_is_sliding.push_back(kind.as_string() == "sliding_attention");
   } else {
-    const int pattern = static_cast<int>(cfg.int_or("sliding_window_pattern", 5));
+    // Without layer_types, MLX-LM's gemma4_text repeats sliding_window_pattern
+    // (default 5); Transformers' unified model makes every sixth layer full.
+    const int pattern = unified ? 6 : static_cast<int>(cfg.int_or("sliding_window_pattern", 5));
     for (int i = 0; i < c.num_layers; ++i) c.layer_is_sliding.push_back((i + 1) % pattern != 0);
   }
-  LK_CHECK(static_cast<int>(c.layer_is_sliding.size()) == c.num_layers, "gemma4: layer_types length mismatch");
+  LK_CHECK(static_cast<int>(c.layer_is_sliding.size()) == c.num_layers, arch + ": layer_types length mismatch");
+  // Transformers forces the unified model's last layer to full attention.
+  LK_CHECK(!unified || !c.layer_is_sliding.back(), arch + ": the last layer must be full_attention");
 
   // RoPE per layer kind. Sliding layers rotate fully with their own base.
   c.local_rope = true;
@@ -267,7 +282,8 @@ DecoderConfig gemma4_config(const Json& raw) {
     }
   }
 
-  const int global_dim = static_cast<int>(cfg.int_or("global_head_dim", c.head_dim));
+  // Transformers and MLX-LM both default global_head_dim to 512.
+  const int global_dim = static_cast<int>(cfg.int_or("global_head_dim", 512));
   const bool k_eq_v = flag(cfg, "attention_k_eq_v");
   const Json* global_kv = cfg.find("num_global_key_value_heads");
   const int shared = static_cast<int>(cfg.int_or("num_kv_shared_layers", 0));
@@ -309,6 +325,8 @@ DecoderConfig gemma4_config(const Json& raw) {
     c.layer_moe.assign(static_cast<size_t>(c.num_layers), true);
   }
   c.per_layer_input = static_cast<int>(cfg.int_or("hidden_size_per_layer_input", 0));
+  LK_CHECK(!unified || (c.per_layer_input == 0 && !flag(cfg, "enable_moe_block")),
+           arch + ": per-layer inputs and experts are not part of this model");
   c.pad_token_id = static_cast<int>(cfg.int_or("pad_token_id", raw.int_or("pad_token_id", 0)));
   c.per_layer_embed_scale = bf16_round(std::sqrt(static_cast<float>(c.per_layer_input)));
   c.per_layer_projection_scale = bf16_round(1.0f / std::sqrt(static_cast<float>(c.hidden_size)));

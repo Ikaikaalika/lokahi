@@ -84,11 +84,17 @@ class Gemma4Config:
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "Gemma4Config":
         cfg = dict(raw.get("text_config") or raw)
+        # Gemma 4 12B (gemma4_unified): no per-layer inputs or experts, a
+        # 1024-token window, "vision" attention and every sixth layer full by
+        # default, as Transformers' Gemma4UnifiedTextConfig has them.
+        unified = str(raw.get("model_type", "")).startswith("gemma4_unified")
+        if unified and (cfg.get("hidden_size_per_layer_input") or cfg.get("enable_moe_block")):
+            raise ValueError("gemma4_unified has no per-layer inputs or experts")
         moe = bool(cfg.get("enable_moe_block"))
         layers = int(cfg["num_hidden_layers"])
         types = cfg.get("layer_types")
         if not types:
-            pattern = int(cfg.get("sliding_window_pattern", 5))
+            pattern = 6 if unified else int(cfg.get("sliding_window_pattern", 5))
             cycle = ["sliding_attention"] * (pattern - 1) + ["full_attention"]
             types = (cycle * (layers // len(cycle) + 1))[:layers]
         rope = cfg.get("rope_parameters") or {
@@ -103,17 +109,17 @@ class Gemma4Config:
             num_key_value_heads=int(cfg.get("num_key_value_heads", 1)),
             num_global_key_value_heads=cfg.get("num_global_key_value_heads"),
             head_dim=int(cfg.get("head_dim", 256)),
-            global_head_dim=int(cfg.get("global_head_dim") or cfg.get("head_dim", 256)),
+            global_head_dim=int(cfg.get("global_head_dim") or 512),  # Transformers' and MLX-LM's default
             rms_norm_eps=float(cfg.get("rms_norm_eps", 1e-6)),
             layer_types=tuple(types),
             rope=rope,
-            sliding_window=int(cfg.get("sliding_window", 512)),
+            sliding_window=int(cfg.get("sliding_window", 1024 if unified else 512)),
             attention_k_eq_v=bool(cfg.get("attention_k_eq_v", False)),
             num_kv_shared_layers=int(cfg.get("num_kv_shared_layers", 0)),
             hidden_size_per_layer_input=int(cfg.get("hidden_size_per_layer_input") or 0),
             final_logit_softcapping=cfg.get("final_logit_softcapping"),
             pad_token_id=int(cfg.get("pad_token_id", raw.get("pad_token_id", 0)) or 0),
-            bidirectional_vision=cfg.get("use_bidirectional_attention") == "vision",
+            bidirectional_vision=cfg.get("use_bidirectional_attention", "vision" if unified else None) == "vision",
             num_experts=int(cfg["num_experts"]) if moe else 0,
             top_k_experts=int(cfg["top_k_experts"]) if moe else 0,
         )

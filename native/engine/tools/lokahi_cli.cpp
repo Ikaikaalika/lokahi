@@ -283,7 +283,12 @@ int cmd_image_geometry(const Args& args) {
 int cmd_info(const Args& args) {
   auto model = load_model(args.get("model"), load_options(args));
   std::string vision;
-  if (auto encoder = VisionEncoder::load(args.get("model"), "cpu")) {
+  const Json config = Json::parse(read_text_file(args.get("model") + "/config.json"));
+  if (has_vision(config) && !vision_supported(config)) {
+    // The text model runs; asking for images fails closed.
+    vision = ",\"vision\":{\"supported\":false,\"model_type\":\"" +
+             config.at("vision_config").string_or("model_type", "") + "\"}";
+  } else if (auto encoder = VisionEncoder::load(args.get("model"), "cpu")) {
     // image_size 0: images take any accepted size (image-geometry).
     vision = ",\"vision\":{\"image_size\":" + std::to_string(encoder->fixed_size()) +
              ",\"image_token_id\":" + std::to_string(encoder->image_token_id()) + "}";
