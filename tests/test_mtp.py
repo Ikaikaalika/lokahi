@@ -4,7 +4,9 @@ Correctness evidence only: generated fixtures with random weights, so the
 head's drafts are rarely right and nothing here measures acceptance or speed.
 The head's drafts and logits must equal the oracle's full recomputation
 (``Qwen35Mtp``) after any run of speculative decoding, and the output must
-stay plain greedy decoding's.
+stay plain greedy decoding's. The CPU must match within 1e-4 of the logits'
+scale; Metal, which stores keys and values as FP16, within 2e-2 with the
+same drafts, as for its other logits.
 """
 from __future__ import annotations
 
@@ -55,36 +57,46 @@ def mtp_model(request, tmp_path_factory):
     return directory, target, Qwen35Mtp.from_checkpoint(target)
 
 
-def _probe(cli, directory, tmp_path, prompt, *args) -> tuple[dict, np.ndarray]:
+def _probe(cli, directory, tmp_path, prompt, *args, backend: str = "cpu") -> tuple[dict, np.ndarray]:
     logits = tmp_path / "mtp.f32"
-    report = _generate(cli, directory, "--backend", "cpu", "--tokens", ",".join(map(str, prompt)),
+    report = _generate(cli, directory, "--backend", backend, "--tokens", ",".join(map(str, prompt)),
                        "--mtp-probe", "3", "--mtp-logits", str(logits), *args)
     return report, np.fromfile(logits, dtype=np.float32).reshape(3, -1)
 
 
-def _assert_head_matches(head: Qwen35Mtp, context: list[int], report: dict, logits: np.ndarray) -> None:
+def _assert_head_matches(head: Qwen35Mtp, context: list[int], report: dict, logits: np.ndarray,
+                         backend: str = "cpu") -> None:
     drafts, expected = head.drafts(context, 3)
     assert report["mtp_drafts"] == drafts
-    assert np.abs(logits - expected).max() < 1e-4 * np.abs(expected).max()
+    tolerance = 1e-4 if backend == "cpu" else 2e-2
+    assert np.abs(logits - expected).max() < tolerance * np.abs(expected).max()
 
 
-def test_mtp_drafting_is_plain_greedy_and_the_head_matches_the_oracle(native_cli, mtp_model, tmp_path):
+def _skip_unsupported(directory: Path, backend: str) -> None:
+    if backend == "metal" and "quantization" not in json.loads((directory / "config.json").read_text()):
+        pytest.skip("the Metal backend reads quantized checkpoints only")
+
+
+@pytest.mark.parametrize("backend", _backends())
+def test_mtp_drafting_is_plain_greedy_and_the_head_matches_the_oracle(native_cli, mtp_model, backend, tmp_path):
     # The head drafts every pass; with random weights it is almost always
     # wrong, so each pass rolls back to the last token. The output is plain
     # greedy decoding's, and afterwards the head's next drafts and their
     # logits equal the oracle's for the whole context.
     directory, target, head = mtp_model
+    _skip_unsupported(directory, backend)
     prompt = TOKENS[:6]
     report, logits = _probe(native_cli, directory, tmp_path, prompt, "--max-new", "10", "--no-eos-stop",
-                            "--speculate", "3", "--drafter", "mtp")
+                            "--speculate", "3", "--drafter", "mtp", backend=backend)
     assert report["tokens"] == target.greedy(prompt, 10)
     stats = report["speculation"]
     assert stats["passes"] > 0 and stats["drafted"] > stats["passes"]
-    _assert_head_matches(head, prompt + report["tokens"], report, logits)
+    _assert_head_matches(head, prompt + report["tokens"], report, logits, backend)
 
 
+@pytest.mark.parametrize("backend", _backends())
 @pytest.mark.parametrize("name", ["qwen3.5-mlx", "qwen3-next-mlx"])
-def test_the_head_follows_accepted_runs_stops_and_limits(native_cli, name, tmp_path):
+def test_the_head_follows_accepted_runs_stops_and_limits(native_cli, name, backend, tmp_path):
     # Lookup drafts from a reference (the greedy continuation with two tokens
     # changed) are mostly accepted, so passes keep several tokens, reject the
     # rest, stop inside accepted runs and end at limits inside passes. The
@@ -100,23 +112,24 @@ def test_the_head_follows_accepted_runs_stops_and_limits(native_cli, name, tmp_p
         reference[at] = (reference[at] + 1) % 512
     (tmp_path / "reference.txt").write_text(",".join(map(str, reference)))
     args = ("--speculate", "4", "--drafter", "both", "--draft-reference", str(tmp_path / "reference.txt"))
-    report, logits = _probe(native_cli, directory, tmp_path, prompt, "--max-new", "16", "--no-eos-stop", *args)
+    report, logits = _probe(native_cli, directory, tmp_path, prompt, "--max-new", "16", "--no-eos-stop", *args,
+                            backend=backend)
     assert report["tokens"] == plain
     stats = report["speculation"]
     assert 0 < stats["accepted"] < stats["drafted"]
-    _assert_head_matches(head, prompt + plain, report, logits)
+    _assert_head_matches(head, prompt + plain, report, logits, backend)
     for limit in (3, 7, 10):
         report, logits = _probe(native_cli, directory, tmp_path, prompt, "--max-new", str(limit), "--no-eos-stop",
-                                *args)
+                                *args, backend=backend)
         assert report["tokens"] == plain[:limit]
-        _assert_head_matches(head, prompt + plain[:limit], report, logits)
+        _assert_head_matches(head, prompt + plain[:limit], report, logits, backend)
     config = json.loads((directory / "config.json").read_text())
     for stop in [i for i in range(2, 12) if plain[i] not in plain[:i]][:3]:
         (config.get("text_config") or config)["eos_token_id"] = plain[stop]
         (directory / "config.json").write_text(json.dumps(config))
-        report, logits = _probe(native_cli, directory, tmp_path, prompt, "--max-new", "16", *args)
+        report, logits = _probe(native_cli, directory, tmp_path, prompt, "--max-new", "16", *args, backend=backend)
         assert report["tokens"] == plain[: stop + 1]
-        _assert_head_matches(head, prompt + plain[: stop + 1], report, logits)
+        _assert_head_matches(head, prompt + plain[: stop + 1], report, logits, backend)
 
 
 def test_a_split_drafter_is_the_head_beside_the_decoder(native_cli, tmp_path):
@@ -189,8 +202,17 @@ def test_mtp_fails_closed(native_cli, tmp_path):
 
 
 @pytest.mark.skipif("metal" not in _backends(), reason="needs the Metal backend")
-def test_metal_refuses_mtp_drafting_for_now(native_cli, tmp_path):
-    directory = write_tiny_qwen35(tmp_path / "model", VARIANTS["qwen3.5-mlx"])
-    assert "metal: multi-token prediction is not supported on this backend" in _error(
-        native_cli, "generate", "--model", str(directory), "--backend", "metal", "--tokens", "2,5,9",
-        "--max-new", "4", "--speculate", "2", "--drafter", "mtp")
+def test_metal_runs_without_a_head_its_kernels_cannot_read(native_cli, tmp_path):
+    # A drafter quantized in groups of 16 leaves the decoder running on
+    # Metal; drafting with it fails closed, and the CPU drafts with it.
+    decoder = write_tiny_qwen35(tmp_path / "decoder", TinyQwen35Spec())
+    drafter = write_tiny_qwen35_mtp_drafter(tmp_path / "drafter", TinyQwen35Spec(mtp=True, group_size=16))
+    info = json.loads(subprocess.run([str(native_cli), "info", "--model", str(decoder), "--backend", "metal",
+                                      "--draft-model", str(drafter)],
+                                     check=True, capture_output=True, text=True).stdout)
+    assert info["mtp"] is False
+    args = ("generate", "--model", str(decoder), "--draft-model", str(drafter), "--tokens", "2,5,9",
+            "--max-new", "4", "--speculate", "2", "--drafter", "mtp")
+    assert "the MTP head cannot run on Metal: metal: fc needs cols and group_size divisible by 32" in _error(
+        native_cli, *args, "--backend", "metal")
+    assert _generate(native_cli, decoder, *args[3:], "--backend", "cpu")["tokens"]
