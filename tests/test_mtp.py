@@ -168,6 +168,43 @@ def test_a_drafter_takes_the_decoders_norm_convention(native_cli, tmp_path):
     _assert_head_matches(Qwen35Mtp.load(target, drafter), TOKENS[:6] + report["tokens"], report, logits)
 
 
+@pytest.mark.parametrize("backend", _backends())
+def test_bench_speculates_only_to_reproduce_plain_greedy(native_cli, backend, tmp_path):
+    # bench --speculate decodes plainly once, untimed, and checks every
+    # repetition against it; a pass emits its tokens together, so the
+    # inter-token latency is the mean. The setup is the hardware run's (a
+    # decoder and a split drafter), but a tiny random model's timings are not
+    # evidence: only tokens and pass counts are checked.
+    spec = VARIANTS["qwen3.5-mlx"]
+    decoder = write_tiny_qwen35(tmp_path / "decoder", TinyQwen35Spec())
+    _skip_unsupported(decoder, backend)
+    drafter = write_tiny_qwen35_mtp_drafter(tmp_path / "drafter", spec)
+    prompt = TOKENS[:6]
+    plain = Qwen35Reference.load(decoder).greedy(prompt, 12)
+    reference = prompt + plain
+    reference[len(prompt) + 5] = (reference[len(prompt) + 5] + 1) % 512
+    (tmp_path / "reference.txt").write_text(",".join(map(str, reference)))
+    bench = (str(native_cli), "bench", "--model", str(decoder), "--backend", backend, "--draft-model", str(drafter),
+             "--tokens", ",".join(map(str, prompt)), "--max-new", "12", "--warmups", "1", "--repetitions", "2")
+    report = json.loads(subprocess.run(bench, check=True, capture_output=True, text=True).stdout)
+    assert report["speculation"] is None
+    assert [run["token_ids"] for run in report["repetitions"]] == [plain, plain]
+    assert not any("speculation" in run for run in report["repetitions"])
+    speculate = ("--speculate", "3", "--draft-reference", str(tmp_path / "reference.txt"))
+    for drafter_name in ("lookup", "mtp", "both"):
+        report = json.loads(subprocess.run([*bench, *speculate, "--drafter", drafter_name],
+                                           check=True, capture_output=True, text=True).stdout)
+        assert report["speculation"] == {"max_draft": 3, "drafter": drafter_name, "inter_token_latency": "mean",
+                                         "matches_plain_greedy": True}
+        for run in report["repetitions"]:
+            assert run["token_ids"] == plain
+            stats = run["speculation"]
+            assert stats["passes"] > 0 and stats["drafted"] >= stats["passes"]
+            if drafter_name != "mtp":  # lookup follows the reference up to the changed token
+                assert stats["accepted"] > 0
+            assert run["inter_token_latency_ms"] == pytest.approx(1000 / run["decode_tokens_per_second"], rel=1e-4)
+
+
 def test_mtp_fails_closed(native_cli, tmp_path):
     plain = write_tiny_qwen35(tmp_path / "plain", TinyQwen35Spec())
     generate = ("generate", "--backend", "cpu", "--tokens", "2,5,9", "--max-new", "4", "--speculate", "2")
