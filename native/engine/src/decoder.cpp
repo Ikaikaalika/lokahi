@@ -963,7 +963,24 @@ double attention(const DecoderConfig& c, int layer, int start, int n) {
   return head_bytes * (2.0 * n * c.num_heads + 2.0 * keys * c.kv_heads_of(layer));
 }
 
+double latent_qkv(const DecoderConfig& c, const DecoderLayer& L, int n) {
+  double bytes = linear(L.q_proj, n) + linear(L.kv_a_proj, n) + (c.q_lora_rank > 0 ? linear(L.q_a_proj, n) : 0.0);
+  for (int h = 0; h < c.num_heads; ++h) bytes += linear(latent_absorption(c, L, h), n);
+  return bytes;
+}
+
+double latent_out(const DecoderLayer& L, int n) {
+  double bytes = linear(L.o_proj, n);
+  for (const Linear& head : L.unembed_out) bytes += linear(head, n);
+  return bytes;
+}
+
 }  // namespace traffic
+
+Linear latent_absorption(const DecoderConfig& c, const DecoderLayer& L, int head) {
+  if (!L.embed_q.empty()) return L.embed_q[static_cast<size_t>(head)];
+  return row_slice(L.kv_b_proj, static_cast<int64_t>(head) * (c.qk_nope_dim + c.v_head_dim), c.qk_nope_dim);
+}
 
 // ---------------------------------------------------------------------------
 // CPU backend
@@ -988,10 +1005,6 @@ float gelu_tanh(float x) {
 }
 
 float silu(float x) { return x / (1.0f + std::exp(-x)); }
-
-// The query and latent norms of multi-head latent attention, whatever
-// rms_norm_eps is (Transformers and MLX-LM construct them with 1e-6).
-constexpr float kLatentNormEps = 1e-6f;
 
 // Times the enclosing block into `profiler` as `name` (no-op without one).
 class Section {
@@ -1397,20 +1410,14 @@ class DecoderCpu final : public Model {
       for (int t = 0; t < n; ++t) std::copy_n(head_out_.data() + static_cast<size_t>(t) * width, width, rows + t * stride + offset);
     };
     {
-      double bytes = 0.0;
-      if (profiling) {
-        bytes = traffic::linear(L.q_proj, n) + traffic::linear(L.kv_a_proj, n) +
-                (c_.q_lora_rank > 0 ? traffic::linear(L.q_a_proj, n) : 0.0);
-        for (int hh = 0; hh < H; ++hh) bytes += traffic::linear(absorption(L, hh), n);
-      }
-      Section section(profiler_, "qkv", bytes);
+      Section section(profiler_, "qkv", profiling ? traffic::latent_qkv(c_, L, n) : 0.0);
       if (c_.q_lora_rank > 0) {
         const int64_t Q = c_.q_lora_rank;
         q_latent_.resize(sn * Q);
         matmul(L.q_a_proj, h_.data(), n, q_latent_.data(), pool_);
         for (int t = 0; t < n; ++t) {
           float* row = q_latent_.data() + static_cast<size_t>(t) * Q;
-          rms_norm(row, L.q_a_norm.data(), Q, kLatentNormEps, 0.0f, row);
+          rms_norm(row, L.q_a_norm.data(), Q, c_.latent_norm_eps, 0.0f, row);
         }
         matmul(L.q_proj, q_latent_.data(), n, q_.data(), pool_);
       } else {
@@ -1431,7 +1438,7 @@ class DecoderCpu final : public Model {
       Section section(profiler_, "rope_kv", profiling ? traffic::rows(W, n, 2 * H + 3) : 0.0);
       for (int t = 0; t < n; ++t) {
         float* latent = k_.data() + static_cast<size_t>(t) * W;
-        rms_norm(latent, L.kv_a_norm.data(), rank, kLatentNormEps, 0.0f, latent);
+        rms_norm(latent, L.kv_a_norm.data(), rank, c_.latent_norm_eps, 0.0f, latent);
         rope_latent(latent + rank, start + t);
         std::copy_n(latent, W, kv_k_[static_cast<size_t>(l)].data() + static_cast<size_t>(start + t) * W);
         for (int hh = 0; hh < H; ++hh) {
@@ -1445,25 +1452,13 @@ class DecoderCpu final : public Model {
       Section section(profiler_, "attention", profiling ? traffic::attention(c_, l, start, n) : 0.0);
       attend_latent(l, start, n);
     }
-    double bytes = 0.0;
-    if (profiling) {
-      bytes = traffic::linear(L.o_proj, n);
-      for (const Linear& u : L.unembed_out) bytes += traffic::linear(u, n);
-    }
-    Section section(profiler_, "o_proj", bytes);
+    Section section(profiler_, "o_proj", profiling ? traffic::latent_out(L, n) : 0.0);
     for (int hh = 0; hh < H; ++hh) {
       gather(latent_out_.data(), static_cast<size_t>(H) * rank, static_cast<size_t>(hh) * rank, rank);
       matmul(L.unembed_out[static_cast<size_t>(hh)], head_in_.data(), n, head_out_.data(), pool_);
       scatter(attn_.data(), static_cast<size_t>(H) * V, static_cast<size_t>(hh) * V, V);
     }
     matmul(L.o_proj, attn_.data(), n, r_.data(), pool_);
-  }
-
-  // Head h's query absorption: embed_q, or the key rows of kv_b_proj
-  // (applied transposed).
-  Linear absorption(const DecoderLayer& L, int h) const {
-    if (!L.embed_q.empty()) return L.embed_q[static_cast<size_t>(h)];
-    return row_slice(L.kv_b_proj, static_cast<int64_t>(h) * (c_.qk_nope_dim + c_.v_head_dim), c_.qk_nope_dim);
   }
 
   // latent_q_[t, h, :rank] = sum over d of q_nope[t, h, d] * keys_h[d, :],
@@ -1475,7 +1470,7 @@ class DecoderCpu final : public Model {
     pool_.parallel_for(static_cast<size_t>(H), [&](size_t begin, size_t end) {
       std::vector<float> row(static_cast<size_t>(rank));
       for (size_t hh = begin; hh < end; ++hh) {
-        const Linear keys = absorption(L, static_cast<int>(hh));
+        const Linear keys = latent_absorption(c_, L, static_cast<int>(hh));
         for (int t = 0; t < n; ++t) std::fill_n(latent_q_.data() + (t * H + hh) * W, rank, 0.0f);
         for (int d = 0; d < nope; ++d) {
           dequantize_row(keys, d, row.data());

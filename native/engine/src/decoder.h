@@ -154,6 +154,9 @@ struct DecoderConfig {
   int qk_nope_dim = 0, qk_rope_dim = 0, v_head_dim = 0;
   bool rope_pairs = false;   // rotate interleaved pairs rather than halves (MLA only)
   float rope_factor = 1.0f;  // YaRN's attention factor, on the RoPE'd dimensions only (MLA only)
+  // The query and latent norms' epsilon, whatever rms_norm_eps is
+  // (Transformers and MLX-LM construct them with 1e-6).
+  float latent_norm_eps = 1e-6f;
   bool mla() const { return kv_lora_rank > 0; }
   int latent_width() const { return kv_lora_rank + qk_rope_dim; }
 
@@ -235,6 +238,11 @@ struct DecoderWeights {
 
 std::unique_ptr<Model> make_decoder_cpu(std::shared_ptr<DecoderWeights> weights, const LoadOptions& options);
 
+// Head `head`'s query absorption in a latent attention layer: its embed_q,
+// or its key rows of kv_b_proj [qk_nope_dim, kv_lora_rank] (applied
+// transposed).
+Linear latent_absorption(const DecoderConfig& config, const DecoderLayer& layer, int head);
+
 // Minimum memory traffic, in bytes, of forward-pass sections over n tokens,
 // shared by every backend's profiler so attributions are comparable.
 // Activations are float32; weights count once per call.
@@ -245,6 +253,10 @@ double rows(int64_t width, int n, int arrays);         // `arrays` [n, width] te
 // q reads, output writes, and every visible key and value read once per kv
 // head for tokens at positions [start, start + n).
 double attention(const DecoderConfig& config, int layer, int start, int n);
+// Latent attention's query and latent projections with every head's
+// absorption, and its per-head expansions with o_proj.
+double latent_qkv(const DecoderConfig& config, const DecoderLayer& layer, int n);
+double latent_out(const DecoderLayer& layer, int n);
 }  // namespace traffic
 
 }  // namespace lokahi
