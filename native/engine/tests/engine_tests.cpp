@@ -700,6 +700,20 @@ static const char* kKimiK2Config = R"({
   "v_head_dim": 128, "vocab_size": 163840
 })";
 
+// zai-org/GLM-4.7-Flash's config.json, as published.
+static const char* kGlm47FlashConfig = R"({
+  "architectures": ["Glm4MoeLiteForCausalLM"], "attention_bias": false, "attention_dropout": 0.0,
+  "pad_token_id": 154820, "eos_token_id": [154820, 154827, 154829], "hidden_act": "silu", "hidden_size": 2048,
+  "intermediate_size": 10240, "max_position_embeddings": 202752, "model_type": "glm4_moe_lite",
+  "moe_intermediate_size": 1536, "topk_method": "noaux_tc", "norm_topk_prob": true, "num_attention_heads": 20,
+  "n_group": 1, "topk_group": 1, "n_routed_experts": 64, "n_shared_experts": 1, "routed_scaling_factor": 1.8,
+  "num_experts_per_tok": 4, "first_k_dense_replace": 1, "num_hidden_layers": 47, "num_key_value_heads": 20,
+  "num_nextn_predict_layers": 1, "partial_rotary_factor": 1.0, "rms_norm_eps": 1e-05, "rope_scaling": null,
+  "rope_theta": 1000000, "tie_word_embeddings": false, "dtype": "bfloat16", "transformers_version": "5.0.0rc0",
+  "q_lora_rank": 768, "kv_lora_rank": 512, "qk_nope_head_dim": 192, "qk_rope_head_dim": 64, "v_head_dim": 256,
+  "vocab_size": 154880
+})";
+
 void test_deepseek_configs() {
   const double pi = 3.14159265358979323846;
   auto mscale = [](double factor, double m) { return 0.1 * m * std::log(factor) + 1.0; };
@@ -746,6 +760,20 @@ void test_deepseek_configs() {
   // beta_fast = beta_slow = 1: the ramp spans the one dimension around 19.2.
   const std::vector<double> k_inv = kimi.rope_inv_freq(false);
   EXPECT(std::fabs(k_inv[18] / plain(5e4, 18) - 1.0) < 1e-12 && std::fabs(k_inv[20] / (plain(5e4, 20) / 32) - 1.0) < 1e-12);
+
+  // GLM-4.7-Flash: V3's latent attention and routing, values wider than the
+  // unrotated keys, the latent norms at 1e-6 under rms_norm_eps 1e-5.
+  const DecoderConfig glm = DecoderConfig::from_json(Json::parse(kGlm47FlashConfig));
+  EXPECT(glm.architecture == "glm4_moe_lite" && glm.mla() && glm.num_heads == 20 && glm.q_lora_rank == 768);
+  EXPECT(glm.head_dim == 256 && glm.v_head_dim == 256 && glm.latent_width() == 576 && glm.rope_pairs);
+  EXPECT(glm.rms_norm_eps == 1e-5f && glm.latent_norm_eps == 1e-6f && glm.rope_factor == 1.0f);
+  EXPECT(std::fabs(glm.attn_scale * std::sqrt(256.0) - 1.0) < 1e-6);
+  EXPECT(glm.router == DecoderConfig::Router::SigmoidGrouped && glm.exclude_dropped_groups && glm.n_group == 1);
+  EXPECT(glm.num_experts == 64 && glm.experts_per_token == 4 && glm.shared_intermediate == 1536);
+  EXPECT(glm.routed_scaling == 1.8f && glm.norm_topk_prob && !glm.is_moe(0) && glm.is_moe(1) && glm.is_moe(46));
+  EXPECT(glm.eos_token_ids == std::vector<int32_t>({154820, 154827, 154829}));
+  const std::vector<double> g_inv = glm.rope_inv_freq(false);
+  EXPECT(g_inv.size() == 32 && std::fabs(g_inv[1] / std::pow(1e6, -2.0 / 64) - 1.0) < 1e-12);
 }
 
 int main() {

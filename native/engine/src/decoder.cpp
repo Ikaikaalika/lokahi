@@ -43,10 +43,11 @@ bool is_llama_family(const Json& raw) {
          type == "gpt_oss" || type == "glm4_moe";
 }
 
-// DeepSeek V2 and V3; Kimi K2 and Moonlight use V3's architecture.
+// DeepSeek V2 and V3; Kimi K2, Moonlight and GLM-4.7-Flash (glm4_moe_lite)
+// use V3's architecture.
 bool is_deepseek(const Json& raw) {
   const std::string type = model_type(raw);
-  return type == "deepseek_v2" || type == "deepseek_v3" || type == "kimi_k2";
+  return type == "deepseek_v2" || type == "deepseek_v3" || type == "kimi_k2" || type == "glm4_moe_lite";
 }
 
 bool flag(const Json& cfg, const char* key) {
@@ -416,7 +417,8 @@ DecoderConfig llama_family_config(const Json& cfg) {
   return c;
 }
 
-// DeepSeek V2 and V3 (Kimi K2 and Moonlight are V3): multi-head latent
+// DeepSeek V2 and V3 (Kimi K2 and Moonlight are V3, and GLM-4.7-Flash is V3
+// that lists its dense and sparse layers in mlp_layer_types): multi-head latent
 // attention with RoPE, and YaRN, on its rope dimensions only; pre-norm
 // blocks with dense MLPs before first_k_dense_replace and routed experts plus
 // always-on shared experts after. V3 routes as GLM-4.5 does, except that the
@@ -428,8 +430,10 @@ DecoderConfig llama_family_config(const Json& cfg) {
 DecoderConfig deepseek_config(const Json& raw) {
   const Json& cfg = text_config(raw);
   DecoderConfig c;
-  const bool v3 = model_type(raw) != "deepseek_v2";
-  c.architecture = v3 ? "deepseek_v3" : "deepseek_v2";
+  const std::string type = model_type(raw);
+  const bool v3 = type != "deepseek_v2";
+  const bool glm = type == "glm4_moe_lite";
+  c.architecture = glm ? "glm4_moe_lite" : v3 ? "deepseek_v3" : "deepseek_v2";
   const std::string& arch = c.architecture;
   c.vocab_size = static_cast<int>(cfg.at("vocab_size").as_int());
   c.hidden_size = static_cast<int>(cfg.at("hidden_size").as_int());
@@ -457,6 +461,7 @@ DecoderConfig deepseek_config(const Json& raw) {
   LK_CHECK(activation == "silu", arch + ": unsupported activation " + activation);
   LK_CHECK(!flag(cfg, "attention_bias"), arch + ": attention_bias is not supported");
   LK_CHECK(!flag(cfg, "mlp_bias"), arch + ": mlp_bias is not supported");
+  LK_CHECK(cfg.number_or("partial_rotary_factor", 1.0) == 1.0, arch + ": partial_rotary_factor is not supported");
   c.attn_scale = 1.0f / std::sqrt(static_cast<float>(c.head_dim));
   if (const Json* scaling = cfg.find("rope_scaling"); scaling != nullptr && scaling->is_object()) {
     const std::string kind = scaling->string_or("rope_type", scaling->string_or("type", "default"));
@@ -507,7 +512,20 @@ DecoderConfig deepseek_config(const Json& raw) {
                c.num_experts % c.n_group == 0 && c.topk_group > 0 && c.topk_group <= c.n_group &&
                c.experts_per_token <= c.topk_group * (c.num_experts / c.n_group),
            arch + ": invalid expert configuration");
-  const int dense = static_cast<int>(cfg.at("first_k_dense_replace").as_int());
+  if (const Json* types = cfg.find("mlp_layer_types"); glm && types != nullptr && types->is_array()) {
+    for (const Json& kind : types->as_array()) {
+      LK_CHECK(kind.as_string() == "dense" || kind.as_string() == "sparse",
+               arch + ": mlp_layer_types entries must be dense or sparse");
+      c.layer_moe.push_back(kind.as_string() == "sparse");
+    }
+    LK_CHECK(static_cast<int>(c.layer_moe.size()) == c.num_layers, arch + ": mlp_layer_types length mismatch");
+    return c;
+  }
+  // GLM-4.7-Flash's default lists its first layer dense (Transformers),
+  // which first_k_dense_replace says too (MLX-LM); other counts would differ.
+  const int dense = glm ? static_cast<int>(cfg.int_or("first_k_dense_replace", 1))
+                        : static_cast<int>(cfg.at("first_k_dense_replace").as_int());
+  LK_CHECK(!glm || dense == 1, arch + ": first_k_dense_replace other than 1 needs mlp_layer_types");
   for (int i = 0; i < c.num_layers; ++i) c.layer_moe.push_back(i >= dense);
   return c;
 }
@@ -522,7 +540,7 @@ DecoderConfig DecoderConfig::from_json(const Json& raw) {
   LK_CHECK(is_supported_decoder(raw),
            "unsupported architecture '" + model_type(raw) +
                "'; this build supports gemma3, gemma4, llama, mistral, qwen2, qwen3, qwen3_moe, gpt_oss, glm4_moe, "
-               "deepseek_v2 and deepseek_v3 text models");
+               "glm4_moe_lite, deepseek_v2 and deepseek_v3 text models");
   DecoderConfig c = is_gemma3(raw)     ? gemma3_config(raw)
                     : is_gemma4(raw)   ? gemma4_config(raw)
                     : is_deepseek(raw) ? deepseek_config(raw)

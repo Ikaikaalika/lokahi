@@ -3,7 +3,7 @@
 These tests pin the oracles' semantics to an independent implementation:
 ``mx.dequantize`` for the packed affine layout, and MLX-LM's ``gemma3_text``,
 ``gemma4``, ``llama``, ``qwen2``, ``qwen3``, ``qwen3_moe``, ``gpt_oss``, ``glm4_moe``,
-``deepseek_v2`` and ``deepseek_v3`` models for the full decoders. They need
+``deepseek_v2``, ``deepseek_v3`` and ``glm4_moe_lite`` models for the full decoders. They need
 ``mlx`` and ``mlx_lm`` and therefore run on Apple Silicon only.
 """
 from __future__ import annotations
@@ -169,8 +169,13 @@ def test_oracle_matches_mlx_lm_gemma4(tmp_path, spec):
         TinyDeepseekSpec(model_type="deepseek_v2", topk_method="group_limited_greedy", n_group=4, topk_group=2,
                          num_experts_per_tok=3, norm_topk_prob=False, n_shared_experts=2, routed_scaling_factor=16.0,
                          rope_scaling={**DEEPSEEK_YARN, "mscale": 0.707, "mscale_all_dim": 0.707}, seed=20),
+        # MLX-LM's latent norms take rms_norm_eps (1e-5) where Transformers'
+        # take 1e-6; at these magnitudes the difference is far below tolerance.
+        TinyDeepseekSpec(model_type="glm4_moe_lite", absorbed=True, qk_nope_head_dim=64, v_head_dim=96,
+                         num_experts_per_tok=4, routed_scaling_factor=1.8, rms_norm_eps=1e-5, rope_theta=1e6,
+                         rope_scaling=None, seed=21),
     ],
-    ids=["v3-absorbed-grouped", "v3-moonlight-factor", "v2-lite", "v2-grouped"],
+    ids=["v3-absorbed-grouped", "v3-moonlight-factor", "v2-lite", "v2-grouped", "glm4.7-flash"],
 )
 def test_oracle_matches_mlx_lm_deepseek(tmp_path, spec):
     directory = write_tiny_deepseek(tmp_path / "model", spec)
