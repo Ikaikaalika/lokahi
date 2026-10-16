@@ -458,19 +458,19 @@ def test_speculative_generation_matches_plain_greedy(native_cli, fixture_model, 
     report = _speculative_run(native_cli, directory, backend, prompt, reference, *args)
     assert report["tokens"] == plain
     stats = report["speculation"]
-    if backend == "cpu":
-        assert 0 < stats["accepted"] < stats["drafted"] and stats["passes"] < len(plain)
-    else:  # Metal decodes one token at a time until it can verify
-        assert stats == {"passes": 0, "drafted": 0, "accepted": 0}
+    assert 0 < stats["accepted"] < stats["drafted"] and stats["passes"] < len(plain)
     # Drafting from the context alone changes nothing either.
     assert _speculative_run(native_cli, directory, backend, prompt, None, *args)["tokens"] == plain
 
 
-@pytest.mark.parametrize("name", ["mistral-sliding-untied", "qwen3.5-mlx", "deepseek-v3-absorbed-grouped"])
-def test_speculative_stop_keeps_the_tokens_before_it(native_cli, name, tmp_path):
+@pytest.mark.parametrize("backend", _backends())
+@pytest.mark.parametrize("name", ["mistral-sliding-untied", "qwen3.5-mlx", "qwen3-next-mlx",
+                                  "deepseek-v3-absorbed-grouped"])
+def test_speculative_stop_keeps_the_tokens_before_it(native_cli, name, backend, tmp_path):
     # A stop token inside an accepted run, and a limit inside a pass: decoding
     # on afterwards continues from the tokens generation kept, for a sliding
-    # window (8 tokens, so the ring wraps), recurrent states and latents.
+    # window (8 tokens, so the ring wraps), recurrent states (Qwen3.5's and
+    # Qwen3-Next's grouped projections) and latents.
     directory = tmp_path / "model"
     if name in DENSE_VARIANTS:
         write_tiny_dense(directory, DENSE_VARIANTS[name])
@@ -478,18 +478,19 @@ def test_speculative_stop_keeps_the_tokens_before_it(native_cli, name, tmp_path)
         write_tiny_qwen35(directory, QWEN35_VARIANTS[name])
     else:
         write_tiny_deepseek(directory, DEEPSEEK_VARIANTS[name])
+    _skip_unsupported(directory, backend)
     prompt = TOKENS[:6]
-    plain = _run(native_cli, "generate", "--model", str(directory), "--backend", "cpu",
+    plain = _run(native_cli, "generate", "--model", str(directory), "--backend", backend,
                  "--tokens", ",".join(map(str, prompt)), "--max-new", "16", "--no-eos-stop")["tokens"]
     # Every stop position and limit, so some fall inside a pass's accepted run.
     for stop in [i for i in range(2, 12) if plain[i] not in plain[:i]]:
         _edit_text_config(directory, {"eos_token_id": plain[stop]})
-        report = _speculative_run(native_cli, directory, "cpu", prompt, prompt + plain, "--max-new", "16",
+        report = _speculative_run(native_cli, directory, backend, prompt, prompt + plain, "--max-new", "16",
                                   "--continue", "4")
         assert report["tokens"] == plain[: stop + 1] and report["continued"] == plain[stop + 1 : stop + 5]
         assert report["speculation"]["accepted"] > 0
     for limit in range(2, 12):
-        report = _speculative_run(native_cli, directory, "cpu", prompt, prompt + plain, "--max-new", str(limit),
+        report = _speculative_run(native_cli, directory, backend, prompt, prompt + plain, "--max-new", str(limit),
                                   "--no-eos-stop", "--continue", "3")
         assert report["tokens"] == plain[:limit] and report["continued"] == plain[limit : limit + 3]
 

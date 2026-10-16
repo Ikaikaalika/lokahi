@@ -1161,10 +1161,13 @@ kernel void mla_rope_store(const device float* q [[buffer(0)]],
 // over the pass; gated_rms_norm_rows applies rms(o) * w * silu(z) per value
 // head before out_proj. The conv history [taps - 1, C] and the states
 // [Hv, dv, dk] are double-buffered by position parity: a pass at start reads
-// buffer start % 2 and writes buffer (start + n) % 2, so a decode step
-// launched past a stop token, and then discarded, never overwrites the state
-// the next step reads. Each thread (or simdgroup) owns its slice of the
-// state, so a pass whose two buffers coincide updates it in place safely.
+// buffer (start + parity) % 2 and writes buffer (start + n + parity) % 2, so
+// a decode step launched past a stop token, and then discarded, never
+// overwrites the state the next step reads. Each thread (or simdgroup) owns
+// its slice of the state, so a pass whose two buffers coincide updates it in
+// place safely. A speculative verify pass always writes the other buffer,
+// and gdn_history_replay and gdn_recurrence rebuild it for a kept prefix of
+// the pass from the one it read.
 // ---------------------------------------------------------------------------
 
 struct GdnSplitParams {
@@ -1238,6 +1241,27 @@ kernel void gdn_conv(device float* mixed [[buffer(0)]],
     mixed[t * C + c] = silu(sum);
   }
   for (int k = 0; k < K - 1; ++k) history_out[k * C + c] = window[k];
+}
+
+struct GdnHistoryParams {
+  int channels;
+  int taps;
+  int kept;
+};
+
+// Speculative decoding: the conv history after the first `kept` tokens of a
+// verify pass, the last K - 1 rows of [history_in, raw], where raw holds the
+// pass's conv inputs. history_in and history_out are different buffers.
+// Grid: (C, K - 1).
+kernel void gdn_history_replay(const device float* history_in [[buffer(0)]],
+                               const device float* raw [[buffer(1)]],
+                               device float* history_out [[buffer(2)]],
+                               constant GdnHistoryParams& p [[buffer(3)]],
+                               uint2 gid [[thread_position_in_grid]]) {
+  const int c = int(gid.x), k = int(gid.y), C = p.channels, H = p.taps - 1;
+  if (c >= C || k >= H) return;
+  const int at = p.kept + k;  // the row of the stream [history_in, raw]
+  history_out[k * C + c] = at < H ? history_in[at * C + c] : raw[(at - H) * C + c];
 }
 
 struct GdnNormParams {
