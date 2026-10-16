@@ -637,7 +637,9 @@ class DecoderMetal final : public Model {
         check(w_->mtp->fc);
         check_layer(w_->mtp->layer, c_.num_layers);
       } catch (const Error& e) {
-        mtp_refused_ = e.what();
+        // The reason is quoted inside another error, so without its prefix.
+        const std::string reason = e.what(), prefix = "lokahi: ";
+        mtp_refused_ = reason.rfind(prefix, 0) == 0 ? reason.substr(prefix.size()) : reason;
       }
     }
   }
