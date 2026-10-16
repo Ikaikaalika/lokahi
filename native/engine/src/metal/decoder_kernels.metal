@@ -217,6 +217,38 @@ kernel void rms_norm_rows(const device float* in [[buffer(0)]],
   for (int i = int(tid); i < p.cols; i += int(tpg)) y[i] = x[i] * inv * (p.offset + weight[i]);
 }
 
+// Multi-token prediction: the head's input rows [norm_e(e) | norm_h(h)],
+// out [rows, 2 * cols], from embedding rows e and the hidden states h before
+// them. One threadgroup per row.
+kernel void mtp_concat_norms(const device float* e [[buffer(0)]],
+                             const device float* h [[buffer(1)]],
+                             const device float* e_weight [[buffer(2)]],
+                             const device float* h_weight [[buffer(3)]],
+                             device float* out [[buffer(4)]],
+                             constant NormParams& p [[buffer(5)]],
+                             uint row [[threadgroup_position_in_grid]],
+                             uint tid [[thread_position_in_threadgroup]],
+                             uint tpg [[threads_per_threadgroup]],
+                             uint sg [[simdgroup_index_in_threadgroup]],
+                             uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float scratch[32];
+  const device float* x = e + row * p.cols;
+  const device float* y = h + row * p.cols;
+  float sx = 0.0f, sy = 0.0f;
+  for (int i = int(tid); i < p.cols; i += int(tpg)) {
+    sx += x[i] * x[i];
+    sy += y[i] * y[i];
+  }
+  const uint simdgroups = (tpg + 31) / 32;
+  const float ix = precise::rsqrt(threadgroup_sum(sx, scratch, sg, lane, simdgroups) / float(p.cols) + p.eps);
+  const float iy = precise::rsqrt(threadgroup_sum(sy, scratch, sg, lane, simdgroups) / float(p.cols) + p.eps);
+  device float* o = out + row * 2 * p.cols;
+  for (int i = int(tid); i < p.cols; i += int(tpg)) {
+    o[i] = x[i] * ix * (p.offset + e_weight[i]);
+    o[p.cols + i] = y[i] * iy * (p.offset + h_weight[i]);
+  }
+}
+
 // x = (x + r) * scale, with r first normalized by w_post when post_norm
 // (sandwich norms) and scale Gemma 4's layer scalar (else 1); then, if
 // has_next, h = norm(x) * (offset + w_next).
@@ -937,8 +969,10 @@ kernel void softcap(device float* values [[buffer(0)]],
 // ---------------------------------------------------------------------------
 // Optional q/k/v biases, optional per-head RMSNorm, rotate-half RoPE for q
 // and k, an optional scale-free RMSNorm on v (Gemma 4), and KV-cache writes.
-// Grid: threadgroups (heads + kv_heads, n_tokens), or heads alone for layers
-// that share another layer's keys and values; head_dim / 2 threads each.
+// Grid: threadgroups (heads + kv_heads, n_tokens), heads alone for layers
+// that share another layer's keys and values, or kv_heads alone (from
+// first_head = heads) to store keys and values only; head_dim / 2 threads
+// each.
 // Rotations with inverse frequency 0 (partial RoPE) leave values unchanged.
 // ---------------------------------------------------------------------------
 
@@ -960,6 +994,9 @@ struct RopeParams {
   int mrope;
   int rope_given;
   int rope_offset;
+  // The head the grid's first threadgroup column handles: 0, or heads to
+  // store only keys and values (an MTP head following a pass).
+  int first_head;
 };
 
 // A token's (temporal, row, column) RoPE positions.
@@ -1011,7 +1048,7 @@ template <typename KV>
   threadgroup float normed[512];  // one head, for classic partial RoPE
   const uint tid = tid2.x;
   const uint tpg = tpg2.x;
-  const int head = int(tgp.x);
+  const int head = int(tgp.x) + p.first_head;
   const int t = int(tgp.y);
   const int half_dim = p.head_dim / 2;
   const int pos = p.start_pos + t;

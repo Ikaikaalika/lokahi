@@ -198,7 +198,7 @@ struct ElementwiseParams { int count; };
 struct GluMulParams { int count; int silu; };
 struct RopeParams {
   int heads; int kv_heads; int head_dim; int start_pos; int capacity; float eps; float offset; int qk_norm;
-  int qkv_bias; int v_norm; int rotary; int mrope; int rope_given; int rope_offset;
+  int qkv_bias; int v_norm; int rotary; int mrope; int rope_given; int rope_offset; int first_head;
 };
 struct PerLayerCombineParams { int size; int layers; float eps; float offset; float proj_scale; float input_scale; };
 struct PerLayerGateParams { int size; int layers; int layer; int count; };
@@ -371,11 +371,16 @@ class DecoderMetal final : public Model {
     const int n = verify_n_;
     verify_n_ = 0;
     const size_t read = verify_read_, written = 1 - read;
-    if (kept < n && c_.has_linear()) {
+    const bool replay = kept < n && c_.has_linear();
+    if (replay || mtp_on_) {
       @autoreleasepool {
         id<MTLCommandBuffer> cb = [queue_ commandBuffer];
         id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-        encode_replay(enc, kept, read, written);
+        if (replay) encode_replay(enc, kept, read, written);
+        // The kept row's hidden state is pending for the MTP head; rows past
+        // it are rewritten before a draft reads them.
+        const size_t row = static_cast<size_t>(c_.hidden_size) * sizeof(float);
+        if (mtp_on_) encode_copy(enc, mtp_h_, mtp_h_, c_.hidden_size, row * static_cast<size_t>(kept), 0);
         [enc endEncoding];
         [cb commit];
         wait(cb);
@@ -383,6 +388,80 @@ class DecoderMetal final : public Model {
     }
     position_ = verify_start_ + kept;
     parity_ = static_cast<int>((written + static_cast<size_t>(position_)) % 2);
+  }
+
+  bool has_mtp() const override { return layers_.size() > static_cast<size_t>(c_.num_layers); }
+
+  void follow_mtp(bool on) override {
+    if (on == mtp_on_) return;
+    LK_CHECK(!on || w_->mtp.has_value(), c_.architecture + ": this checkpoint has no multi-token prediction head");
+    LK_CHECK(!on || mtp_refused_.empty(), "the MTP head cannot run on Metal: " + mtp_refused_);
+    LK_CHECK(!on || position_ == 0, "the MTP head must follow the model from an empty context");
+    mtp_on_ = on;
+  }
+
+  // The whole block in one command buffer: each draft's step runs the head's
+  // layer on one row at the next position, then its norm, lm_head and an
+  // argmax on the device, whose token the next step embeds.
+  std::vector<int32_t> mtp_draft(int32_t token, int count, std::vector<float>* logits) override {
+    @autoreleasepool {
+      drain();
+      LK_CHECK(mtp_on_ && position_ > 0, "the MTP head drafts once it has followed a pass");
+      LK_CHECK(token >= 0 && token < c_.vocab_size, "token id out of range");
+      LK_CHECK(count >= 0 && position_ - 1 + count <= max_context_, "context length exceeded");
+      if (logits != nullptr) logits->clear();
+      if (count == 0) return {};
+      const size_t vocab = static_cast<size_t>(c_.vocab_size);
+      if (logits != nullptr && count > mtp_logits_rows_) {
+        mtp_logits_ = shared_buffer(static_cast<size_t>(count) * vocab * sizeof(float));
+        mtp_logits_rows_ = count;
+      }
+      static_cast<int32_t*>([token_ contents])[0] = token;
+      const size_t layer = static_cast<size_t>(c_.num_layers);
+      const GpuLayer& G = layers_[layer];
+      active_cb_ = [queue_ commandBuffer];
+      id<MTLComputeCommandEncoder> enc = [active_cb_ computeCommandEncoder];
+      id<MTLComputePipelineState> pick = pipeline("argmax_vocab");
+      for (int step = 0; step < count; ++step) {
+        // The first draft starts from the pending hidden state, each later
+        // one from the head's output (h_).
+        encode_mtp_input(enc, token_, 0, step == 0 ? mtp_h_ : h_, 0, 1);
+        encode_qmm(enc, mtp_fc_, mtp_in_, 1, x_);
+        encode_rms_norm(enc, x_, G.attn_norm, h_, 1);
+        encode_layer(enc, layer, 1, position_ - 1 + step, &mtp_final_norm_);
+        encode_qmv(enc, lm_head_, h_, 0, logits_, 0);
+        if (c_.final_logit_softcapping > 0.0f) {
+          [enc setComputePipelineState:pipeline("softcap")];
+          bind(enc, logits_, 0, 0);
+          bytes(enc, c_.final_logit_softcapping, 1);
+          bytes(enc, ElementwiseParams{c_.vocab_size}, 2);
+          encode_elementwise(enc, c_.vocab_size);
+        }
+        section(enc, "lm_head", profiler_ != nullptr ? traffic::linear(w_->lm_head, 1) : 0.0);
+        if (logits != nullptr) {
+          encode_copy(enc, logits_, mtp_logits_, c_.vocab_size, 0, static_cast<size_t>(step) * vocab * sizeof(float));
+        }
+        [enc setComputePipelineState:pick];
+        bind(enc, logits_, 0, 0);
+        bind(enc, token_, 0, 1);
+        bind(enc, history_, 0, 2);
+        bytes(enc, ArgmaxParams{c_.vocab_size, step}, 3);
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(1024, [pick maxTotalThreadsPerThreadgroup] / 32 * 32),
+                                              1, 1)];
+        section(enc, "sample", profiler_ != nullptr ? 4.0 * c_.vocab_size : 0.0);
+      }
+      [enc endEncoding];
+      id<MTLCommandBuffer> cb = active_cb_;
+      [cb commit];
+      wait(cb);
+      const int32_t* history = static_cast<const int32_t*>([history_ contents]);
+      if (logits != nullptr) {
+        const float* rows = static_cast<const float*>([mtp_logits_ contents]);
+        logits->assign(rows, rows + static_cast<size_t>(count) * vocab);
+      }
+      return std::vector<int32_t>(history, history + count);
+    }
   }
 
   std::vector<int32_t> generate(const std::vector<int32_t>& prompt, int max_new, const SamplingParams& sampling,
@@ -437,6 +516,9 @@ class DecoderMetal final : public Model {
         if (on_token && !on_token(out.back())) stopped = true;
       }
       for (auto& [cb, step] : inflight) wait(cb);
+      // A discarded step has moved the MTP head's pending state on, so the
+      // head stops following (drafting with it fails closed until reset).
+      if (!inflight.empty()) mtp_on_ = false;
       // Steps launched past a stop token are discarded; only consumed tokens advance.
       position_ = base + static_cast<int>(out.size()) - 1;
       if (timing) {
@@ -454,7 +536,7 @@ class DecoderMetal final : public Model {
  private:
   // ---- setup --------------------------------------------------------------
 
-  void validate() const {
+  void validate() {
     if (c_.has_linear()) {
       // The conv keeps its taps in registers, and each lane of the recurrence
       // at most 8 rows of a state column.
@@ -490,8 +572,7 @@ class DecoderMetal final : public Model {
       LK_CHECK(width == 96 || width == 576, "metal: latent attention is built for kv_lora_rank + "
                                             "qk_rope_head_dim of 576 (or 96); this model has " + std::to_string(width));
     }
-    for (int i = 0; i < c_.num_layers; ++i) {
-      const DecoderLayer& L = w_->layers[static_cast<size_t>(i)];
+    auto check_layer = [&](const DecoderLayer& L, int i) {
       if (c_.is_linear(i)) {
         const bool grouped = L.in_proj_qkvz.rows > 0;
         for (const Linear* l : {&L.in_proj_qkvz, &L.in_proj_ba, &L.in_proj_qkv, &L.in_proj_z, &L.in_proj_b,
@@ -539,7 +620,7 @@ class DecoderMetal final : public Model {
         check(L.per_layer_gate);
         check(L.per_layer_proj);
       }
-      if (c_.mla() || c_.is_linear(i)) continue;  // no k/v projections
+      if (c_.mla() || c_.is_linear(i)) return;  // no k/v projections
       if (!c_.shares_kv(i)) check(L.k_proj);
       if (!c_.shares_kv(i) && !c_.k_eq_v(i)) check(L.v_proj);
       const int dim = c_.head_dim_of(i), dpl = dim / 32;
@@ -547,6 +628,17 @@ class DecoderMetal final : public Model {
                "metal: head_dim must be 64, 128, 256 or 512");
       const int group = c_.num_heads / c_.kv_heads_of(i);
       LK_CHECK(group >= 1 && group <= 8, "metal: heads per kv head must be between 1 and 8");
+    };
+    for (int i = 0; i < c_.num_layers; ++i) check_layer(w_->layers[static_cast<size_t>(i)], i);
+    // An MTP head the kernels cannot read leaves the decoder running here and
+    // refuses MTP drafting with the reason.
+    if (w_->mtp) {
+      try {
+        check(w_->mtp->fc);
+        check_layer(w_->mtp->layer, c_.num_layers);
+      } catch (const Error& e) {
+        mtp_refused_ = e.what();
+      }
     }
   }
 
@@ -638,9 +730,11 @@ class DecoderMetal final : public Model {
       if (v.empty()) placeholders.push_back({target, &placeholder_});
       else add_vector(v, target);
     };
-    layers_.resize(w_->layers.size());
-    for (size_t i = 0; i < w_->layers.size(); ++i) {
-      const DecoderLayer& L = w_->layers[i];
+    // The MTP head's layer, when it runs here, follows the decoder's.
+    const bool mtp = w_->mtp.has_value() && mtp_refused_.empty();
+    layers_.resize(w_->layers.size() + (mtp ? 1 : 0));
+    for (size_t i = 0; i < layers_.size(); ++i) {
+      const DecoderLayer& L = i < w_->layers.size() ? w_->layers[i] : w_->mtp->layer;
       GpuLayer& G = layers_[i];
       const int layer = static_cast<int>(i);
       G.head_dim = c_.head_dim_of(layer);
@@ -741,6 +835,12 @@ class DecoderMetal final : public Model {
       add_optional(L.k_bias, &G.k_bias);
       add_optional(L.v_bias, &G.v_bias);
     }
+    if (mtp) {
+      mtp_fc_ = add_linear(arena, w_->mtp->fc, linear_fix, &mtp_fc_);
+      add_vector(w_->mtp->embedding_norm, &mtp_embedding_norm_);
+      add_vector(w_->mtp->hidden_norm, &mtp_hidden_norm_);
+      add_vector(w_->mtp->final_norm, &mtp_final_norm_);
+    }
     arena.finalize();
     staged_.clear();  // the arena has copied the staged expert stacks
     for (auto& [target, ids] : expert_fix_) {
@@ -814,6 +914,11 @@ class DecoderMetal final : public Model {
       const size_t element = kv_f16_ ? sizeof(uint16_t) : sizeof(float);
       G.k_cache = private_buffer(width * static_cast<size_t>(G.capacity) * element);
       G.v_cache = private_buffer(width * static_cast<size_t>(G.capacity) * element);
+    }
+    if (has_mtp()) {
+      mtp_h_ = private_buffer((chunk + 1) * hidden * f);
+      mtp_e_ = private_buffer(chunk * hidden * f);
+      mtp_in_ = private_buffer(chunk * 2 * hidden * f);
     }
     x_ = private_buffer(chunk * hidden * f);
     h_ = private_buffer(chunk * hidden * f);
@@ -1190,13 +1295,70 @@ class DecoderMetal final : public Model {
         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
   }
 
-  // dst[0, count) = src[0, count).
-  void encode_copy(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> src, id<MTLBuffer> dst, int count) {
+  // dst[0, count) = src[0, count), from byte offsets into each.
+  void encode_copy(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> src, id<MTLBuffer> dst, int count,
+                   size_t src_offset = 0, size_t dst_offset = 0) {
     [enc setComputePipelineState:pipeline("copy_floats")];
-    bind(enc, src, 0, 0);
-    bind(enc, dst, 0, 1);
+    bind(enc, src, src_offset, 0);
+    bind(enc, dst, dst_offset, 1);
     bytes(enc, ElementwiseParams{count}, 2);
     encode_elementwise(enc, count);
+  }
+
+  // ---- multi-token prediction ---------------------------------------------
+
+  // mtp_in_'s `rows` rows: [norm_e(embedding) | norm_h(hidden)] for the
+  // tokens at tokens + tokens_offset and the hidden states at `hidden` +
+  // hidden_offset.
+  void encode_mtp_input(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> tokens, size_t tokens_offset,
+                        id<MTLBuffer> hidden, size_t hidden_offset, int rows) {
+    [enc setComputePipelineState:quant_pipeline("embed_rows", embed_)];
+    bind_weights(enc, embed_, 0);
+    bind(enc, tokens, tokens_offset, 3);
+    bind(enc, mtp_e_, 0, 4);
+    bytes(enc, EmbedParams{c_.hidden_size, rows, c_.embed_scale}, 5);
+    [enc dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(c_.hidden_size), static_cast<NSUInteger>(rows), 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    id<MTLComputePipelineState> pso = pipeline("mtp_concat_norms");
+    [enc setComputePipelineState:pso];
+    bind(enc, mtp_e_, 0, 0);
+    bind(enc, hidden, hidden_offset, 1);
+    bind(enc, mtp_embedding_norm_, 2);
+    bind(enc, mtp_hidden_norm_, 3);
+    bind(enc, mtp_in_, 0, 4);
+    bytes(enc, NormParams{c_.hidden_size, c_.rms_norm_eps, c_.norm_offset}, 5);
+    [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(rows), 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(norm_threads(pso), 1, 1)];
+  }
+
+  // The head follows the pass (DecoderCpu::mtp_follow): its rows for
+  // positions [start - 1, start + n - 1) pair each token with the hidden
+  // state before it, and only their keys and values are computed; the
+  // pass's last hidden state is left pending in mtp_h_'s row 0.
+  void encode_mtp_follow(__strong id<MTLComputeCommandEncoder>& enc, id<MTLBuffer> tokens, size_t tokens_offset,
+                         int n, int start) {
+    const GpuLayer& G = layers_[static_cast<size_t>(c_.num_layers)];
+    const DecoderWeights::Mtp& M = *w_->mtp;
+    const int hidden = c_.hidden_size;
+    const size_t row = static_cast<size_t>(hidden) * sizeof(float);
+    encode_copy(enc, h_, mtp_h_, n * hidden, 0, row);
+    const int first = start == 0 ? 1 : 0;  // position 0's token follows no hidden state
+    const int rows = n - first;
+    if (rows > 0) {
+      encode_mtp_input(enc, tokens, tokens_offset + sizeof(int32_t) * static_cast<size_t>(first), mtp_h_,
+                       row * static_cast<size_t>(first), rows);
+      encode_qmm(enc, mtp_fc_, mtp_in_, rows, x_);
+      encode_rms_norm(enc, x_, G.attn_norm, r_, rows);
+      encode_qmm(enc, G.k, r_, rows, kt_);
+      encode_qmm(enc, G.v, r_, rows, vt_);
+      encode_rope(enc, G, rows, start - 1 + first, true);
+    }
+    encode_copy(enc, mtp_h_, mtp_h_, hidden, row * static_cast<size_t>(n), 0);
+    section(enc, "mtp",
+            profiler_ != nullptr && rows > 0
+                ? traffic::linear(M.fc, rows) + traffic::linear(M.layer.k_proj, rows) +
+                      traffic::linear(M.layer.v_proj, rows) + traffic::embed(w_->embed, rows)
+                : 0.0);
   }
 
   // Each Gated DeltaNet layer's conv history and state after the first
@@ -1252,7 +1414,8 @@ class DecoderMetal final : public Model {
     encode_qmm(enc, G.out_proj, lin_out_, n, r_);
   }
 
-  void encode_rope(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n, int start) {
+  // With kv_only, only the keys and values are normed, rotated and stored.
+  void encode_rope(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n, int start, bool kv_only = false) {
     [enc setComputePipelineState:pipeline(kv_f16_ ? "qk_norm_rope_store_h" : "qk_norm_rope_store")];
     bind(enc, q_, 0, 0);
     bind(enc, kt_, 0, 1);
@@ -1268,7 +1431,7 @@ class DecoderMetal final : public Model {
     bytes(enc, RopeParams{c_.num_heads, G.kv_heads, G.head_dim, start, G.capacity, c_.rms_norm_eps,
                           c_.norm_offset, c_.qk_norm ? 1 : 0, c_.qkv_bias ? 1 : 0, c_.v_norm ? 1 : 0,
                           c_.rotary_dim > 0 ? c_.rotary_dim : G.head_dim, rope_axes_ != nil ? 1 : 0, given ? 1 : 0,
-                          rope_offset_},
+                          rope_offset_, kv_only ? c_.num_heads : 0},
           8);
     bind(enc, G.q_bias, 9);
     bind(enc, G.k_bias, 10);
@@ -1285,7 +1448,7 @@ class DecoderMetal final : public Model {
     }
     if (G.k_eq_v) bind(enc, kt_, 0, 2);  // values are the raw keys, before k_norm
     // KV-shared layers only rotate their queries.
-    const int heads = c_.num_heads + (G.own_kv ? G.kv_heads : 0);
+    const int heads = kv_only ? G.kv_heads : c_.num_heads + (G.own_kv ? G.kv_heads : 0);
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(heads), static_cast<NSUInteger>(n), 1)
         threadsPerThreadgroup:MTLSizeMake(static_cast<NSUInteger>(G.head_dim / 2), 1, 1)];
   }
@@ -1655,6 +1818,141 @@ class DecoderMetal final : public Model {
     enc = [active_cb_ computeCommandEncoder];
   }
 
+  // Layer l over the pass's n rows (h_ holds their norm), at positions
+  // [start, start + n); its residual leaves norm `next` of x_ in h_.
+  void encode_layer(__strong id<MTLComputeCommandEncoder>& enc, size_t l, int n, int start, const BufRef* next) {
+    const bool profiling = profiler_ != nullptr;
+    const int64_t hidden = c_.hidden_size;
+    const GpuLayer& G = layers_[l];
+    const DecoderLayer& L = l < w_->layers.size() ? w_->layers[l] : w_->mtp->layer;
+    const int layer = static_cast<int>(l);
+    // The residual kernel adds the sublayer output (normalized first with
+    // sandwich norms) and applies the next norm in one pass.
+    const double residual_bytes = profiling ? traffic::rows(hidden, n, 4) + 8.0 * hidden : 0.0;
+    if (G.linear) {
+      encode_gdn_projections(enc, G, n);
+      section(enc, "qkv", profiling ? traffic::linear_projections(L, n) : 0.0);
+      // A verify pass records its conv inputs, then its recurrence's
+      // inputs, for accept (each copy read and written once).
+      const int channels = c_.linear_channels(), gates = n * c_.linear_v_heads;
+      const VerifyRecord* record = verifying_ ? &records_[l] : nullptr;
+      if (record != nullptr) encode_copy(enc, mixed_, record->raw, n * channels);
+      encode_gdn_conv(enc, G, n, start);
+      section(enc, "rope_kv",
+              profiling ? traffic::linear_conv(c_, n) + (record ? traffic::rows(channels, n, 2) : 0.0) : 0.0);
+      if (record != nullptr) {
+        encode_copy(enc, mixed_, record->rows, n * channels);
+        encode_copy(enc, lin_b_, record->beta, gates);
+        encode_copy(enc, lin_a_, record->decay, gates);
+      }
+      encode_gdn_recurrence(enc, G, n, start);
+      section(enc, "attention",
+              profiling ? traffic::linear_recurrence(c_, n) +
+                              (record ? traffic::rows(channels, n, 2) + traffic::rows(c_.linear_v_heads, n, 4) : 0.0)
+                        : 0.0);
+      encode_gdn_out(enc, G, n);
+      section(enc, "o_proj", profiling ? traffic::linear_out(c_, L, n) : 0.0);
+    } else if (c_.mla()) {
+      encode_latent_qkv(enc, G, n);
+      section(enc, "qkv", profiling ? traffic::latent_qkv(c_, L, n) : 0.0);
+      encode_latent_rope(enc, G, n, start);
+      section(enc, "rope_kv", profiling ? traffic::rows(c_.latent_width(), n, 2 * c_.num_heads + 3) : 0.0);
+      encode_latent_attention(enc, G, n, start);
+      section(enc, "attention", profiling ? traffic::attention(c_, layer, start, n) : 0.0);
+      encode_latent_out(enc, G, n);
+      section(enc, "o_proj", profiling ? traffic::latent_out(L, n) : 0.0);
+    } else {
+      encode_qkv(enc, G, n);
+      section(enc, "qkv",
+              profiling ? traffic::linear(L.q_proj, n) + (G.own_kv ? traffic::linear(L.k_proj, n) : 0.0) +
+                              (G.own_kv && !G.k_eq_v ? traffic::linear(L.v_proj, n) : 0.0)
+                        : 0.0);
+      encode_rope(enc, G, n, start);
+      // q in and out, k and v in, and k and v written to the cache.
+      section(enc, "rope_kv",
+              profiling ? traffic::rows(G.head_dim, n, 2 * c_.num_heads + (G.own_kv ? 2 * G.kv_heads : 0)) +
+                              (G.own_kv ? kv_bytes() / 4.0 * traffic::rows(G.head_dim, n, 2 * G.kv_heads) : 0.0)
+                        : 0.0);
+      encode_attention(enc, G, n, start);
+      section(enc, "attention", profiling ? traffic::attention(c_, layer, start, n, kv_bytes()) : 0.0);
+      const int gated = n * c_.num_heads * G.head_dim;
+      if (c_.attn_output_gate) encode_mul_sigmoid(enc, attn_, out_gate_, 1, gated);
+      encode_qmm(enc, G.o, attn_, n, r_);
+      if (c_.o_bias) {
+        [enc setComputePipelineState:pipeline("add_bias_rows")];
+        bind(enc, r_, 0, 0);
+        bind(enc, G.o_bias, 1);
+        const int count = n * c_.hidden_size;
+        bytes(enc, BiasParams{c_.hidden_size, count}, 2);
+        encode_elementwise(enc, count);
+      }
+      section(enc, "o_proj",
+              profiling ? traffic::linear(L.o_proj, n) + (c_.attn_output_gate ? traffic::rows(gated, 1, 3) : 0.0)
+                        : 0.0);
+    }
+    encode_residual_norm(enc, G.attn_post_norm, &G.mlp_norm, n);
+    section(enc, "residual_norm", residual_bytes);
+    if (G.moe && c_.experts_beside_mlp) {
+      // Gemma 4: r_ = mlp_post_norm_1(mlp(h_)) + expert_post_norm(experts(expert_norm(x))),
+      // routed on rms(x) * router_input_scale.
+      encode_mlp(enc, G, n);
+      section(enc, "mlp",
+              profiling ? traffic::linear(L.gate_proj, n) + traffic::linear(L.up_proj, n) +
+                              traffic::linear(L.down_proj, n) + traffic::rows(G.inter, n, 1)
+                        : 0.0);
+      encode_rms_norm(enc, r_, G.mlp_post_norm_1, r_, n);
+      encode_rms_norm(enc, x_, G.router_input_scale, router_in_, n);
+      encode_rms_norm(enc, x_, G.expert_norm, h_, n);
+      section(enc, "norm", profiling ? traffic::rows(c_.hidden_size, n, 6) + 12.0 * c_.hidden_size : 0.0);
+      encode_router(enc, G, n, router_in_);
+      section(enc, "router", profiling ? traffic::linear(L.router, n) + traffic::rows(c_.num_experts, n, 1) : 0.0);
+      const double expert_bytes = profiling ? expert_traffic(L, n) : 0.0;
+      encode_experts(enc, G, n, h_, moe_out_);
+      section(enc, "experts", expert_bytes);
+      encode_add_normed(enc, r_, moe_out_, G.expert_post_norm, n);
+      section(enc, "norm", profiling ? traffic::rows(c_.hidden_size, n, 3) + 4.0 * c_.hidden_size : 0.0);
+    } else if (G.moe) {
+      encode_router(enc, G, n, h_);
+      section(enc, "router", profiling ? traffic::linear(L.router, n) + traffic::rows(c_.num_experts, n, 1) : 0.0);
+      // While profiling the router has finished here, so its choices are readable.
+      const double expert_bytes = profiling ? expert_traffic(L, n) : 0.0;
+      encode_experts(enc, G, n, h_, r_);
+      section(enc, "experts", expert_bytes);
+    } else {
+      encode_mlp(enc, G, n);
+      section(enc, "mlp",
+              profiling ? traffic::linear(L.gate_proj, n) + traffic::linear(L.up_proj, n) +
+                              traffic::linear(L.down_proj, n) + traffic::rows(G.inter, n, 1)
+                        : 0.0);
+    }
+    if (c_.per_layer_input > 0) {
+      // x += post_ff_norm(mlp); x += norm(per-layer input); x *= scalar.
+      encode_residual_norm(enc, G.mlp_post_norm, nullptr, n);
+      section(enc, "residual_norm", residual_bytes);
+      encode_per_layer_gate(enc, G, layer, n);
+      section(enc, "per_layer_input",
+              profiling ? traffic::linear(L.per_layer_gate, n) + traffic::linear(L.per_layer_proj, n) +
+                              traffic::rows(c_.per_layer_input, n, 2)
+                        : 0.0);
+      encode_residual_norm(enc, G.pl_norm, next, n, G.scalar);
+    } else if (!plan_.empty() && l < active_.layer_rows.size()) {
+      // Deepstack: x += mlp, then this layer's rows onto the image tokens,
+      // then the next layer's norm.
+      encode_residual_norm(enc, G.mlp_post_norm, nullptr, n, G.scalar);
+      [enc setComputePipelineState:pipeline("add_rows_at")];
+      bind(enc, layer_rows_, sizeof(float) * l * active_.rows.size(), 0);
+      bind(enc, inject_index_, sizeof(int32_t) * static_cast<size_t>(start - plan_.base), 1);
+      bind(enc, x_, 0, 2);
+      bytes(enc, ReplaceParams{c_.hidden_size, n}, 3);
+      [enc dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(c_.hidden_size), static_cast<NSUInteger>(n), 1)
+          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      encode_rms_norm(enc, x_, *next, h_, n);
+    } else {
+      encode_residual_norm(enc, G.mlp_post_norm, next, n, G.scalar);
+    }
+    section(enc, "residual_norm", residual_bytes);
+  }
+
   // Encodes n tokens at positions [start, start + n) whose ids are at
   // tokens + tokens_offset. When `last`, also the final projection and argmax.
   void encode_forward(__strong id<MTLComputeCommandEncoder>& enc, id<MTLBuffer> tokens, size_t tokens_offset, int n,
@@ -1691,137 +1989,11 @@ class DecoderMetal final : public Model {
     encode_rms_norm(enc, x_, layers_[0].attn_norm, h_, n);
     section(enc, "norm", profiling ? traffic::rows(hidden, n, 2) + 4.0 * hidden : 0.0);
 
-    // The residual kernel adds the sublayer output (normalized first with
-    // sandwich norms) and applies the next norm in one pass.
-    const double residual_bytes = profiling ? traffic::rows(hidden, n, 4) + 8.0 * hidden : 0.0;
-    for (size_t l = 0; l < layers_.size(); ++l) {
-      const GpuLayer& G = layers_[l];
-      const DecoderLayer& L = w_->layers[l];
-      const int layer = static_cast<int>(l);
-      if (G.linear) {
-        encode_gdn_projections(enc, G, n);
-        section(enc, "qkv", profiling ? traffic::linear_projections(L, n) : 0.0);
-        // A verify pass records its conv inputs, then its recurrence's
-        // inputs, for accept (each copy read and written once).
-        const int channels = c_.linear_channels(), gates = n * c_.linear_v_heads;
-        const VerifyRecord* record = verifying_ ? &records_[l] : nullptr;
-        if (record != nullptr) encode_copy(enc, mixed_, record->raw, n * channels);
-        encode_gdn_conv(enc, G, n, start);
-        section(enc, "rope_kv",
-                profiling ? traffic::linear_conv(c_, n) + (record ? traffic::rows(channels, n, 2) : 0.0) : 0.0);
-        if (record != nullptr) {
-          encode_copy(enc, mixed_, record->rows, n * channels);
-          encode_copy(enc, lin_b_, record->beta, gates);
-          encode_copy(enc, lin_a_, record->decay, gates);
-        }
-        encode_gdn_recurrence(enc, G, n, start);
-        section(enc, "attention",
-                profiling ? traffic::linear_recurrence(c_, n) +
-                                (record ? traffic::rows(channels, n, 2) + traffic::rows(c_.linear_v_heads, n, 4) : 0.0)
-                          : 0.0);
-        encode_gdn_out(enc, G, n);
-        section(enc, "o_proj", profiling ? traffic::linear_out(c_, L, n) : 0.0);
-      } else if (c_.mla()) {
-        encode_latent_qkv(enc, G, n);
-        section(enc, "qkv", profiling ? traffic::latent_qkv(c_, L, n) : 0.0);
-        encode_latent_rope(enc, G, n, start);
-        section(enc, "rope_kv", profiling ? traffic::rows(c_.latent_width(), n, 2 * c_.num_heads + 3) : 0.0);
-        encode_latent_attention(enc, G, n, start);
-        section(enc, "attention", profiling ? traffic::attention(c_, layer, start, n) : 0.0);
-        encode_latent_out(enc, G, n);
-        section(enc, "o_proj", profiling ? traffic::latent_out(L, n) : 0.0);
-      } else {
-        encode_qkv(enc, G, n);
-        section(enc, "qkv",
-                profiling ? traffic::linear(L.q_proj, n) + (G.own_kv ? traffic::linear(L.k_proj, n) : 0.0) +
-                                (G.own_kv && !G.k_eq_v ? traffic::linear(L.v_proj, n) : 0.0)
-                          : 0.0);
-        encode_rope(enc, G, n, start);
-        // q in and out, k and v in, and k and v written to the cache.
-        section(enc, "rope_kv",
-                profiling ? traffic::rows(G.head_dim, n, 2 * c_.num_heads + (G.own_kv ? 2 * G.kv_heads : 0)) +
-                                (G.own_kv ? kv_bytes() / 4.0 * traffic::rows(G.head_dim, n, 2 * G.kv_heads) : 0.0)
-                          : 0.0);
-        encode_attention(enc, G, n, start);
-        section(enc, "attention", profiling ? traffic::attention(c_, layer, start, n, kv_bytes()) : 0.0);
-        const int gated = n * c_.num_heads * G.head_dim;
-        if (c_.attn_output_gate) encode_mul_sigmoid(enc, attn_, out_gate_, 1, gated);
-        encode_qmm(enc, G.o, attn_, n, r_);
-        if (c_.o_bias) {
-          [enc setComputePipelineState:pipeline("add_bias_rows")];
-          bind(enc, r_, 0, 0);
-          bind(enc, G.o_bias, 1);
-          const int count = n * c_.hidden_size;
-          bytes(enc, BiasParams{c_.hidden_size, count}, 2);
-          encode_elementwise(enc, count);
-        }
-        section(enc, "o_proj",
-                profiling ? traffic::linear(L.o_proj, n) + (c_.attn_output_gate ? traffic::rows(gated, 1, 3) : 0.0)
-                          : 0.0);
-      }
-      encode_residual_norm(enc, G.attn_post_norm, &G.mlp_norm, n);
-      section(enc, "residual_norm", residual_bytes);
-      if (G.moe && c_.experts_beside_mlp) {
-        // Gemma 4: r_ = mlp_post_norm_1(mlp(h_)) + expert_post_norm(experts(expert_norm(x))),
-        // routed on rms(x) * router_input_scale.
-        encode_mlp(enc, G, n);
-        section(enc, "mlp",
-                profiling ? traffic::linear(L.gate_proj, n) + traffic::linear(L.up_proj, n) +
-                                traffic::linear(L.down_proj, n) + traffic::rows(G.inter, n, 1)
-                          : 0.0);
-        encode_rms_norm(enc, r_, G.mlp_post_norm_1, r_, n);
-        encode_rms_norm(enc, x_, G.router_input_scale, router_in_, n);
-        encode_rms_norm(enc, x_, G.expert_norm, h_, n);
-        section(enc, "norm", profiling ? traffic::rows(c_.hidden_size, n, 6) + 12.0 * c_.hidden_size : 0.0);
-        encode_router(enc, G, n, router_in_);
-        section(enc, "router", profiling ? traffic::linear(L.router, n) + traffic::rows(c_.num_experts, n, 1) : 0.0);
-        const double expert_bytes = profiling ? expert_traffic(L, n) : 0.0;
-        encode_experts(enc, G, n, h_, moe_out_);
-        section(enc, "experts", expert_bytes);
-        encode_add_normed(enc, r_, moe_out_, G.expert_post_norm, n);
-        section(enc, "norm", profiling ? traffic::rows(c_.hidden_size, n, 3) + 4.0 * c_.hidden_size : 0.0);
-      } else if (G.moe) {
-        encode_router(enc, G, n, h_);
-        section(enc, "router", profiling ? traffic::linear(L.router, n) + traffic::rows(c_.num_experts, n, 1) : 0.0);
-        // While profiling the router has finished here, so its choices are readable.
-        const double expert_bytes = profiling ? expert_traffic(L, n) : 0.0;
-        encode_experts(enc, G, n, h_, r_);
-        section(enc, "experts", expert_bytes);
-      } else {
-        encode_mlp(enc, G, n);
-        section(enc, "mlp",
-                profiling ? traffic::linear(L.gate_proj, n) + traffic::linear(L.up_proj, n) +
-                                traffic::linear(L.down_proj, n) + traffic::rows(G.inter, n, 1)
-                          : 0.0);
-      }
-      const BufRef* next = l + 1 < layers_.size() ? &layers_[l + 1].attn_norm : &final_norm_;
-      if (c_.per_layer_input > 0) {
-        // x += post_ff_norm(mlp); x += norm(per-layer input); x *= scalar.
-        encode_residual_norm(enc, G.mlp_post_norm, nullptr, n);
-        section(enc, "residual_norm", residual_bytes);
-        encode_per_layer_gate(enc, G, layer, n);
-        section(enc, "per_layer_input",
-                profiling ? traffic::linear(L.per_layer_gate, n) + traffic::linear(L.per_layer_proj, n) +
-                                traffic::rows(c_.per_layer_input, n, 2)
-                          : 0.0);
-        encode_residual_norm(enc, G.pl_norm, next, n, G.scalar);
-      } else if (!plan_.empty() && l < active_.layer_rows.size()) {
-        // Deepstack: x += mlp, then this layer's rows onto the image tokens,
-        // then the next layer's norm.
-        encode_residual_norm(enc, G.mlp_post_norm, nullptr, n, G.scalar);
-        [enc setComputePipelineState:pipeline("add_rows_at")];
-        bind(enc, layer_rows_, sizeof(float) * l * active_.rows.size(), 0);
-        bind(enc, inject_index_, sizeof(int32_t) * static_cast<size_t>(start - plan_.base), 1);
-        bind(enc, x_, 0, 2);
-        bytes(enc, ReplaceParams{c_.hidden_size, n}, 3);
-        [enc dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(c_.hidden_size), static_cast<NSUInteger>(n), 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        encode_rms_norm(enc, x_, *next, h_, n);
-      } else {
-        encode_residual_norm(enc, G.mlp_post_norm, next, n, G.scalar);
-      }
-      section(enc, "residual_norm", residual_bytes);
+    const size_t decoder_layers = static_cast<size_t>(c_.num_layers);
+    for (size_t l = 0; l < decoder_layers; ++l) {
+      encode_layer(enc, l, n, start, l + 1 < decoder_layers ? &layers_[l + 1].attn_norm : &final_norm_);
     }
+    if (mtp_on_) encode_mtp_follow(enc, tokens, tokens_offset, n, start);
     if (!last) return;
     const size_t last_row = static_cast<size_t>(n - 1) * c_.hidden_size * sizeof(float);
     encode_qmv(enc, lm_head_, h_, last_row, logits_, 0);
@@ -1862,6 +2034,7 @@ class DecoderMetal final : public Model {
     LK_CHECK(n > 0, "prefill requires at least one token");
     LK_CHECK(position_ + n <= max_context_, "context length exceeded");
     for (int i = 0; i < n; ++i) LK_CHECK(tokens[i] >= 0 && tokens[i] < c_.vocab_size, "token id out of range");
+    LK_CHECK(!mtp_on_ || active_.empty(), "the MTP head does not take image features yet");
     plan_ = plan_injection(active_, position_, n, c_.hidden_size, chunk_, c_.injection_rules(rope_offset_));
     rope_offset_ = plan_.rope_offset;  // for the tokens after this prefill
     if (!plan_.rope.empty()) std::memcpy([rope_pos_ contents], plan_.rope.data(), sizeof(int32_t) * plan_.rope.size());
@@ -2001,6 +2174,19 @@ class DecoderMetal final : public Model {
     id<MTLBuffer> raw = nil, rows = nil, beta = nil, decay = nil;
   };
   std::vector<VerifyRecord> records_;
+  // Multi-token prediction (DecoderWeights::mtp): the head's layer is
+  // layers_[c_.num_layers] when it runs here, and mtp_refused_ says why it
+  // does not otherwise. mtp_h_ [chunk + 1, hidden] holds the hidden state
+  // each of a pass's head rows starts from: row 0 the one the previous pass
+  // left pending, rows 1 to n the pass's own final-normed rows. mtp_e_
+  // [chunk, hidden] holds token embeddings, mtp_in_ [chunk, 2 * hidden] the
+  // head's inputs, and mtp_logits_ a draft block's logits.
+  bool mtp_on_ = false;
+  std::string mtp_refused_;
+  GpuLinear mtp_fc_;
+  BufRef mtp_embedding_norm_, mtp_hidden_norm_, mtp_final_norm_;
+  id<MTLBuffer> mtp_h_ = nil, mtp_e_ = nil, mtp_in_ = nil, mtp_logits_ = nil;
+  int mtp_logits_rows_ = 0;
 };
 
 }  // namespace
