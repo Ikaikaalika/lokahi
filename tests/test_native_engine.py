@@ -212,6 +212,14 @@ DEEPSEEK_VARIANTS = {
     "glm4.7-flash-shape": TinyDeepseekSpec(
         model_type="glm4_moe_lite", absorbed=True, qk_nope_head_dim=64, v_head_dim=96, num_experts_per_tok=4,
         routed_scaling_factor=1.8, rms_norm_eps=1e-5, rope_theta=1e6, rope_scaling=None, seed=21),
+    # Latent attention at widths whose codes straddle words: kv_b_proj's
+    # per-head absorption at 5 bits, GLM-4.7-Flash's absorbed tensors at 6.
+    "deepseek-v2-lite-5bit": TinyDeepseekSpec(
+        model_type="deepseek_v2", q_lora_rank=None, norm_topk_prob=False, n_shared_experts=2,
+        rope_scaling=DEEPSEEK_V2_YARN, bits=5, seed=37),
+    "glm4.7-flash-6bit": TinyDeepseekSpec(
+        model_type="glm4_moe_lite", absorbed=True, qk_nope_head_dim=64, v_head_dim=96, num_experts_per_tok=4,
+        routed_scaling_factor=1.8, rms_norm_eps=1e-5, rope_theta=1e6, rope_scaling=None, bits=6, seed=21),
 }
 QWEN35_VARIANTS = {
     # Qwen3.5 as MLX-LM converts it: 4-bit under language_model., norms stored
@@ -233,6 +241,11 @@ QWEN35_VARIANTS = {
     "qwen3-next-mlx": TinyQwen35Spec(model_type="qwen3_next", mlp_only_layers=(1,), norm_topk_prob=False,
                                      linear_key_head_dim=16, seed=0),
     "qwen3-next-hf": TinyQwen35Spec(model_type="qwen3_next", mlx=False, decoder_sparse_step=2, seed=0),
+    # Qwen3.8-27B's 5- and 6-bit MLX builds (group size 64), where codes
+    # straddle words, and 3-bit experts.
+    "qwen3.5-mlx-5bit": TinyQwen35Spec(bits=5, group_size=64, seed=0),
+    "qwen3.5-mlx-6bit": TinyQwen35Spec(bits=6, group_size=64, seed=0),
+    "qwen3.5-moe-mlx-3bit": TinyQwen35Spec(model_type="qwen3_5_moe", bits=3, seed=0),
 }
 VARIANTS = (sorted(GEMMA3_VARIANTS) + sorted(GEMMA4_VARIANTS) + sorted(DENSE_VARIANTS) + sorted(DEEPSEEK_VARIANTS)
             + sorted(QWEN35_VARIANTS))
@@ -1062,6 +1075,25 @@ def test_generation_config_eos_replaces_the_config_eos(native_cli, backend, tmp_
     assert tokens(expected[stop], {"eos_token_id": None, "top_k": 20}) == expected[: stop + 1]
     (directory / "generation_config.json").write_text("[1]")
     assert "generation_config.json must be an object" in _load_error(native_cli, directory)
+
+
+@pytest.mark.parametrize(
+    ("quantization", "message"),
+    [
+        # 4-bit rows of 128 codes are 16 words, which hold no whole number of
+        # 3-bit codes.
+        ({"group_size": 32, "bits": 3}, "weight words do not hold whole codes"),
+        ({"group_size": 32, "bits": 7}, "unsupported bit width 7"),
+        # 16 three-bit codes end mid-word, so groups would not start on words.
+        ({"group_size": 16, "bits": 3}, "invalid group size"),
+    ],
+)
+def test_quantization_the_weights_do_not_match_fails_closed(native_cli, tmp_path, quantization, message):
+    directory = write_tiny_qwen35(tmp_path / "model", QWEN35_VARIANTS["qwen3.5-mlx"])
+    config = json.loads((directory / "config.json").read_text())
+    config["quantization"] = config["quantization_config"] = quantization
+    (directory / "config.json").write_text(json.dumps(config))
+    assert message in _load_error(native_cli, directory)
 
 
 _FULL_AT_3 = ["linear_attention"] * 3 + ["full_attention", "linear_attention"]

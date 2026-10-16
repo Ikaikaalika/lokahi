@@ -12,7 +12,8 @@
 
 namespace lokahi {
 
-// Affine: code * scale + bias per group, with BF16/F16 scales and biases.
+// Affine: code * scale + bias per group, with BF16/F16 scales and biases, at
+// 2, 3, 4, 5, 6 or 8 bits.
 // MXFP4 (OCP microscaling): 4-bit E2M1 codes times a per-32 E8M0 scale.
 enum class QuantMode { Affine, Mxfp4 };
 

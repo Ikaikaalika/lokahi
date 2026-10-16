@@ -40,12 +40,13 @@ pytestmark = pytest.mark.skipif(
 TOKENS = [2, 5, 9, 33, 100, 7, 7, 7, 400, 3, 2, 11, 90, 91, 92, 93, 17, 18, 19, 20]
 
 
-@pytest.mark.parametrize("bits", [2, 4, 8])
-def test_affine_layout_matches_mx_dequantize(bits):
+@pytest.mark.parametrize("group", [32, 64, 128])
+@pytest.mark.parametrize("bits", [2, 3, 4, 5, 6, 8])
+def test_affine_layout_matches_mx_dequantize(bits, group):
     import mlx.core as mx
 
     rng = np.random.default_rng(bits)
-    rows, cols, group = 12, 256, 64
+    rows, cols = 12, 256
     codes = rng.integers(0, 1 << bits, size=(rows, cols), dtype=np.uint32)
     scales = rng.uniform(0.01, 0.05, size=(rows, cols // group)).astype(np.float32)
     biases = rng.uniform(-0.1, 0.1, size=(rows, cols // group)).astype(np.float32)
@@ -55,6 +56,13 @@ def test_affine_layout_matches_mx_dequantize(bits):
         mx.array(words), mx.array(scales), mx.array(biases), group_size=group, bits=bits
     )
     np.testing.assert_allclose(np.array(theirs), ours, rtol=0, atol=1e-6)
+    # And MLX's own quantizer's codes unpack to its dequantized matrix.
+    weights = mx.array(rng.standard_normal((rows, cols)).astype(np.float32))
+    packed, scale, bias = mx.quantize(weights, group_size=group, bits=bits)
+    np.testing.assert_array_equal(
+        dequantize_affine(np.array(packed), np.array(scale), np.array(bias), QuantSpec(group, bits)),
+        np.array(mx.dequantize(packed, scale, bias, group_size=group, bits=bits)),
+    )
 
 
 def test_mxfp4_layout_matches_mx_dequantize():
@@ -208,9 +216,12 @@ def test_oracle_matches_mlx_lm_deepseek(tmp_path, spec):
         TinyQwen35Spec(model_type="qwen3_next", mlp_only_layers=(1,), norm_topk_prob=False, linear_key_head_dim=16,
                        seed=0),
         TinyQwen35Spec(model_type="qwen3_next", mlx=False, decoder_sparse_step=2, seed=0),
+        TinyQwen35Spec(bits=5, group_size=64, seed=0),
+        TinyQwen35Spec(bits=6, group_size=64, seed=0),
+        TinyQwen35Spec(model_type="qwen3_5_moe", bits=3, seed=0),
     ],
     ids=["qwen3.5-mlx", "qwen3.5-hf-tied", "qwen3.5-moe-mlx", "qwen3.5-moe-hf-fused", "qwen3-next-mlx",
-         "qwen3-next-hf"],
+         "qwen3-next-hf", "qwen3.5-mlx-5bit", "qwen3.5-mlx-6bit", "qwen3.5-moe-mlx-3bit"],
 )
 def test_oracle_matches_mlx_lm_qwen35(tmp_path, spec):
     directory = write_tiny_qwen35(tmp_path / "model", spec)

@@ -80,9 +80,9 @@ struct QuantFixture {
 QuantFixture make_quant(int rows, int cols, int bits, int group_size, unsigned seed) {
   QuantFixture f;
   std::mt19937 rng(seed);
-  const int per_word = 32 / bits;
   const int groups = cols / group_size;
-  f.words.assign(static_cast<size_t>(rows) * cols / per_word, 0);
+  const size_t words_per_row = static_cast<size_t>(cols) * bits / 32;
+  f.words.assign(static_cast<size_t>(rows) * words_per_row, 0);
   f.scales.resize(static_cast<size_t>(rows) * groups);
   f.biases.resize(static_cast<size_t>(rows) * groups);
   f.dense.resize(static_cast<size_t>(rows) * cols);
@@ -95,7 +95,12 @@ QuantFixture make_quant(int rows, int cols, int bits, int group_size, unsigned s
     }
     for (int c = 0; c < cols; ++c) {
       uint32_t q = code(rng);
-      f.words[(static_cast<size_t>(r) * cols + c) / per_word] |= q << (bits * (c % per_word));
+      // MLX's layout: each row one little-endian bit stream, so a code can
+      // straddle two words (3, 5 and 6 bits).
+      const size_t bit = static_cast<size_t>(c) * bits;
+      uint32_t* row_words = f.words.data() + static_cast<size_t>(r) * words_per_row;
+      row_words[bit / 32] |= q << (bit % 32);
+      if (bit % 32 + bits > 32) row_words[bit / 32 + 1] |= q >> (32 - bit % 32);
       int g = c / group_size;
       f.dense[static_cast<size_t>(r) * cols + c] =
           bf16_to_f32(f.scales[static_cast<size_t>(r) * groups + g]) * static_cast<float>(q) +
@@ -114,27 +119,31 @@ QuantFixture make_quant(int rows, int cols, int bits, int group_size, unsigned s
 
 void test_quant_kernels() {
   ThreadPool pool(3);
-  for (int bits : {2, 4, 8}) {
-    const int rows = 37, cols = 256, group = 64;
-    QuantFixture f = make_quant(rows, cols, bits, group, 1234u + bits);
-    std::vector<float> row(cols);
-    dequantize_row(f.linear, 5, row.data());
-    for (int c = 0; c < cols; ++c) EXPECT(row[c] == f.dense[5 * cols + c]);
+  for (int bits : {2, 3, 4, 5, 6, 8}) {
+    for (int group : {32, 64, 128}) {
+      const int rows = 37, cols = 256;
+      QuantFixture f = make_quant(rows, cols, bits, group, 1234u + bits + group);
+      std::vector<float> row(cols);
+      for (int r : {0, 5, rows - 1}) {
+        dequantize_row(f.linear, r, row.data());
+        for (int c = 0; c < cols; ++c) EXPECT(row[c] == f.dense[static_cast<size_t>(r) * cols + c]);
+      }
 
-    std::mt19937 rng(7);
-    std::normal_distribution<float> normal(0.0f, 1.0f);
-    const int n = 3;
-    std::vector<float> x(static_cast<size_t>(n) * cols);
-    for (float& v : x) v = normal(rng);
-    std::vector<float> y(static_cast<size_t>(n) * rows), yv(rows);
-    matmul(f.linear, x.data(), n, y.data(), pool);
-    matvec(f.linear, x.data() + cols, yv.data(), pool);
-    for (int t = 0; t < n; ++t) {
-      for (int r = 0; r < rows; ++r) {
-        double ref = 0.0;
-        for (int c = 0; c < cols; ++c) ref += static_cast<double>(f.dense[r * cols + c]) * x[t * cols + c];
-        EXPECT(std::fabs(y[t * rows + r] - ref) < 1e-3 * (1.0 + std::fabs(ref)));
-        if (t == 1) EXPECT(std::fabs(yv[r] - ref) < 1e-3 * (1.0 + std::fabs(ref)));
+      std::mt19937 rng(7);
+      std::normal_distribution<float> normal(0.0f, 1.0f);
+      const int n = 3;
+      std::vector<float> x(static_cast<size_t>(n) * cols);
+      for (float& v : x) v = normal(rng);
+      std::vector<float> y(static_cast<size_t>(n) * rows), yv(rows);
+      matmul(f.linear, x.data(), n, y.data(), pool);
+      matvec(f.linear, x.data() + cols, yv.data(), pool);
+      for (int t = 0; t < n; ++t) {
+        for (int r = 0; r < rows; ++r) {
+          double ref = 0.0;
+          for (int c = 0; c < cols; ++c) ref += static_cast<double>(f.dense[r * cols + c]) * x[t * cols + c];
+          EXPECT(std::fabs(y[t * rows + r] - ref) < 1e-3 * (1.0 + std::fabs(ref)));
+          if (t == 1) EXPECT(std::fabs(yv[r] - ref) < 1e-3 * (1.0 + std::fabs(ref)));
+        }
       }
     }
   }
@@ -160,6 +169,16 @@ void test_quant_config() {
   EXPECT(throws([] {
     quant_spec_for(Json::parse(R"({"quantization": {"group_size": 16, "bits": 4, "mode": "nvfp4"}})"), "x");
   }));
+  // lmstudio-community's 5- and 6-bit MLX builds, and 3 bits; groups must
+  // start on word boundaries (16 six-bit codes fill 3 words, 16 three-bit
+  // codes do not), and 7 bits is not an MLX width.
+  auto spec = [](const char* quant) { return quant_spec_for(Json::parse(quant), "x"); };
+  EXPECT(spec(R"({"quantization": {"group_size": 64, "bits": 5, "mode": "affine"}})").bits == 5);
+  EXPECT(spec(R"({"quantization": {"group_size": 64, "bits": 6}})").bits == 6);
+  EXPECT(spec(R"({"quantization": {"group_size": 32, "bits": 3}})").bits == 3);
+  EXPECT(spec(R"({"quantization": {"group_size": 16, "bits": 6}})").group_size == 16);
+  EXPECT(throws([&] { spec(R"({"quantization": {"group_size": 16, "bits": 3}})"); }));
+  EXPECT(throws([&] { spec(R"({"quantization": {"group_size": 64, "bits": 7}})"); }));
 }
 
 // MXFP4 rows against hand-computed values, including exponent 0 (2^-127).

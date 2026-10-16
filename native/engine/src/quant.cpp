@@ -32,10 +32,10 @@ QuantSpec quant_spec_for(const Json& config, const std::string& module) {
     return spec;
   }
   LK_CHECK(mode == "affine", "quantization mode '" + mode + "' is not supported yet (" + module + ")");
-  LK_CHECK(spec.bits == 2 || spec.bits == 4 || spec.bits == 8,
+  LK_CHECK(spec.bits == 2 || spec.bits == 3 || spec.bits == 4 || spec.bits == 5 || spec.bits == 6 || spec.bits == 8,
            "unsupported bit width " + std::to_string(spec.bits) + " for " + module);
-  LK_CHECK(spec.group_size > 0 && spec.group_size % (32 / spec.bits) == 0,
-           "invalid group size for " + module);
+  // Groups start on word boundaries, as in every layout MLX writes.
+  LK_CHECK(spec.group_size > 0 && spec.group_size * spec.bits % 32 == 0, "invalid group size for " + module);
   return spec;
 }
 
@@ -93,6 +93,7 @@ Linear bind_linear(const Checkpoint& checkpoint, const Json& config, const std::
   LK_CHECK(linear.quant.quantized(), module + ": has scales but config marks it unquantized");
   LK_CHECK(weight.dtype == DType::U32, module + ": quantized weight must be U32");
   linear.rows = weight.dim(0);
+  LK_CHECK(weight.dim(1) * 32 % linear.quant.bits == 0, module + ": weight words do not hold whole codes");
   linear.cols = weight.dim(1) * 32 / linear.quant.bits;
   linear.words = weight.as<uint32_t>();
   bind_scales(checkpoint, module, 0, linear);
@@ -121,6 +122,7 @@ std::vector<Linear> bind_expert_linears(const Checkpoint& checkpoint, const Json
     first.quant = quant_spec_for(config, quant_module);
     LK_CHECK(first.quant.quantized(), module + ": has scales but config marks it unquantized");
     LK_CHECK(weight.dtype == DType::U32, module + ": quantized weight must be U32");
+    LK_CHECK(weight.dim(2) * 32 % first.quant.bits == 0, module + ": weight words do not hold whole codes");
     first.cols = weight.dim(2) * 32 / first.quant.bits;
     first.words = weight.as<uint32_t>();
     bind_scales(checkpoint, module, experts, first);
@@ -209,6 +211,35 @@ Linear row_slice(const Linear& linear, int64_t first, int64_t count) {
   return out;
 }
 
+namespace {
+
+// Reads codes in order from MLX's packing: each row (and each group, which
+// starts on a word boundary) is one little-endian bit stream of `bits`-bit
+// codes, so 3-, 5- and 6-bit codes straddle words.
+class CodeStream {
+ public:
+  CodeStream(const uint32_t* words, int bits) : words_(words), bits_(bits), mask_((1u << bits) - 1u) {}
+  uint32_t next() {
+    if (have_ < bits_) {
+      buffer_ |= static_cast<uint64_t>(*words_++) << have_;
+      have_ += 32;
+    }
+    const uint32_t code = static_cast<uint32_t>(buffer_) & mask_;
+    buffer_ >>= bits_;
+    have_ -= bits_;
+    return code;
+  }
+
+ private:
+  const uint32_t* words_;
+  int bits_;
+  uint32_t mask_;
+  uint64_t buffer_ = 0;
+  int have_ = 0;
+};
+
+}  // namespace
+
 void dequantize_row(const Linear& linear, int64_t row, float* out) {
   if (!linear.quant.quantized()) {
     for (int64_t c = 0; c < linear.cols; ++c) out[c] = dense_value(linear, row * linear.cols + c);
@@ -223,17 +254,14 @@ void dequantize_row(const Linear& linear, int64_t row, float* out) {
     return;
   }
   const int bits = linear.quant.bits;
-  const int per_word = 32 / bits;
-  const uint32_t mask = (1u << bits) - 1u;
   const uint32_t* words = linear.words + row * linear.words_per_row();
   const int64_t group_size = linear.quant.group_size;
   for (int64_t g = 0; g < linear.groups_per_row(); ++g) {
     const float scale = scale_value(linear, row, g);
     const float bias = bias_value(linear, row, g);
+    CodeStream codes(words + g * group_size * bits / 32, bits);
     for (int64_t c = g * group_size; c < (g + 1) * group_size; ++c) {
-      uint32_t word = words[c / per_word];
-      uint32_t code = (word >> (bits * (c % per_word))) & mask;
-      out[c] = scale * static_cast<float>(code) + bias;
+      out[c] = scale * static_cast<float>(codes.next()) + bias;
     }
   }
 }
@@ -242,22 +270,27 @@ void dequantize_row(const Linear& linear, int64_t row, float* out) {
 // costs one multiply per group: sum(s*q*x + b*x) = s*sum(q*x) + b*sum(x).
 template <int Bits>
 static float quant_row_dot(const Linear& linear, int64_t row, const float* x, const float* xsum) {
-  constexpr int kPerWord = 32 / Bits;
-  constexpr uint32_t kMask = (1u << Bits) - 1u;
   const int64_t group_size = linear.quant.group_size;
-  const int64_t words_per_group = group_size / kPerWord;
+  const int64_t words_per_group = group_size * Bits / 32;
   const uint32_t* words = linear.words + row * linear.words_per_row();
   float total = 0.0f;
   for (int64_t g = 0; g < linear.groups_per_row(); ++g) {
     const uint32_t* gw = words + g * words_per_group;
     const float* gx = x + g * group_size;
     float acc = 0.0f;
-    for (int64_t w = 0; w < words_per_group; ++w) {
-      uint32_t word = gw[w];
-      const float* wx = gx + w * kPerWord;
-      for (int j = 0; j < kPerWord; ++j) {
-        acc += static_cast<float>((word >> (Bits * j)) & kMask) * wx[j];
+    if constexpr (32 % Bits == 0) {  // whole codes per word
+      constexpr int kPerWord = 32 / Bits;
+      constexpr uint32_t kMask = (1u << Bits) - 1u;
+      for (int64_t w = 0; w < words_per_group; ++w) {
+        uint32_t word = gw[w];
+        const float* wx = gx + w * kPerWord;
+        for (int j = 0; j < kPerWord; ++j) {
+          acc += static_cast<float>((word >> (Bits * j)) & kMask) * wx[j];
+        }
       }
+    } else {  // 3, 5 or 6 bits: codes straddle words
+      CodeStream codes(gw, Bits);
+      for (int64_t c = 0; c < group_size; ++c) acc += static_cast<float>(codes.next()) * gx[c];
     }
     total += scale_value(linear, row, g) * acc + bias_value(linear, row, g) * xsum[g];
   }
@@ -300,7 +333,10 @@ static float row_dot(const Linear& linear, int64_t row, const float* x, const fl
   if (linear.quant.mxfp4()) return mxfp4_row_dot(linear, row, x);
   switch (linear.quant.bits) {
     case 2: return quant_row_dot<2>(linear, row, x, xsum);
+    case 3: return quant_row_dot<3>(linear, row, x, xsum);
     case 4: return quant_row_dot<4>(linear, row, x, xsum);
+    case 5: return quant_row_dot<5>(linear, row, x, xsum);
+    case 6: return quant_row_dot<6>(linear, row, x, xsum);
     default: return quant_row_dot<8>(linear, row, x, xsum);
   }
 }

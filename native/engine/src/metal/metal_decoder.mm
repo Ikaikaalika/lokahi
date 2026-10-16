@@ -423,7 +423,6 @@ class DecoderMetal final : public Model {
         }
         if (L.embed_q.empty()) {
           check(L.kv_b_proj);
-          LK_CHECK(32 % L.kv_b_proj.quant.bits == 0, "metal: " + L.kv_b_proj.name + " needs 2, 4 or 8 bits");
         }
       }
       if (c_.is_moe(i)) {
@@ -1209,9 +1208,10 @@ class DecoderMetal final : public Model {
     bind(enc, q_, 0, 3);
     bind(enc, latent_q_, 0, 4);
     bytes(enc, AbsorbParams{H, nope, nope + c_.v_head_dim, rank, c_.head_dim, width}, 5);
-    const NSUInteger words = static_cast<NSUInteger>(rank * G.kv_b.bits / 32);
+    // One thread per word, or per 16 codes when codes straddle words.
+    const NSUInteger units = static_cast<NSUInteger>(32 % G.kv_b.bits == 0 ? rank * G.kv_b.bits / 32 : rank / 16);
     const NSUInteger threads =
-        std::min<NSUInteger>((words + 31) / 32 * 32, std::min<NSUInteger>(256, [pso maxTotalThreadsPerThreadgroup] / 32 * 32));
+        std::min<NSUInteger>((units + 31) / 32 * 32, std::min<NSUInteger>(256, [pso maxTotalThreadsPerThreadgroup] / 32 * 32));
     [enc dispatchThreadgroups:MTLSizeMake(pairs, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
   }
 

@@ -2,12 +2,14 @@
 
 MLX stores an affine-quantized ``[out, in]`` matrix as three tensors:
 
-* ``weight``: ``uint32`` ``[out, in * bits / 32]``; value ``k`` of a row sits in
-  word ``k // (32 / bits)`` at bit offset ``bits * (k % (32 / bits))``;
+* ``weight``: ``uint32`` ``[out, in * bits / 32]``. Each row is one
+  little-endian bit stream: value ``k`` occupies bits ``[k * bits, (k + 1) *
+  bits)``. For 2, 4 and 8 bits that is word ``k // (32 / bits)`` at bit offset
+  ``bits * (k % (32 / bits))``; 3-, 5- and 6-bit values can straddle words;
 * ``scales`` and ``biases``: ``[out, in / group_size]`` in the model dtype.
 
-Dequantization is ``w = scales * q + biases`` per group. Only the 2-, 4- and
-8-bit layouts (which divide 32 evenly) are supported here.
+Dequantization is ``w = scales * q + biases`` per group. Groups start on word
+boundaries (``group_size * bits`` is a multiple of 32).
 
 MXFP4 (``mode: "mxfp4"``, OCP microscaling) packs 4-bit E2M1 codes the same
 way and stores one ``uint8`` E8M0 exponent per 32 values in ``scales``, with no
@@ -20,7 +22,7 @@ from typing import Any, Mapping
 
 import numpy as np
 
-SUPPORTED_BITS = (2, 4, 8)
+SUPPORTED_BITS = (2, 3, 4, 5, 6, 8)
 
 
 @dataclass(frozen=True)
@@ -32,7 +34,7 @@ class QuantSpec:
     def __post_init__(self) -> None:
         if self.bits not in SUPPORTED_BITS:
             raise ValueError(f"unsupported affine bit width {self.bits}")
-        if self.group_size <= 0 or self.group_size % (32 // self.bits):
+        if self.group_size <= 0 or self.group_size * self.bits % 32:
             raise ValueError(f"invalid group size {self.group_size}")
         if self.mode == "mxfp4" and (self.bits, self.group_size) != (4, 32):
             raise ValueError("mxfp4 needs 4 bits and group size 32")
@@ -75,10 +77,14 @@ def pack_affine(q: np.ndarray, bits: int) -> np.ndarray:
     """Pack integer codes ``[rows, cols]`` into MLX ``uint32`` words."""
 
     q = np.asarray(q, dtype=np.uint32)
-    per_word = 32 // bits
     rows, cols = q.shape
-    if cols % per_word:
+    if cols * bits % 32:
         raise ValueError("columns must fill whole words")
+    if 32 % bits:  # one little-endian bit stream per row
+        planes = ((q[:, :, None] >> np.arange(bits, dtype=np.uint32)) & 1).astype(np.uint8)
+        packed = np.packbits(planes.reshape(rows, cols * bits), axis=1, bitorder="little")
+        return np.ascontiguousarray(packed).view("<u4").astype(np.uint32)
+    per_word = 32 // bits
     grouped = q.reshape(rows, cols // per_word, per_word)
     shifts = (np.arange(per_word, dtype=np.uint32) * bits).reshape(1, 1, per_word)
     return np.bitwise_or.reduce(grouped << shifts, axis=2).astype(np.uint32)
@@ -88,11 +94,18 @@ def unpack_affine(words: np.ndarray, bits: int) -> np.ndarray:
     """Unpack MLX ``uint32`` words ``[rows, cols*bits/32]`` to codes ``[rows, cols]``."""
 
     words = np.asarray(words, dtype=np.uint32)
+    rows, count = words.shape
+    if 32 % bits:
+        if count * 32 % bits:
+            raise ValueError("words do not hold a whole number of codes")
+        stream = np.unpackbits(np.ascontiguousarray(words, dtype="<u4").view(np.uint8), axis=1, bitorder="little")
+        planes = stream.reshape(rows, count * 32 // bits, bits).astype(np.uint32)
+        return np.bitwise_or.reduce(planes << np.arange(bits, dtype=np.uint32), axis=2).astype(np.uint32)
     per_word = 32 // bits
     mask = np.uint32((1 << bits) - 1)
     shifts = (np.arange(per_word, dtype=np.uint32) * bits).reshape(1, 1, per_word)
     codes = (words[:, :, None] >> shifts) & mask
-    return codes.reshape(words.shape[0], words.shape[1] * per_word)
+    return codes.reshape(rows, count * per_word)
 
 
 def dequantize_affine(
