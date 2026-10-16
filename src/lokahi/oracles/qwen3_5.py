@@ -13,10 +13,15 @@ Semantics follow Transformers' ``Qwen3_5ForCausalLM`` (the text model of
   full);
 * full attention: ``q_proj`` gives each head its query and an output gate
   (``head_dim`` each, in that order); q and k are RMS-normed per head; RoPE
-  rotates halves within the first ``partial_rotary_factor`` of each head
-  (Qwen3.5's multimodal RoPE reduces to this for text, whose three position
-  axes coincide); grouped-query softmax attention; the output times
-  ``sigmoid(gate)``; ``o_proj``;
+  rotates halves within the first ``partial_rotary_factor`` of each head;
+  grouped-query softmax attention; the output times ``sigmoid(gate)``;
+  ``o_proj``. Qwen3.5's RoPE is multimodal (interleaved M-RoPE): each token
+  has temporal, height and width positions, and rotation frequency i reads
+  the height position when ``i % 3 == 1`` and ``i < 3 * mrope_section[1]``,
+  the width position when ``i % 3 == 2`` and ``i < 3 * mrope_section[2]``,
+  and the temporal one otherwise. Text tokens' three positions coincide, so
+  for text it is plain RoPE; image tokens take their grid coordinates
+  (``qwen3_5_vision.rope_positions``);
 * Gated DeltaNet: ``in_proj_qkv``, ``in_proj_z``, ``in_proj_b`` and
   ``in_proj_a`` (Qwen3.5), or Qwen3-Next's ``in_proj_qkvz`` and ``in_proj_ba``
   grouped per key head; a depthwise causal conv1d (kernel
@@ -77,6 +82,8 @@ class Qwen35Config:
     norm_topk_prob: bool = True
     decoder_sparse_step: int = 1
     mlp_only_layers: tuple[int, ...] = ()
+    mrope_section: tuple[int, ...] = ()  # empty: plain RoPE even for images (Qwen3-Next)
+    mrope_interleaved: bool = True
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "Qwen35Config":
@@ -119,6 +126,8 @@ class Qwen35Config:
             norm_topk_prob=True if moe else bool(cfg.get("norm_topk_prob", True)),
             decoder_sparse_step=1 if moe else int(cfg.get("decoder_sparse_step") or 1),
             mlp_only_layers=() if moe else tuple(cfg.get("mlp_only_layers") or ()),
+            mrope_section=tuple(int(s) for s in rope.get("mrope_section") or ()),
+            mrope_interleaved=bool(rope.get("mrope_interleaved", True)),
         )
 
     @property
@@ -131,6 +140,17 @@ class Qwen35Config:
             and layer not in self.mlp_only_layers
             and (layer + 1) % self.decoder_sparse_step == 0
         )
+
+    def rope_axes(self) -> np.ndarray:
+        """The position axis (0 temporal, 1 height, 2 width) each rotation frequency reads."""
+
+        axes = np.zeros(self.rotary_dim // 2, dtype=np.int64)
+        if self.mrope_section:
+            if not self.mrope_interleaved:
+                raise NotImplementedError("chunked (non-interleaved) M-RoPE")
+            for axis in (1, 2):
+                axes[axis : 3 * self.mrope_section[axis] : 3] = axis
+        return axes
 
     def inv_freq(self) -> np.ndarray:
         dim = self.rotary_dim
@@ -170,6 +190,8 @@ class Qwen35Reference:
         return _rms(x, self.config.rms_norm_eps) * (self.norm_offset + self.w[name])
 
     def _attention(self, index: int, x: np.ndarray, positions: np.ndarray) -> np.ndarray:
+        """``positions`` [3, tokens]: each token's temporal, height and width RoPE positions."""
+
         cfg = self.config
         prefix = f"model.layers.{index}.self_attn"
         tokens, heads, kv_heads, dim = x.shape[0], cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
@@ -180,7 +202,7 @@ class Qwen35Reference:
         q = self._norm(f"{prefix}.q_norm", q)
         k = self._norm(f"{prefix}.k_norm", k)
         rot = cfg.rotary_dim
-        angles = positions[:, None].astype(np.float64) * cfg.inv_freq()[None, :]
+        angles = positions[cfg.rope_axes()].T.astype(np.float64) * cfg.inv_freq()[None, :]
         cos = np.cos(angles).astype(np.float32)[:, None, :]
         sin = np.sin(angles).astype(np.float32)[:, None, :]
 
@@ -190,7 +212,8 @@ class Qwen35Reference:
             return np.concatenate([a * cos - b * sin, b * cos + a * sin, t[..., rot:]], axis=-1)
 
         q, k = rope(q), rope(k)
-        allowed = positions[None, :] <= positions[:, None]
+        order = np.arange(tokens)
+        allowed = order[None, :] <= order[:, None]  # causal by sequence index, not RoPE position
         group = heads // kv_heads
         out = np.empty((tokens, heads, dim), dtype=np.float32)
         for head in range(heads):
@@ -298,13 +321,22 @@ class Qwen35Reference:
             out = out + shared * (1.0 / (1.0 + np.exp(-gate_logit)))
         return out
 
-    def logits(self, token_ids: Sequence[int]) -> np.ndarray:
-        """Return ``[len(token_ids), vocab]`` float32 logits."""
+    def logits(self, token_ids: Sequence[int], injected: Mapping[int, np.ndarray] | None = None,
+               positions: np.ndarray | None = None) -> np.ndarray:
+        """Return ``[len(token_ids), vocab]`` float32 logits.
+
+        ``injected`` replaces the embeddings at some positions (image
+        features); ``positions`` [3, tokens] gives the M-RoPE positions
+        (default: each token's index on all three axes).
+        """
 
         cfg = self.config
         tokens = np.asarray(token_ids, dtype=np.int64)
-        positions = np.arange(tokens.shape[0])
-        x = self.w["model.embed_tokens"][tokens]
+        if positions is None:
+            positions = np.broadcast_to(np.arange(tokens.shape[0]), (3, tokens.shape[0]))
+        x = self.w["model.embed_tokens"][tokens].copy()
+        for position, row in (injected or {}).items():
+            x[position] = row
         for index in range(cfg.num_hidden_layers):
             prefix = f"model.layers.{index}"
             h = self._norm(f"{prefix}.input_layernorm", x)

@@ -87,15 +87,19 @@ jobs:
           fi
           system_profiler SPDisplaysDataType | sed -n '1,20p'
           LOKAHI_TEST_BACKENDS=metal PYTHONPATH=src .venv/bin/python -m pytest -q tests/test_native_engine.py tests/test_gemma3_vision.py tests/test_gemma4_vision.py tests/test_sampling.py
-      - name: Oracles vs MLX and MLX-LM (independent implementations)
+      - name: Oracles vs MLX, MLX-LM, MLX-VLM and Transformers (independent implementations)
         run: |
-          # Correctness evidence: the NumPy oracles against MLX-LM's models in
-          # float32. A separate venv keeps MLX-LM's dependencies away from the
-          # pinned tokenizers the other steps use.
+          # Correctness evidence: the NumPy oracles against MLX-LM's and
+          # MLX-VLM's models in float32, and Transformers' image processor. A
+          # separate venv keeps their dependencies away from the pinned
+          # tokenizers the other steps use. MLX-VLM goes in without its
+          # server and dataset dependencies, which the models never import.
           python3 -m venv .venv-mlx
-          .venv-mlx/bin/pip install numpy pytest mlx==0.32.3 mlx-metal==0.32.3 mlx-lm==0.32.0
-          .venv-mlx/bin/python -c 'import mlx.core, mlx_lm'  # the tests skip without them; here they must run
-          PYTHONPATH=src .venv-mlx/bin/python -m pytest -q -rs tests/test_mlx_crosscheck.py
+          .venv-mlx/bin/pip install numpy pytest Pillow requests mlx==0.32.3 mlx-metal==0.32.3 mlx-lm==0.32.0 \
+            transformers==5.20.0
+          .venv-mlx/bin/pip install --no-deps mlx-vlm==0.4.4
+          .venv-mlx/bin/python -c 'import mlx.core, mlx_lm, mlx_vlm.utils'  # the tests skip without them; here they must run
+          PYTHONPATH=src .venv-mlx/bin/python -m pytest -q -rs tests/test_mlx_crosscheck.py tests/test_mlx_vlm_crosscheck.py
       - name: Wire v1 service across a real XPC boundary (gate B, CPU backend)
         run: |
           PYTHONPATH=src .venv/bin/python -c 'import sys; from lokahi.fixtures import write_tiny_chat_model; write_tiny_chat_model(sys.argv[1])' build/xpc-model
