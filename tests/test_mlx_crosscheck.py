@@ -56,13 +56,17 @@ def test_affine_layout_matches_mx_dequantize(bits, group):
         mx.array(words), mx.array(scales), mx.array(biases), group_size=group, bits=bits
     )
     np.testing.assert_allclose(np.array(theirs), ours, rtol=0, atol=1e-6)
-    # And MLX's own quantizer's codes unpack to its dequantized matrix.
+    # And MLX's own quantizer's codes unpack to its dequantized matrix. MLX's
+    # Metal kernels fuse scale * q + bias into one rounding, so the two agree
+    # to an ulp, far inside the smallest scale step a misread code would show.
     weights = mx.array(rng.standard_normal((rows, cols)).astype(np.float32))
     packed, scale, bias = mx.quantize(weights, group_size=group, bits=bits)
-    np.testing.assert_array_equal(
+    np.testing.assert_allclose(
         dequantize_affine(np.array(packed), np.array(scale), np.array(bias), QuantSpec(group, bits)),
         np.array(mx.dequantize(packed, scale, bias, group_size=group, bits=bits)),
+        rtol=0, atol=1e-6,
     )
+    assert np.abs(np.array(scale)).min() > 1e-3  # a misread code moves a value by at least one scale step
 
 
 def test_mxfp4_layout_matches_mx_dequantize():
