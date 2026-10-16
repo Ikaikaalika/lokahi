@@ -1,5 +1,5 @@
-// Lokahi Metal kernels for dense decoders (Gemma 3, Gemma 4 and the Llama
-// family).
+// Lokahi Metal kernels for decoders (Gemma 3, Gemma 4, the Llama family and
+// DeepSeek).
 //
 // Activations are float32. Linear weights are MLX affine-quantized codes with
 // BF16 or F16 per-group scales and biases, or (in the matrix-vector kernels)
@@ -383,9 +383,13 @@ struct MoeRouteParams {
   int norm_topk;      // with softmax over all experts, renormalize over the chosen
   int has_bias;       // add the router bias first (GPT-OSS)
   int has_scale;      // multiply each weight by its expert's scale (Gemma 4)
+  int groups;         // > 1: only the topk_groups groups with the largest maxima compete (DeepSeek V2)
+  int topk_groups;
+  float scaling;      // every weight times this (DeepSeek's routed_scaling_factor)
 };
 
-// One simdgroup per token. Ties go to the lower expert index.
+// One simdgroup per token. Ties go to the lower expert index (and drop the
+// lower group).
 kernel void moe_route(device float* logits [[buffer(0)]],
                       device int* chosen [[buffer(1)]],
                       device float* weights [[buffer(2)]],
@@ -405,8 +409,26 @@ kernel void moe_route(device float* logits [[buffer(0)]],
   float total = 0.0f;
   for (int e = int(lane); e < p.experts; e += 32) total += exp(l[e] - top);
   total = simd_sum(total);
-  // Experts already chosen, as a bit set over up to 256 experts.
-  uint taken[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  // Experts already chosen or excluded, as a bit set over up to 512 experts.
+  uint taken[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  if (p.groups > 1) {  // every lane drops the same groups
+    const int per_group = p.experts / p.groups;
+    float group_max[32];
+    for (int g = 0; g < p.groups; ++g) {
+      float best = -INFINITY;
+      for (int e = g * per_group; e < (g + 1) * per_group; ++e) best = max(best, l[e]);
+      group_max[g] = best;
+    }
+    uint dropped = 0;
+    for (int j = 0; j < p.groups - p.topk_groups; ++j) {
+      int worst = -1;
+      for (int g = 0; g < p.groups; ++g) {
+        if (!((dropped >> g) & 1u) && (worst < 0 || group_max[g] < group_max[worst])) worst = g;
+      }
+      dropped |= 1u << worst;
+      for (int e = worst * per_group; e < (worst + 1) * per_group; ++e) taken[e >> 5] |= 1u << (e & 31);
+    }
+  }
   float kept = 0.0f;
   for (int j = 0; j < p.k; ++j) {
     float best = -INFINITY;
@@ -429,7 +451,7 @@ kernel void moe_route(device float* logits [[buffer(0)]],
       weights[int(t) * p.k + j] = weight;
     }
   }
-  const float scale = (p.topk_softmax != 0 || p.norm_topk != 0) ? 1.0f / kept : 1.0f / total;
+  const float scale = ((p.topk_softmax != 0 || p.norm_topk != 0) ? 1.0f / kept : 1.0f / total) * p.scaling;
   if (lane == 0) {
     for (int j = 0; j < p.k; ++j) {
       const int slot = int(t) * p.k + j;
@@ -453,6 +475,8 @@ struct GatherParams {
   int act;          // glu's activation (gate and up kernel)
   int has_bias;     // per-expert output biases [experts, rows]
   float limit;      // the clamped SwiGLU's limit
+  int x_stride;     // floats between input rows; 0 for cols
+  int y_stride;     // floats between output rows; 0 for rows
 };
 
 // y[pair, :] = act(gate_e(x)) * up_e(x) with e = chosen[pair].
@@ -476,7 +500,7 @@ kernel void qmv_gather_glu(const device uint* wg [[buffer(0)]],
   if (row0 >= p.rows) return;
   const int e = chosen[pair];
   const int words = p.rows * (p.cols * QBITS / 32), groups = p.rows * (p.cols / QGROUP);
-  const device float* xr = x + (p.input_rows != 0 ? pair / p.k : pair) * p.cols;
+  const device float* xr = x + (p.input_rows != 0 ? pair / p.k : pair) * (p.x_stride != 0 ? p.x_stride : p.cols);
   float gate[QMV_ROWS] = {0.0f, 0.0f, 0.0f, 0.0f};
   float up[QMV_ROWS] = {0.0f, 0.0f, 0.0f, 0.0f};
   qmv_accumulate(wg + e * words, expert_scales(sg_scales, e, groups), bg + e * groups, xr, row0, p.rows, p.cols, lane,
@@ -491,12 +515,14 @@ kernel void qmv_gather_glu(const device uint* wg [[buffer(0)]],
         g += gate_bias[e * p.rows + row];
         u += up_bias[e * p.rows + row];
       }
-      y[pair * p.rows + row] = glu(g, u, p.act, p.limit);
+      y[pair * (p.y_stride != 0 ? p.y_stride : p.rows) + row] = glu(g, u, p.act, p.limit);
     }
   }
 }
 
-// y[pair, :] = W_e x[pair or pair / k] with e = chosen[pair].
+// y[pair, :] = W_e x[pair or pair / k] with e = chosen[pair]. Multi-head
+// latent attention also runs its per-head absorptions and expansions
+// through it, with e the pair's head and strided rows.
 kernel void qmv_gather(const device uint* w [[buffer(0)]],
                        const device ushort* scales [[buffer(1)]],
                        const device ushort* biases [[buffer(2)]],
@@ -513,23 +539,72 @@ kernel void qmv_gather(const device uint* w [[buffer(0)]],
   if (row0 >= p.rows) return;
   const int e = chosen[pair];
   const int words = p.rows * (p.cols * QBITS / 32), groups = p.rows * (p.cols / QGROUP);
-  const device float* xr = x + (p.input_rows != 0 ? pair / p.k : pair) * p.cols;
+  const device float* xr = x + (p.input_rows != 0 ? pair / p.k : pair) * (p.x_stride != 0 ? p.x_stride : p.cols);
+  device float* yr = y + pair * (p.y_stride != 0 ? p.y_stride : p.rows);
   float acc[QMV_ROWS] = {0.0f, 0.0f, 0.0f, 0.0f};
   qmv_accumulate(w + e * words, expert_scales(scales, e, groups), biases + e * groups, xr, row0, p.rows, p.cols, lane,
                  acc);
   for (int r = 0; r < QMV_ROWS; ++r) {
     const float total = simd_sum(acc[r]);
     const int row = row0 + r;
-    if (lane == 0 && row < p.rows) y[pair * p.rows + row] = total + (p.has_bias != 0 ? out_bias[e * p.rows + row] : 0.0f);
+    if (lane == 0 && row < p.rows) yr[row] = total + (p.has_bias != 0 ? out_bias[e * p.rows + row] : 0.0f);
+  }
+}
+
+// Multi-head latent attention's query absorption from kv_b_proj, whose rows
+// are quantized along the latent rank: for pair (token, head h),
+// y[pair * y_stride + r] = sum over d < nope of x[pair * x_stride + d] *
+// W[h * head_rows + d, r]. One threadgroup per pair; each thread owns whole
+// words of the latent (one group's scale and bias apply to a word) and walks
+// the head's key rows, so neighbouring threads read neighbouring words.
+struct AbsorbParams {
+  int heads;
+  int nope;       // key rows per head
+  int head_rows;  // rows per head in kv_b_proj (nope + v)
+  int cols;       // the latent rank
+  int x_stride;
+  int y_stride;
+};
+
+kernel void qmv_t_heads(const device uint* w [[buffer(0)]],
+                        const device ushort* scales [[buffer(1)]],
+                        const device ushort* biases [[buffer(2)]],
+                        const device float* x [[buffer(3)]],
+                        device float* y [[buffer(4)]],
+                        constant AbsorbParams& p [[buffer(5)]],
+                        uint pair [[threadgroup_position_in_grid]],
+                        uint tid [[thread_position_in_threadgroup]],
+                        uint tpg [[threads_per_threadgroup]]) {
+  const int per_word = 32 / QBITS;
+  const uint mask = (1u << QBITS) - 1u;
+  const int words_per_row = p.cols / per_word;
+  const int groups_per_row = p.cols / QGROUP;
+  const int h = int(pair) % p.heads;
+  const device float* xr = x + int(pair) * p.x_stride;
+  device float* yr = y + int(pair) * p.y_stride;
+  for (int word = int(tid); word < words_per_row; word += int(tpg)) {
+    float acc[16];
+    for (int j = 0; j < per_word; ++j) acc[j] = 0.0f;
+    const int g = word * per_word / QGROUP;
+    for (int d = 0; d < p.nope; ++d) {
+      const int row = h * p.head_rows + d;
+      const uint codes = w[row * words_per_row + word];
+      const float scale = scale_at(scales, row * groups_per_row + g);
+      const float bias = scale_at(biases, row * groups_per_row + g);
+      const float xv = xr[d];
+      for (int j = 0; j < per_word; ++j) acc[j] += xv * (scale * float((codes >> (QBITS * j)) & mask) + bias);
+    }
+    for (int j = 0; j < per_word; ++j) yr[word * per_word + j] = acc[j];
   }
 }
 
 // GLM-4.5 / DeepSeek V3 (noaux_tc) routing, one simdgroup per token:
 // sigmoid scores plus the correction bias choose the top k within the best
-// topk_groups groups (by each group's two best); the chosen experts' raw
-// scores, renormalized when norm_topk (and k > 1), times scaling, weight
-// them. Ties go to the lower group or expert index. Lane 0 does the
-// selection: at most 256 experts, so it is cheap next to the experts.
+// topk_groups groups (by each group's two best; the others' experts score 0,
+// or are excluded with `exclude`); the chosen experts' raw scores,
+// renormalized when norm_topk (and k > 1), times scaling, weight them. Ties
+// go to the lower group or expert index. Lane 0 does the selection: at most
+// 512 experts, so it is cheap next to the experts.
 struct MoeGroupedParams {
   int experts;
   int k;
@@ -537,6 +612,7 @@ struct MoeGroupedParams {
   int topk_groups;
   int norm_topk;
   float scaling;
+  int exclude;
 };
 
 kernel void moe_route_grouped(const device float* logits [[buffer(0)]],
@@ -546,8 +622,8 @@ kernel void moe_route_grouped(const device float* logits [[buffer(0)]],
                               const device float* correction [[buffer(4)]],
                               uint t [[threadgroup_position_in_grid]],
                               uint lane [[thread_index_in_simdgroup]]) {
-  threadgroup float score[256];
-  threadgroup float selection[256];
+  threadgroup float score[512];
+  threadgroup float selection[512];
   const device float* l = logits + int(t) * p.experts;
   for (int e = int(lane); e < p.experts; e += 32) {
     score[e] = 1.0f / (1.0f + precise::exp(-l[e]));
@@ -572,16 +648,17 @@ kernel void moe_route_grouped(const device float* logits [[buffer(0)]],
       group_score[g] = first + (per_group > 1 ? second : 0.0f);
     }
     uint dropped = 0;
-    for (int j = 0; j < p.groups - p.topk_groups; ++j) {  // zero the lowest groups
+    const float dropped_score = p.exclude != 0 ? -INFINITY : 0.0f;
+    for (int j = 0; j < p.groups - p.topk_groups; ++j) {  // zero or exclude the lowest groups
       int worst = -1;
       for (int g = 0; g < p.groups; ++g) {
         if (!((dropped >> g) & 1u) && (worst < 0 || group_score[g] < group_score[worst])) worst = g;
       }
       dropped |= 1u << worst;
-      for (int e = worst * per_group; e < (worst + 1) * per_group; ++e) selection[e] = 0.0f;
+      for (int e = worst * per_group; e < (worst + 1) * per_group; ++e) selection[e] = dropped_score;
     }
   }
-  uint taken[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  uint taken[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
   float total = 0.0f;
   for (int j = 0; j < p.k; ++j) {
     int best = -1;
@@ -911,6 +988,77 @@ kernel void qk_norm_rope_store(device float* q [[buffer(0)]],
 }
 
 // ---------------------------------------------------------------------------
+// Multi-head latent attention's per-token RoPE and cache write. Threadgroup
+// (g, t): g < heads rotates head g's rope query (q[t, g, nope:]) into
+// latent_q[t, g, rank:]; g == heads writes the token's cache row: its latent
+// (kv[t, :rank]) RMS-normed by kv_norm, then its rope key (kv[t, rank:])
+// rotated. RoPE rotates interleaved pairs or halves, then scales by factor
+// (YaRN's attention factor).
+// ---------------------------------------------------------------------------
+
+struct MlaRopeParams {
+  int heads;
+  int nope;
+  int rope;
+  int rank;
+  int start_pos;
+  float eps;
+  int pairs;
+  float factor;
+};
+
+inline void rope_latent(const device float* src, device float* dst, int dims, int pos, int pairs, float factor,
+                        const device float* inv_freq, uint tid, uint tpg) {
+  const int half_dims = dims / 2;
+  for (int i = int(tid); i < half_dims; i += int(tpg)) {
+    const float angle = float(pos) * inv_freq[i];
+    const float cs = precise::cos(angle);
+    const float sn = precise::sin(angle);
+    const int ia = pairs != 0 ? 2 * i : i;
+    const int ib = pairs != 0 ? 2 * i + 1 : i + half_dims;
+    const float a = src[ia];
+    const float b = src[ib];
+    dst[ia] = (a * cs - b * sn) * factor;
+    dst[ib] = (b * cs + a * sn) * factor;
+  }
+}
+
+kernel void mla_rope_store(const device float* q [[buffer(0)]],
+                           device float* latent_q [[buffer(1)]],
+                           const device float* kv [[buffer(2)]],
+                           device float* cache [[buffer(3)]],
+                           const device float* kv_norm [[buffer(4)]],
+                           const device float* inv_freq [[buffer(5)]],
+                           constant MlaRopeParams& p [[buffer(6)]],
+                           uint2 tgp [[threadgroup_position_in_grid]],
+                           uint2 tid2 [[thread_position_in_threadgroup]],
+                           uint2 tpg2 [[threads_per_threadgroup]],
+                           uint sg [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float scratch[32];
+  const uint tid = tid2.x;
+  const uint tpg = tpg2.x;
+  const int g = int(tgp.x);
+  const int t = int(tgp.y);
+  const int pos = p.start_pos + t;
+  const int width = p.rank + p.rope;
+  if (g < p.heads) {  // uniform across the threadgroup
+    const int row = t * p.heads + g;
+    rope_latent(q + row * (p.nope + p.rope) + p.nope, latent_q + row * width + p.rank, p.rope, pos, p.pairs,
+                p.factor, inv_freq, tid, tpg);
+    return;
+  }
+  const device float* src = kv + t * width;
+  device float* dst = cache + pos * width;
+  float ss = 0.0f;
+  for (int i = int(tid); i < p.rank; i += int(tpg)) ss += src[i] * src[i];
+  const float total = threadgroup_sum(ss, scratch, sg, lane, (tpg + 31) / 32);
+  const float inv = precise::rsqrt(total / float(p.rank) + p.eps);
+  for (int i = int(tid); i < p.rank; i += int(tpg)) dst[i] = src[i] * inv * kv_norm[i];
+  rope_latent(src + p.rank, dst + p.rank, p.rope, pos, p.pairs, p.factor, inv_freq, tid, tpg);
+}
+
+// ---------------------------------------------------------------------------
 // Gemma 4's per-layer inputs. per_layer_combine turns the pass's projection
 // of the scaled embedding and its per-layer embedding lookup (already times
 // sqrt(P)) into out[t, l, :] = (norm(proj * proj_scale) * w + lookup) *
@@ -995,6 +1143,7 @@ struct AttnParams {
   float scale;
   float softcap;  // 0 disables
   int has_last_key;  // last_key[t] extends query t's keys (Gemma 3's image blocks)
+  int groups_per_kv;  // threadgroups of G query heads per kv head: 1, or heads / G for latent attention
 };
 
 template <int G, int DPL>
@@ -1013,7 +1162,8 @@ template <int G, int DPL>
   threadgroup float sh_l[G];
 
   const int blk = int(tgp.x);
-  const int kvh = int(tgp.y);
+  const int qg = int(tgp.y);  // this threadgroup's G query heads are qg * G ...
+  const int kvh = qg / p.groups_per_kv;
   const int t = int(tgp.z);
   const int D = p.head_dim;
   const int pos = p.start_pos + t;
@@ -1024,7 +1174,7 @@ template <int G, int DPL>
 
   float qv[G][DPL];
   for (int g = 0; g < G; ++g) {
-    const device float* qh = q + (t * p.heads + kvh * G + g) * D + int(lane) * DPL;
+    const device float* qh = q + (t * p.heads + qg * G + g) * D + int(lane) * DPL;
     for (int j = 0; j < DPL; ++j) qv[g][j] = qh[j];
   }
   float m[G], l[G], acc[G][DPL];
@@ -1087,7 +1237,7 @@ template <int G, int DPL>
   }
   if (sg != 0) return;
   for (int g = 0; g < G; ++g) {
-    const int head = kvh * G + g;
+    const int head = qg * G + g;
     const int index = (t * p.heads + head) * p.n_blocks + blk;
     device float* o = part_o + index * D + int(lane) * DPL;
     for (int j = 0; j < DPL; ++j) o[j] = acc[g][j];
@@ -1119,6 +1269,11 @@ LOKAHI_ATTN_ALL_DPL(5)
 LOKAHI_ATTN_ALL_DPL(6)
 LOKAHI_ATTN_ALL_DPL(7)
 LOKAHI_ATTN_ALL_DPL(8)
+// Multi-head latent attention: four query heads per threadgroup over the
+// one latent key head, 576 wide in every released model (96 in the tiny
+// fixtures).
+LOKAHI_ATTN(4, 3)
+LOKAHI_ATTN(4, 18)
 
 struct ReduceParams {
   int heads;

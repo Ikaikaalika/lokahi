@@ -1,4 +1,4 @@
-// Metal backend for dense decoders (Gemma 3, Gemma 4 and the Llama family).
+// Metal backend for decoders (Gemma 3, Gemma 4, the Llama family and DeepSeek).
 //
 // One serial compute encoder per command buffer runs a whole prefill (all
 // chunks) or one decode step: embedding, every layer, the last-row
@@ -102,6 +102,15 @@ struct GpuLayer {
   // Gemma 4's experts beside the dense MLP: the router's input scale, the
   // per-expert weight scales, and the extra norms.
   BufRef router_input_scale, per_expert_scale, mlp_post_norm_1, expert_norm, expert_post_norm;
+  // Multi-head latent attention: the query's down projection (q is q_b_proj
+  // then) and the latent projection with their norms; the query absorption,
+  // stacked per head (embed_q) or as kv_b_proj's key rows; and the per-head
+  // expansion, stacked (unembed_out, or kv_b_proj's value rows copied
+  // contiguous). The latent cache is k_cache, and also v_cache.
+  GpuLinear q_a, kv_a, kv_b;
+  GpuExperts embed_q, unembed_out;
+  bool absorbed = false;  // embed_q, rather than kv_b_proj's key rows
+  BufRef q_a_norm, kv_a_norm;
   // A KV-shared layer's caches and capacity are its source layer's.
   id<MTLBuffer> k_cache = nil;
   id<MTLBuffer> v_cache = nil;
@@ -182,14 +191,19 @@ struct RopeParams {
 };
 struct PerLayerCombineParams { int size; int layers; float eps; float offset; float proj_scale; float input_scale; };
 struct PerLayerGateParams { int size; int layers; int layer; int count; };
-struct MoeRouteParams { int experts; int k; int topk_softmax; int norm_topk; int has_bias; int has_scale; };
-struct GatherParams { int rows; int cols; int k; int input_rows; int act; int has_bias; float limit; };
+struct MoeRouteParams {
+  int experts; int k; int topk_softmax; int norm_topk; int has_bias; int has_scale; int groups; int topk_groups;
+  float scaling;
+};
+struct GatherParams { int rows; int cols; int k; int input_rows; int act; int has_bias; float limit; int x_stride; int y_stride; };
+struct AbsorbParams { int heads; int nope; int head_rows; int cols; int x_stride; int y_stride; };
+struct MlaRopeParams { int heads; int nope; int rope; int rank; int start_pos; float eps; int pairs; float factor; };
 struct MoeCombineParams { int cols; int k; int count; int has_shared; };
-struct MoeGroupedParams { int experts; int k; int groups; int topk_groups; int norm_topk; float scaling; };
+struct MoeGroupedParams { int experts; int k; int groups; int topk_groups; int norm_topk; float scaling; int exclude; };
 struct DenseParams { int rows; int cols; int dtype; };
 struct AttnParams {
   int heads; int kv_heads; int head_dim; int start_pos; int window; int capacity; int block; int n_blocks;
-  float scale; float softcap; int has_last_key;
+  float scale; float softcap; int has_last_key; int groups_per_kv;
 };
 struct ReplaceParams { int cols; int n; };
 struct ReduceParams { int heads; int head_dim; int n_blocks; int has_sinks; };
@@ -333,8 +347,6 @@ class DecoderMetal final : public Model {
   // ---- setup --------------------------------------------------------------
 
   void validate() const {
-    LK_CHECK(!c_.mla(), "metal: multi-head latent attention (" + c_.architecture +
-                            ") is not implemented yet; use --backend cpu");
     // Experts run only through the matrix-vector kernels, which also read
     // MXFP4; other matrices must be affine.
     auto check_any = [&](const Linear& l) {
@@ -353,10 +365,30 @@ class DecoderMetal final : public Model {
       check(w_->embed_per_layer);
       check(w_->per_layer_model_proj);
     }
-    LK_CHECK(c_.num_experts <= 256, "metal: at most 256 experts");
+    LK_CHECK(c_.num_experts <= 512, "metal: at most 512 experts");
+    LK_CHECK(c_.n_group <= 32, "metal: at most 32 expert groups");
+    if (c_.mla()) {
+      // Four query heads per attention threadgroup over the latent, whose
+      // width the kernels are instantiated for.
+      const int width = c_.latent_width();
+      LK_CHECK(c_.num_heads % 4 == 0, "metal: latent attention needs a multiple of 4 heads");
+      LK_CHECK(width == 96 || width == 576, "metal: latent attention is built for kv_lora_rank + "
+                                            "qk_rope_head_dim of 576 (or 96); this model has " + std::to_string(width));
+    }
     for (int i = 0; i < c_.num_layers; ++i) {
       const DecoderLayer& L = w_->layers[static_cast<size_t>(i)];
       for (const Linear* l : {&L.q_proj, &L.o_proj}) check(*l);
+      if (c_.mla()) {
+        if (c_.q_lora_rank > 0) check(L.q_a_proj);
+        check(L.kv_a_proj);
+        for (const auto* heads : {&L.embed_q, &L.unembed_out}) {
+          for (const Linear& h : *heads) check(h);
+        }
+        if (L.embed_q.empty()) {
+          check(L.kv_b_proj);
+          LK_CHECK(32 % L.kv_b_proj.quant.bits == 0, "metal: " + L.kv_b_proj.name + " needs 2, 4 or 8 bits");
+        }
+      }
       if (c_.is_moe(i)) {
         if (L.router.quant.quantized()) {
           check(L.router);
@@ -379,12 +411,13 @@ class DecoderMetal final : public Model {
       if (!c_.is_moe(i) || c_.experts_beside_mlp) {
         for (const Linear* l : {&L.gate_proj, &L.up_proj, &L.down_proj}) check(*l);
       }
-      if (!c_.shares_kv(i)) check(L.k_proj);
-      if (!c_.shares_kv(i) && !c_.k_eq_v(i)) check(L.v_proj);
       if (c_.per_layer_input > 0) {
         check(L.per_layer_gate);
         check(L.per_layer_proj);
       }
+      if (c_.mla()) continue;  // no k/v projections; the latent's geometry is checked above
+      if (!c_.shares_kv(i)) check(L.k_proj);
+      if (!c_.shares_kv(i) && !c_.k_eq_v(i)) check(L.v_proj);
       const int dim = c_.head_dim_of(i), dpl = dim / 32;
       LK_CHECK(dim % 32 == 0 && (dpl == 2 || dpl == 4 || dpl == 8 || dpl == 16),
                "metal: head_dim must be 64, 128, 256 or 512");
@@ -461,6 +494,10 @@ class DecoderMetal final : public Model {
       max_kv_width_ = std::max(max_kv_width_, c_.kv_heads_of(i) * c_.head_dim_of(i));
       max_inter_ = std::max(max_inter_, c_.intermediate_of(i));
     }
+    if (c_.mla()) {  // attention runs over latent-wide heads
+      max_head_dim_ = std::max(max_head_dim_, c_.latent_width());
+      max_kv_width_ = std::max(max_kv_width_, c_.latent_width());
+    }
     // Bound in place of norms a family does not have; kernels never read it.
     placeholder_data_.assign(static_cast<size_t>(std::max({c_.hidden_size, max_head_dim_, c_.num_heads * max_head_dim_,
                                                             c_.per_layer_input})),
@@ -489,9 +526,22 @@ class DecoderMetal final : public Model {
       G.k_eq_v = c_.k_eq_v(layer);
       G.scalar = L.layer_scalar;
       G.q = add_linear(arena, L.q_proj, linear_fix, &G.q);
-      if (G.own_kv) G.k = add_linear(arena, L.k_proj, linear_fix, &G.k);
-      if (G.own_kv && !G.k_eq_v) G.v = add_linear(arena, L.v_proj, linear_fix, &G.v);
+      if (G.own_kv && !c_.mla()) G.k = add_linear(arena, L.k_proj, linear_fix, &G.k);
+      if (G.own_kv && !G.k_eq_v && !c_.mla()) G.v = add_linear(arena, L.v_proj, linear_fix, &G.v);
       G.o = add_linear(arena, L.o_proj, linear_fix, &G.o);
+      if (c_.mla()) {
+        if (c_.q_lora_rank > 0) G.q_a = add_linear(arena, L.q_a_proj, linear_fix, &G.q_a);
+        G.kv_a = add_linear(arena, L.kv_a_proj, linear_fix, &G.kv_a);
+        G.absorbed = !L.embed_q.empty();
+        if (G.absorbed) {
+          add_experts(arena, L.embed_q, &G.embed_q);
+        } else {
+          G.kv_b = add_linear(arena, L.kv_b_proj, linear_fix, &G.kv_b);
+        }
+        add_experts(arena, L.unembed_out, &G.unembed_out);
+      }
+      add_optional(L.q_a_norm, &G.q_a_norm);
+      add_optional(L.kv_a_norm, &G.kv_a_norm);
       G.moe = c_.is_moe(layer);
       if (G.moe) {
         G.router_dense = !L.router.quant.quantized();
@@ -588,6 +638,12 @@ class DecoderMetal final : public Model {
     for (size_t i = 0; i < layers_.size(); ++i) {
       GpuLayer& G = layers_[i];
       G.sliding = c_.layer_is_sliding[i];
+      if (c_.mla()) {  // one latent per position, whose prefix is also the value
+        G.capacity = max_context_;
+        G.k_cache = private_buffer(static_cast<size_t>(c_.latent_width()) * static_cast<size_t>(G.capacity) * f);
+        G.v_cache = G.k_cache;
+        continue;
+      }
       if (!G.own_kv) {  // reads its source layer's caches, allocated earlier
         const GpuLayer& source = layers_[static_cast<size_t>(c_.kv_source(static_cast<int>(i)))];
         G.k_cache = source.k_cache;
@@ -631,6 +687,17 @@ class DecoderMetal final : public Model {
       per_layer_lookup_ = private_buffer(chunk * width * f);
       per_layer_proj_ = private_buffer(chunk * width * f);
       per_layer_gate_ = private_buffer(chunk * static_cast<size_t>(c_.per_layer_input) * f);
+    }
+    if (c_.mla()) {
+      const size_t width = static_cast<size_t>(c_.latent_width());
+      latent_q_ = private_buffer(chunk * H * width * f);
+      latent_out_ = private_buffer(chunk * H * width * f);
+      if (c_.q_lora_rank > 0) q_latent_ = private_buffer(chunk * static_cast<size_t>(c_.q_lora_rank) * f);
+      // Each (token, head) pair's head, the expert index of the per-head
+      // gathered kernels.
+      head_index_ = shared_buffer(chunk * H * sizeof(int32_t));
+      int32_t* heads = static_cast<int32_t*>([head_index_ contents]);
+      for (size_t i = 0; i < chunk * H; ++i) heads[i] = static_cast<int32_t>(i % H);
     }
     const size_t partials = std::max(H * kDecodeMaxBlocks, chunk * H * kPrefillMaxBlocks);
     part_o_ = private_buffer(partials * D * f);
@@ -736,12 +803,18 @@ class DecoderMetal final : public Model {
 
   void encode_rms_norm(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> in, const BufRef& weight,
                        id<MTLBuffer> out, int n) {
+    encode_rms_norm(enc, in, weight, out, n, NormParams{c_.hidden_size, c_.rms_norm_eps, c_.norm_offset});
+  }
+
+  // Rows of params.cols values (in place when in is out).
+  void encode_rms_norm(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> in, const BufRef& weight,
+                       id<MTLBuffer> out, int n, const NormParams& params) {
     id<MTLComputePipelineState> pso = pipeline("rms_norm_rows");
     [enc setComputePipelineState:pso];
     bind(enc, in, 0, 0);
     bind(enc, weight, 1);
     bind(enc, out, 0, 2);
-    bytes(enc, NormParams{c_.hidden_size, c_.rms_norm_eps, c_.norm_offset}, 3);
+    bytes(enc, params, 3);
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(n), 1, 1)
         threadsPerThreadgroup:MTLSizeMake(norm_threads(pso), 1, 1)];
   }
@@ -845,7 +918,7 @@ class DecoderMetal final : public Model {
     bind(enc, part_ml_, 0, 4);
     bytes(enc,
           AttnParams{c_.num_heads, G.kv_heads, G.head_dim, start, window, G.capacity, block, n_blocks,
-                     c_.attn_scale, c_.attn_logit_softcapping, blocks ? 1 : 0},
+                     c_.attn_scale, c_.attn_logit_softcapping, blocks ? 1 : 0, 1},
           5);
     bind(enc, last_key_, blocks ? sizeof(int32_t) * static_cast<size_t>(start - plan_.base) : 0, 6);
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(n_blocks),
@@ -859,6 +932,116 @@ class DecoderMetal final : public Model {
     bind(enc, G.sinks, 4);
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(c_.num_heads), static_cast<NSUInteger>(n), 1)
         threadsPerThreadgroup:MTLSizeMake(static_cast<NSUInteger>(G.head_dim), 1, 1)];
+  }
+
+  // ---- multi-head latent attention ---------------------------------------
+
+  // The query (through the query rank when there is one) and the latent
+  // projection into kt_, then each head's query absorbed into
+  // latent_q_[t, h, :rank]: through the stacked embed_q, or straight from
+  // kv_b_proj's key rows.
+  void encode_latent_qkv(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n) {
+    if (c_.q_lora_rank > 0) {
+      encode_qmm(enc, G.q_a, h_, n, q_latent_);
+      encode_rms_norm(enc, q_latent_, G.q_a_norm, q_latent_, n, NormParams{c_.q_lora_rank, c_.latent_norm_eps, 0.0f});
+      encode_qmm(enc, G.q, q_latent_, n, q_);
+    } else {
+      encode_qmm(enc, G.q, h_, n, q_);
+    }
+    encode_qmm(enc, G.kv_a, h_, n, kt_);
+    const int H = c_.num_heads, nope = c_.qk_nope_dim, rank = c_.kv_lora_rank, width = c_.latent_width();
+    const NSUInteger pairs = static_cast<NSUInteger>(n * H);
+    if (G.absorbed) {
+      [enc setComputePipelineState:quant_pipeline("qmv_gather", G.embed_q.format())];
+      bind(enc, G.embed_q.words, 0);
+      bind(enc, G.embed_q.scales, 1);
+      bind(enc, G.embed_q.biases, 2);
+      bind(enc, q_, 0, 3);
+      bind(enc, latent_q_, 0, 4);
+      bytes(enc, GatherParams{rank, nope, 1, 0, 0, 0, 0.0f, c_.head_dim, width}, 5);
+      bind(enc, head_index_, 0, 6);
+      bind(enc, placeholder_, 7);
+      [enc dispatchThreadgroups:MTLSizeMake(qmv_groups(rank), pairs, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+      return;
+    }
+    id<MTLComputePipelineState> pso = quant_pipeline("qmv_t_heads", G.kv_b);
+    [enc setComputePipelineState:pso];
+    bind_weights(enc, G.kv_b, 0);
+    bind(enc, q_, 0, 3);
+    bind(enc, latent_q_, 0, 4);
+    bytes(enc, AbsorbParams{H, nope, nope + c_.v_head_dim, rank, c_.head_dim, width}, 5);
+    const NSUInteger words = static_cast<NSUInteger>(rank * G.kv_b.bits / 32);
+    const NSUInteger threads =
+        std::min<NSUInteger>((words + 31) / 32 * 32, std::min<NSUInteger>(256, [pso maxTotalThreadsPerThreadgroup] / 32 * 32));
+    [enc dispatchThreadgroups:MTLSizeMake(pairs, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+  }
+
+  // RoPE on the rope queries (into latent_q_[t, h, rank:]) and the pass's
+  // latents normed and rotated into the cache.
+  void encode_latent_rope(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n, int start) {
+    [enc setComputePipelineState:pipeline("mla_rope_store")];
+    bind(enc, q_, 0, 0);
+    bind(enc, latent_q_, 0, 1);
+    bind(enc, kt_, 0, 2);
+    bind(enc, G.k_cache, 0, 3);
+    bind(enc, G.kv_a_norm, 4);
+    bind(enc, inv_freq_global_buf_, 5);
+    bytes(enc, MlaRopeParams{c_.num_heads, c_.qk_nope_dim, c_.qk_rope_dim, c_.kv_lora_rank, start,
+                             c_.latent_norm_eps, c_.rope_pairs ? 1 : 0, c_.rope_factor},
+          6);
+    [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(c_.num_heads + 1), static_cast<NSUInteger>(n), 1)
+        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+  }
+
+  // Causal attention of the absorbed queries over the cached latents (one
+  // key head, values its first kv_lora_rank dimensions), four query heads
+  // per threadgroup, into latent_out_ (whose rope dimensions are unused).
+  void encode_latent_attention(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n, int start) {
+    constexpr int kHeadsPerGroup = 4;
+    const int H = c_.num_heads, width = c_.latent_width();
+    const int keys_max = start + n;
+    const int max_blocks = n == 1 ? kDecodeMaxBlocks : kPrefillMaxBlocks;
+    const int block = std::max(n == 1 ? 32 : 64, (keys_max + max_blocks - 1) / max_blocks);
+    const int n_blocks = (keys_max + block - 1) / block;
+    [enc setComputePipelineState:pipeline("attn_partial_g4_d" + std::to_string(width / 32))];
+    bind(enc, latent_q_, 0, 0);
+    bind(enc, G.k_cache, 0, 1);
+    bind(enc, G.k_cache, 0, 2);
+    bind(enc, part_o_, 0, 3);
+    bind(enc, part_ml_, 0, 4);
+    bytes(enc, AttnParams{H, 1, width, start, 1 << 30, G.capacity, block, n_blocks, c_.attn_scale, 0.0f, 0,
+                          H / kHeadsPerGroup},
+          5);
+    bind(enc, last_key_, 0, 6);
+    [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(n_blocks), static_cast<NSUInteger>(H / kHeadsPerGroup),
+                                          static_cast<NSUInteger>(n))
+        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    [enc setComputePipelineState:pipeline("attn_reduce")];
+    bind(enc, part_o_, 0, 0);
+    bind(enc, part_ml_, 0, 1);
+    bind(enc, latent_out_, 0, 2);
+    bytes(enc, ReduceParams{H, width, n_blocks, 0}, 3);
+    bind(enc, placeholder_, 4);
+    [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(H), static_cast<NSUInteger>(n), 1)
+        threadsPerThreadgroup:MTLSizeMake(static_cast<NSUInteger>(width), 1, 1)];
+  }
+
+  // Each head's latent output expanded (unembed_out) into attn_ [n, heads *
+  // v_head_dim], then o_proj into r_.
+  void encode_latent_out(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n) {
+    const int V = c_.v_head_dim;
+    [enc setComputePipelineState:quant_pipeline("qmv_gather", G.unembed_out.format())];
+    bind(enc, G.unembed_out.words, 0);
+    bind(enc, G.unembed_out.scales, 1);
+    bind(enc, G.unembed_out.biases, 2);
+    bind(enc, latent_out_, 0, 3);
+    bind(enc, attn_, 0, 4);
+    bytes(enc, GatherParams{V, c_.kv_lora_rank, 1, 0, 0, 0, 0.0f, c_.latent_width(), 0}, 5);
+    bind(enc, head_index_, 0, 6);
+    bind(enc, placeholder_, 7);
+    [enc dispatchThreadgroups:MTLSizeMake(qmv_groups(V), static_cast<NSUInteger>(n * c_.num_heads), 1)
+        threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    encode_qmm(enc, G.o, attn_, n, r_);
   }
 
   // Gemma 4's per-layer inputs for the pass into per_layer_: the per-layer
@@ -923,7 +1106,7 @@ class DecoderMetal final : public Model {
       bind(enc, chosen_, 0, 1);
       bind(enc, expert_weights_, 0, 2);
       bytes(enc, MoeGroupedParams{c_.num_experts, c_.experts_per_token, c_.n_group, c_.topk_group,
-                                  c_.norm_topk_prob ? 1 : 0, c_.routed_scaling},
+                                  c_.norm_topk_prob ? 1 : 0, c_.routed_scaling, c_.exclude_dropped_groups ? 1 : 0},
             3);
       bind(enc, G.router_correction, 4);
       [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(n), 1, 1)
@@ -936,7 +1119,8 @@ class DecoderMetal final : public Model {
     bind(enc, expert_weights_, 0, 2);
     bytes(enc, MoeRouteParams{c_.num_experts, c_.experts_per_token,
                               c_.router == DecoderConfig::Router::TopKSoftmax ? 1 : 0, c_.norm_topk_prob ? 1 : 0,
-                              c_.router_bias ? 1 : 0, c_.experts_beside_mlp ? 1 : 0},
+                              c_.router_bias ? 1 : 0, c_.experts_beside_mlp ? 1 : 0, c_.n_group, c_.topk_group,
+                              c_.routed_scaling},
           3);
     bind(enc, G.router_bias, 4);
     bind(enc, G.per_expert_scale, 5);
@@ -958,7 +1142,7 @@ class DecoderMetal final : public Model {
     bind(enc, G.expert_up.biases, 5);
     bind(enc, input, 0, 6);
     bind(enc, expert_hidden_, 0, 7);
-    bytes(enc, GatherParams{I, c_.hidden_size, K, 1, act, has_bias, c_.swiglu_limit}, 8);
+    bytes(enc, GatherParams{I, c_.hidden_size, K, 1, act, has_bias, c_.swiglu_limit, 0, 0}, 8);
     bind(enc, chosen_, 0, 9);
     bind(enc, G.expert_gate.bias, 10);
     bind(enc, G.expert_up.bias, 11);
@@ -970,7 +1154,7 @@ class DecoderMetal final : public Model {
     bind(enc, G.expert_down.biases, 2);
     bind(enc, expert_hidden_, 0, 3);
     bind(enc, expert_out_, 0, 4);
-    bytes(enc, GatherParams{c_.hidden_size, I, K, 0, 0, has_bias, c_.swiglu_limit}, 5);
+    bytes(enc, GatherParams{c_.hidden_size, I, K, 0, 0, has_bias, c_.swiglu_limit, 0, 0}, 5);
     bind(enc, chosen_, 0, 6);
     bind(enc, G.expert_down.bias, 7);
     [enc dispatchThreadgroups:MTLSizeMake(qmv_groups(c_.hidden_size), static_cast<NSUInteger>(pairs), 1)
@@ -1116,26 +1300,37 @@ class DecoderMetal final : public Model {
       const GpuLayer& G = layers_[l];
       const DecoderLayer& L = w_->layers[l];
       const int layer = static_cast<int>(l);
-      encode_qkv(enc, G, n);
-      section(enc, "qkv",
-              profiling ? traffic::linear(L.q_proj, n) + (G.own_kv ? traffic::linear(L.k_proj, n) : 0.0) +
-                              (G.own_kv && !G.k_eq_v ? traffic::linear(L.v_proj, n) : 0.0)
-                        : 0.0);
-      encode_rope(enc, G, n, start);
-      section(enc, "rope_kv",
-              profiling ? traffic::rows(G.head_dim, n, 2 * c_.num_heads + (G.own_kv ? 4 * G.kv_heads : 0)) : 0.0);
-      encode_attention(enc, G, n, start);
-      section(enc, "attention", profiling ? traffic::attention(c_, layer, start, n) : 0.0);
-      encode_qmm(enc, G.o, attn_, n, r_);
-      if (c_.o_bias) {
-        [enc setComputePipelineState:pipeline("add_bias_rows")];
-        bind(enc, r_, 0, 0);
-        bind(enc, G.o_bias, 1);
-        const int count = n * c_.hidden_size;
-        bytes(enc, BiasParams{c_.hidden_size, count}, 2);
-        encode_elementwise(enc, count);
+      if (c_.mla()) {
+        encode_latent_qkv(enc, G, n);
+        section(enc, "qkv", profiling ? traffic::latent_qkv(c_, L, n) : 0.0);
+        encode_latent_rope(enc, G, n, start);
+        section(enc, "rope_kv", profiling ? traffic::rows(c_.latent_width(), n, 2 * c_.num_heads + 3) : 0.0);
+        encode_latent_attention(enc, G, n, start);
+        section(enc, "attention", profiling ? traffic::attention(c_, layer, start, n) : 0.0);
+        encode_latent_out(enc, G, n);
+        section(enc, "o_proj", profiling ? traffic::latent_out(L, n) : 0.0);
+      } else {
+        encode_qkv(enc, G, n);
+        section(enc, "qkv",
+                profiling ? traffic::linear(L.q_proj, n) + (G.own_kv ? traffic::linear(L.k_proj, n) : 0.0) +
+                                (G.own_kv && !G.k_eq_v ? traffic::linear(L.v_proj, n) : 0.0)
+                          : 0.0);
+        encode_rope(enc, G, n, start);
+        section(enc, "rope_kv",
+                profiling ? traffic::rows(G.head_dim, n, 2 * c_.num_heads + (G.own_kv ? 4 * G.kv_heads : 0)) : 0.0);
+        encode_attention(enc, G, n, start);
+        section(enc, "attention", profiling ? traffic::attention(c_, layer, start, n) : 0.0);
+        encode_qmm(enc, G.o, attn_, n, r_);
+        if (c_.o_bias) {
+          [enc setComputePipelineState:pipeline("add_bias_rows")];
+          bind(enc, r_, 0, 0);
+          bind(enc, G.o_bias, 1);
+          const int count = n * c_.hidden_size;
+          bytes(enc, BiasParams{c_.hidden_size, count}, 2);
+          encode_elementwise(enc, count);
+        }
+        section(enc, "o_proj", profiling ? traffic::linear(L.o_proj, n) : 0.0);
       }
-      section(enc, "o_proj", profiling ? traffic::linear(L.o_proj, n) : 0.0);
       encode_residual_norm(enc, G.attn_post_norm, &G.mlp_norm, n);
       section(enc, "residual_norm", residual_bytes);
       if (G.moe && c_.experts_beside_mlp) {
@@ -1320,6 +1515,10 @@ class DecoderMetal final : public Model {
   InjectionPlan plan_;
   id<MTLBuffer> inject_rows_ = nil, inject_index_ = nil, last_key_ = nil;
   id<MTLBuffer> per_layer_tokens_ = nil;  // the prompt with image tokens replaced by the pad token
+  // Multi-head latent attention: absorbed queries and latent outputs [chunk,
+  // heads, latent width], the query latent [chunk, q_lora_rank], and each
+  // (token, head) pair's head.
+  id<MTLBuffer> latent_q_ = nil, latent_out_ = nil, q_latent_ = nil, head_index_ = nil;
   std::vector<id<MTLCommandBuffer>> pending_;
   // The command buffer encode_forward is appending to (sections replace it
   // while profiling).

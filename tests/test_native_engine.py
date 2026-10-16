@@ -186,11 +186,18 @@ DEEPSEEK_VARIANTS = {
         model_type="deepseek_v2", q_lora_rank=None, norm_topk_prob=False, n_shared_experts=2,
         rope_scaling=DEEPSEEK_V2_YARN, seed=37),
     # V2's group_limited_greedy times routed_scaling_factor 16, in
-    # Transformers' BF16 layout (kv_b_proj transposed exactly).
+    # Transformers' BF16 layout (which the Metal backend refuses).
     "deepseek-v2-grouped-bf16": TinyDeepseekSpec(
         model_type="deepseek_v2", topk_method="group_limited_greedy", n_group=4, topk_group=2,
         num_experts_per_tok=3, norm_topk_prob=False, n_shared_experts=2, routed_scaling_factor=16.0, bits=0,
         stacked_experts=False, rope_scaling=DEEPSEEK_V2_YARN, seed=20),
+    # V2-Lite's latent geometry as mlx-community stores it: a 512-wide latent
+    # plus 64 rope dimensions (the 576-wide latent of every released model),
+    # 128-wide heads, kv_b_proj at 4 bits in groups of 64, eight heads.
+    "deepseek-v2-lite-geometry": TinyDeepseekSpec(
+        model_type="deepseek_v2", num_attention_heads=8, kv_lora_rank=512, q_lora_rank=None, qk_nope_head_dim=128,
+        qk_rope_head_dim=64, v_head_dim=128, norm_topk_prob=False, n_shared_experts=2, rope_scaling=DEEPSEEK_V2_YARN,
+        group_size=64, seed=20),
 }
 VARIANTS = sorted(GEMMA3_VARIANTS) + sorted(GEMMA4_VARIANTS) + sorted(DENSE_VARIANTS) + sorted(DEEPSEEK_VARIANTS)
 
@@ -211,8 +218,7 @@ def fixture_model(request, tmp_path_factory):
     return directory, LlamaFamilyReference.load(directory)
 
 
-# Architectures the Metal backend refuses: it has no latent attention yet.
-CPU_ONLY: tuple[str, ...] = ("deepseek_v2", "deepseek_v3")
+CPU_ONLY: tuple[str, ...] = ()  # architectures the Metal backend refuses (none today)
 
 
 def _dense_mxfp4(config: dict) -> bool:
@@ -229,6 +235,8 @@ def _skip_unsupported(directory: Path, backend: str) -> None:
         pytest.skip("the Metal backend does not implement this architecture yet")
     if backend == "metal" and _dense_mxfp4(config):
         pytest.skip("the Metal backend implements mxfp4 only for experts so far")
+    if backend == "metal" and "quantization" not in config:
+        pytest.skip("the Metal backend reads quantized checkpoints only")
 
 
 @pytest.mark.parametrize("backend", _backends())
@@ -758,12 +766,6 @@ def test_latent_norms_keep_their_own_epsilon(native_cli, backend, tmp_path, monk
     np.testing.assert_allclose(got, expected[-1:], atol=tolerance * np.abs(expected).max(), rtol=0)
 
 
-def test_latent_attention_runs_on_the_cpu_under_auto(native_cli, tmp_path):
-    directory = write_tiny_deepseek(tmp_path / "model", DEEPSEEK_VARIANTS["deepseek-v3-absorbed-grouped"])
-    info = _run(native_cli, "info", "--model", str(directory), "--backend", "auto")
-    assert (info["architecture"], info["backend"]) == ("deepseek_v3", "cpu")
-
-
 def test_kimi_k2_reads_as_deepseek_v3(native_cli, tmp_path):
     directory = write_tiny_deepseek(tmp_path / "model", DEEPSEEK_VARIANTS["deepseek-v3-absorbed-grouped"])
     config = json.loads((directory / "config.json").read_text())
@@ -773,9 +775,16 @@ def test_kimi_k2_reads_as_deepseek_v3(native_cli, tmp_path):
 
 
 @pytest.mark.skipif("metal" not in _backends(), reason="needs the Metal backend")
-def test_metal_refuses_latent_attention(native_cli, tmp_path):
-    directory = write_tiny_deepseek(tmp_path / "model", DEEPSEEK_VARIANTS["deepseek-v2-lite"])
-    assert "metal: multi-head latent attention (deepseek_v2) is not implemented yet" in _load_error(
+def test_metal_refuses_unquantized_matrices(native_cli, tmp_path):
+    directory = write_tiny_deepseek(tmp_path / "model", DEEPSEEK_VARIANTS["deepseek-v2-grouped-bf16"])
+    assert "is not quantized; use --backend cpu" in _load_error(native_cli, directory, "metal")
+
+
+@pytest.mark.skipif("metal" not in _backends(), reason="needs the Metal backend")
+def test_metal_refuses_latent_widths_it_lacks(native_cli, tmp_path):
+    spec = TinyDeepseekSpec(kv_lora_rank=128, seed=20)  # a 160-wide latent
+    directory = write_tiny_deepseek(tmp_path / "model", spec)
+    assert "metal: latent attention is built for kv_lora_rank + qk_rope_head_dim of 576" in _load_error(
         native_cli, directory, "metal")
 
 
