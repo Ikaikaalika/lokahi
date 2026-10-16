@@ -754,6 +754,7 @@ std::unique_ptr<VisionEncoder> make_gemma4_vision_metal(std::shared_ptr<const Ge
 }
 
 bool metal_qwen3_5_vision_supports(const Qwen35VisionWeights& weights) {
+  if (weights.config.qwen2_5) return false;  // window attention: CPU only so far
   std::vector<const Qwen35VisionWeights::Merger*> mergers = {&weights.merger};
   for (const Qwen35VisionWeights::Merger& m : weights.deepstack) mergers.push_back(&m);
   for (const Qwen35VisionWeights::Merger* m : mergers) {

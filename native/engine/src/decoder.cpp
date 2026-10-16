@@ -58,17 +58,17 @@ bool is_qwen3_vl(const Json& raw) {
   return type == "qwen3_vl_text" || type == "qwen3_vl_moe_text";
 }
 
-// Interleaved M-RoPE, as Transformers and MLX-VLM apply it whatever
-// mrope_interleaved says (so a false one, meant for chunked sections, is
-// refused): frequency i reads the row position when i % 3 == 1 and
-// i < 3 * section[1], the column position when i % 3 == 2 and
-// i < 3 * section[2], and the temporal one otherwise. `section` is the
-// references' default when `rope` names none.
-std::vector<int> interleaved_mrope_axes(const Json& rope, const std::string& arch, int rotary_dim,
-                                        std::vector<int> section) {
-  const Json* interleaved = rope.find("mrope_interleaved");
-  LK_CHECK(interleaved == nullptr || interleaved->is_null() || (interleaved->is_bool() && interleaved->as_bool()),
-           arch + ": only interleaved M-RoPE is supported");
+// Qwen2.5-VL: Qwen 2 with chunked M-RoPE; its config keeps the text fields
+// at the top level (model_type qwen2_5_vl) or, from Transformers 5, in
+// text_config (qwen2_5_vl_text).
+bool is_qwen2_5_vl(const Json& raw) {
+  const std::string type = model_type(raw);
+  return type == "qwen2_5_vl" || type == "qwen2_5_vl_text";
+}
+
+// `rope`'s mrope_section (temporal, rows, columns), or `section`, the
+// references' default, when it names none.
+std::vector<int> mrope_section(const Json& rope, const std::string& arch, std::vector<int> section) {
   if (const Json* given = rope.find("mrope_section"); given != nullptr && !given->is_null()) {
     LK_CHECK(given->is_array() && given->as_array().size() == 3, arch + ": mrope_section must have 3 entries");
     for (size_t axis = 0; axis < 3; ++axis) {
@@ -76,6 +76,20 @@ std::vector<int> interleaved_mrope_axes(const Json& rope, const std::string& arc
       LK_CHECK(section[axis] >= 0, arch + ": mrope_section entries must not be negative");
     }
   }
+  return section;
+}
+
+// Interleaved M-RoPE, as Transformers and MLX-VLM apply it whatever
+// mrope_interleaved says (so a false one, meant for chunked sections, is
+// refused): frequency i reads the row position when i % 3 == 1 and
+// i < 3 * section[1], the column position when i % 3 == 2 and
+// i < 3 * section[2], and the temporal one otherwise.
+std::vector<int> interleaved_mrope_axes(const Json& rope, const std::string& arch, int rotary_dim,
+                                        std::vector<int> section) {
+  const Json* interleaved = rope.find("mrope_interleaved");
+  LK_CHECK(interleaved == nullptr || interleaved->is_null() || (interleaved->is_bool() && interleaved->as_bool()),
+           arch + ": only interleaved M-RoPE is supported");
+  section = mrope_section(rope, arch, section);
   std::vector<int> axes(static_cast<size_t>(rotary_dim / 2), 0);
   for (int axis = 1; axis <= 2; ++axis) {
     for (int i = axis; i < std::min(3 * section[static_cast<size_t>(axis)], rotary_dim / 2); i += 3) {
@@ -96,6 +110,24 @@ bool is_qwen3_5(const Json& raw) {
 bool flag(const Json& cfg, const char* key) {
   const Json* value = cfg.find(key);
   return value != nullptr && value->is_bool() && value->as_bool();
+}
+
+// Chunked M-RoPE, as Transformers and MLX-VLM apply Qwen2.5-VL's whatever
+// mrope_interleaved says (so a true one, meant for Qwen3-VL's layout, is
+// refused): the first section[0] frequencies read the temporal position,
+// the next section[1] the row and the last section[2] the column. The
+// sections must cover every frequency, as Transformers' split requires.
+std::vector<int> chunked_mrope_axes(const Json& rope, const std::string& arch, int rotary_dim,
+                                    std::vector<int> section) {
+  LK_CHECK(!flag(rope, "mrope_interleaved"), arch + ": only chunked M-RoPE is supported");
+  section = mrope_section(rope, arch, section);
+  const int frequencies = rotary_dim / 2;
+  LK_CHECK(section[0] + section[1] + section[2] == frequencies,
+           arch + ": mrope_section must cover the head's " + std::to_string(frequencies) + " frequencies");
+  std::vector<int> axes(static_cast<size_t>(frequencies), 2);
+  std::fill_n(axes.begin(), section[0] + section[1], 1);
+  std::fill_n(axes.begin(), section[0], 0);
+  return axes;
 }
 
 std::vector<int32_t> eos_ids(const Json& raw, const Json& cfg) {
@@ -322,7 +354,7 @@ double parse_yarn(const Json& cfg, const Json& scaling, RopeScaling& y) {
 // norms, classic partial RoPE, leading dense layers, and a grouped sigmoid
 // router over routed experts plus a shared expert. Options these checkpoints
 // do not use fail closed.
-DecoderConfig llama_family_config(const Json& cfg, const std::string& family = "") {
+DecoderConfig llama_family_config(const Json& cfg, const std::string& family = "", bool mrope = false) {
   DecoderConfig c;
   c.architecture = family.empty() ? model_type(cfg) : family;
   const std::string& arch = c.architecture;
@@ -377,7 +409,10 @@ DecoderConfig llama_family_config(const Json& cfg, const std::string& family = "
       const double attention = parse_yarn(cfg, *scaling, c.rope_scaling);
       c.attn_scale *= static_cast<float>(attention * attention);
     } else {
-      LK_CHECK(kind == "default", arch + ": rope_scaling type '" + kind + "' is not supported");
+      // Qwen2.5-VL's {"type": "mrope"} names its M-RoPE sections, which the
+      // caller reads; it scales nothing.
+      LK_CHECK(kind == "default" || (mrope && kind == "mrope"),
+               arch + ": rope_scaling type '" + kind + "' is not supported");
     }
   }
 
@@ -730,23 +765,49 @@ DecoderConfig qwen3_vl_config(const Json& raw) {
   return c;
 }
 
+// Qwen2.5-VL's text model: Qwen 2 (q/k/v biases) with chunked M-RoPE
+// (sections [16, 24, 24] by default) from rope_scaling ({"type": "mrope"})
+// or Transformers 5's rope_parameters. Transformers splits hidden_size
+// evenly across the heads whatever head_dim says, so another head_dim fails
+// closed, as do sliding-window layers.
+DecoderConfig qwen2_5_vl_config(const Json& raw) {
+  const Json& cfg = text_config(raw);
+  const std::string arch = "qwen2_5_vl";
+  DecoderConfig c = llama_family_config(cfg, "qwen2", true);
+  LK_CHECK(c.hidden_size % c.num_heads == 0 && c.head_dim == c.hidden_size / c.num_heads,
+           arch + ": head_dim must be hidden_size / num_attention_heads");
+  if (const Json* types = cfg.find("layer_types"); types != nullptr && types->is_array()) {
+    for (const Json& type : types->as_array()) {
+      LK_CHECK(type.is_string() && type.as_string() == "full_attention",
+               arch + ": sliding-window layers are not supported");
+    }
+  }
+  const Json& rope = vl_rope_parameters(cfg, arch, 1e6, c);
+  const std::string kind = rope.string_or("rope_type", rope.string_or("type", "default"));
+  LK_CHECK(kind == "default" || kind == "mrope", arch + ": rope type '" + kind + "' is not supported");
+  c.rope_axes = chunked_mrope_axes(rope, arch, c.head_dim, {16, 24, 24});
+  c.architecture = arch;
+  return c;
+}
+
 bool is_supported_decoder(const Json& raw) {
   return is_gemma3(raw) || is_gemma4(raw) || is_llama_family(raw) || is_deepseek(raw) || is_qwen3_5(raw) ||
-         is_qwen3_vl(raw);
+         is_qwen3_vl(raw) || is_qwen2_5_vl(raw);
 }
 
 DecoderConfig DecoderConfig::from_json(const Json& raw) {
   LK_CHECK(is_supported_decoder(raw),
            "unsupported architecture '" + model_type(raw) +
                "'; this build supports gemma3, gemma4, llama, mistral, qwen2, qwen3, qwen3_moe, gpt_oss, glm4_moe, "
-               "glm4_moe_lite, deepseek_v2, deepseek_v3, qwen3_5, qwen3_5_moe, qwen3_next, qwen3_vl and qwen3_vl_moe "
-               "text models");
-  DecoderConfig c = is_gemma3(raw)     ? gemma3_config(raw)
-                    : is_gemma4(raw)   ? gemma4_config(raw)
-                    : is_deepseek(raw) ? deepseek_config(raw)
-                    : is_qwen3_5(raw)  ? qwen3_5_config(raw)
-                    : is_qwen3_vl(raw) ? qwen3_vl_config(raw)
-                                       : llama_family_config(raw);
+               "glm4_moe_lite, deepseek_v2, deepseek_v3, qwen3_5, qwen3_5_moe, qwen3_next, qwen3_vl, qwen3_vl_moe and "
+               "qwen2_5_vl text models");
+  DecoderConfig c = is_gemma3(raw)       ? gemma3_config(raw)
+                    : is_gemma4(raw)     ? gemma4_config(raw)
+                    : is_deepseek(raw)   ? deepseek_config(raw)
+                    : is_qwen3_5(raw)    ? qwen3_5_config(raw)
+                    : is_qwen3_vl(raw)   ? qwen3_vl_config(raw)
+                    : is_qwen2_5_vl(raw) ? qwen2_5_vl_config(raw)
+                                         : llama_family_config(raw);
   LK_CHECK(static_cast<int>(c.layer_is_sliding.size()) == c.num_layers,
            c.architecture + ": layer_types length mismatch");
   for (int l = 0; l < c.num_layers; ++l) {

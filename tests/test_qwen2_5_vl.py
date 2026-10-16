@@ -6,7 +6,11 @@ never real weights.
 """
 from __future__ import annotations
 
+import json
+import os
+import subprocess
 from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -146,3 +150,176 @@ def test_fixture_windows_and_each_rope_axis_matter(reference):
     # Greedy continuations vary, and with the images.
     greedy = reference.greedy(PROMPT, images, 10)
     assert len(set(greedy)) >= 4 and greedy != reference.greedy(PROMPT, _images(1), 10)
+
+
+# ---------------------------------------------------------------------------
+# The native engine against the oracle.
+# ---------------------------------------------------------------------------
+
+def _backends() -> list[str]:
+    requested = os.environ.get("LOKAHI_TEST_BACKENDS", "cpu")
+    return [name.strip() for name in requested.split(",") if name.strip()]
+
+
+def _run(cli: Path, *args: str) -> dict:
+    result = subprocess.run([str(cli), *args], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout.strip().splitlines()[-1])
+
+
+def _fails(cli: Path, *args: str) -> str:
+    result = subprocess.run([str(cli), *args], capture_output=True, text=True)
+    assert result.returncode != 0, result.stdout
+    return result.stderr
+
+
+def write_ppm(path: Path, rgb: np.ndarray) -> Path:
+    height, width = rgb.shape[:2]
+    path.write_bytes(f"P6\n{width} {height}\n255\n".encode() + np.ascontiguousarray(rgb).tobytes())
+    return path
+
+
+def _image_files(directory: Path, images: list[np.ndarray]) -> str:
+    return ",".join(str(write_ppm(directory / f"image{i}.ppm", image)) for i, image in enumerate(images))
+
+
+def _skip_unsupported(directory: Path, backend: str) -> None:
+    if backend == "metal" and "quantization" not in json.loads((directory / "config.json").read_text()):
+        pytest.skip("the Metal backend reads quantized checkpoints only")
+
+
+@pytest.fixture(scope="module", params=sorted(VARIANTS))
+def vlm(request, tmp_path_factory):
+    directory = write_tiny_qwen2_5_vl(tmp_path_factory.mktemp(request.param) / "model", VARIANTS[request.param])
+    images = _images(seed=3)
+    return directory, Qwen25VLReference.load(directory), images, _image_files(directory, images)
+
+
+@pytest.mark.parametrize("backend", _backends())
+def test_image_features_match_oracle(native_cli, vlm, backend, tmp_path):
+    directory, oracle, images, files = vlm
+    out = tmp_path / "features.bin"
+    report = _run(native_cli, "image-features", "--model", str(directory), "--backend", backend,
+                  "--images", files, "--out", str(out))
+    width = oracle.language.config.hidden_size
+    # The window-attention tower runs on the CPU for every decoder backend.
+    assert report == {"backend": "cpu", "tokens": TOKENS, "width": width}
+    got = np.fromfile(out, dtype=np.float32).reshape(sum(TOKENS), width)
+    expected = np.concatenate([oracle.encode(image) for image in images])
+    np.testing.assert_allclose(got, expected, atol=1e-5 * np.abs(expected).max(), rtol=0)
+
+
+# Chunks of 3 end passes inside both images.
+@pytest.mark.parametrize("backend", _backends())
+@pytest.mark.parametrize("chunk", [512, 7, 3])
+def test_logits_with_images_match_oracle(native_cli, vlm, backend, chunk, tmp_path):
+    directory, oracle, images, files = vlm
+    _skip_unsupported(directory, backend)
+    tokens = PROMPT + [44, 45, 46]
+    out = tmp_path / "logits.bin"
+    report = _run(
+        native_cli, "logits", "--model", str(directory), "--backend", backend,
+        "--tokens", ",".join(map(str, tokens)), "--prefill", str(len(PROMPT)), "--prefill-chunk", str(chunk),
+        "--images", files, "--out", str(out),
+    )
+    got = np.fromfile(out, dtype=np.float32).reshape(report["rows"], -1)
+    injected, positions, delta, _ = oracle._inputs(PROMPT, images)
+    later = np.arange(len(PROMPT), len(tokens)) + delta
+    full = np.concatenate([positions, np.broadcast_to(later, (3, later.size))], axis=1)
+    expected = oracle.language.logits(tokens, injected, full)[len(PROMPT) - 1 :]
+    tolerance = 2e-4 if backend == "cpu" else 2e-2
+    np.testing.assert_allclose(got, expected, atol=tolerance * np.abs(expected).max(), rtol=0)
+    np.testing.assert_array_equal(got.argmax(axis=1), expected.argmax(axis=1))
+
+
+@pytest.mark.parametrize("backend", _backends())
+def test_greedy_with_images_matches_full_recompute(native_cli, vlm, backend):
+    directory, oracle, images, files = vlm
+    _skip_unsupported(directory, backend)
+    report = _run(
+        native_cli, "generate", "--model", str(directory), "--backend", backend,
+        "--tokens", ",".join(map(str, PROMPT)), "--images", files, "--max-new", "10", "--no-eos-stop",
+    )
+    assert report["tokens"] == oracle.greedy(PROMPT, images, 10)
+
+
+@pytest.mark.parametrize("backend", _backends())
+def test_text_alone_matches_oracle(native_cli, vlm, backend, tmp_path):
+    # Without images M-RoPE is plain RoPE and nothing is injected.
+    directory, oracle, _, _ = vlm
+    _skip_unsupported(directory, backend)
+    tokens = [2, 5, 9, 33, 100, 7, 7, 400, 3, 11]
+    out = tmp_path / "logits.bin"
+    report = _run(native_cli, "logits", "--model", str(directory), "--backend", backend,
+                  "--tokens", ",".join(map(str, tokens)), "--prefill", "4", "--out", str(out))
+    got = np.fromfile(out, dtype=np.float32).reshape(report["rows"], -1)
+    expected = oracle.language.logits(tokens)[3:]
+    tolerance = 2e-4 if backend == "cpu" else 2e-2
+    np.testing.assert_allclose(got, expected, atol=tolerance * np.abs(expected).max(), rtol=0)
+    np.testing.assert_array_equal(got.argmax(axis=1), expected.argmax(axis=1))
+    assert _run(native_cli, "info", "--model", str(directory), "--backend", backend)["architecture"] == "qwen2_5_vl"
+
+
+def _edit(path: Path, change) -> None:
+    data = json.loads(path.read_text())
+    change(data)
+    path.write_text(json.dumps(data))
+
+
+def _set_vision(key, value):
+    return lambda data: data["vision_config"].__setitem__(key, value)
+
+
+def _set(key, value):
+    return lambda data: data.__setitem__(key, value)
+
+
+def _set_rope(key, value):
+    return lambda data: data["rope_scaling"].__setitem__(key, value)
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        (_set_vision("hidden_act", "gelu"), "qwen2_5_vl vision: unsupported activation gelu"),
+        (_set_vision("in_chans", 4), "qwen2_5_vl vision: images must have 3 channels"),
+        (_set_vision("fullatt_block_indexes", [1, 1]), "fullatt_block_indexes must be increasing blocks"),
+        (_set_vision("fullatt_block_indexes", [3]), "fullatt_block_indexes must be increasing blocks"),
+        (_set_vision("window_size", 8), "qwen2_5_vl vision: window_size must cover a merged token"),
+        (_set_vision("deepstack_visual_indexes", [0]), "deepstack features are Qwen3-VL's, not qwen2_5_vl's"),
+        (_set_vision("rope_parameters", {"rope_type": "axial", "rope_theta": 5000.0}),
+         "only axial 2-D RoPE with theta 10000"),
+        (_set_vision("out_hidden_size", 64), "out_hidden_size must be the text model's hidden_size"),
+    ],
+)
+def test_unsupported_vision_configurations_fail_closed(native_cli, tmp_path, change, message):
+    directory = write_tiny_qwen2_5_vl(tmp_path / "model", SPEC)
+    _edit(directory / "config.json", change)
+    files = _image_files(tmp_path, _images()[:1])
+    assert message in _fails(native_cli, "image-features", "--model", str(directory), "--images", files,
+                             "--out", str(tmp_path / "x.bin"))
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        (_set_rope("mrope_interleaved", True), "qwen2_5_vl: only chunked M-RoPE is supported"),
+        (_set_rope("mrope_section", [8, 12, 11]), "qwen2_5_vl: mrope_section must cover the head's 32 frequencies"),
+        (_set_rope("mrope_section", [16, 16]), "qwen2_5_vl: mrope_section must have 3 entries"),
+        (_set_rope("type", "longrope"), "rope_scaling type 'longrope' is not supported"),
+        (_set("head_dim", 32), "qwen2_5_vl: head_dim must be hidden_size / num_attention_heads"),
+        (_set("use_sliding_window", True), "use_sliding_window is not supported"),
+        (lambda data: data.pop("rope_scaling"), "qwen2_5_vl: the text config has no rope_scaling or rope_parameters"),
+    ],
+)
+def test_unsupported_text_configurations_fail_closed(native_cli, tmp_path, change, message):
+    directory = write_tiny_qwen2_5_vl(tmp_path / "model", SPEC)
+    _edit(directory / "config.json", change)
+    assert message in _fails(native_cli, "info", "--model", str(directory), "--backend", "cpu")
+
+
+def test_sliding_layers_fail_closed(native_cli, tmp_path):
+    directory = write_tiny_qwen2_5_vl(tmp_path / "model", replace(SPEC, layout="hf5"))
+    _edit(directory / "config.json", lambda data: data["text_config"]["layer_types"].__setitem__(2, "sliding_attention"))
+    assert "qwen2_5_vl: sliding-window layers are not supported" in _fails(
+        native_cli, "info", "--model", str(directory), "--backend", "cpu")

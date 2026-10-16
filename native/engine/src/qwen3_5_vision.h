@@ -20,6 +20,14 @@
 //   merger of its own, which LayerNorms the concatenated square instead of
 //   each patch, gives one more set of feature rows (ImageFeatures::deepstack).
 //
+// Qwen2.5-VL's tower (Qwen2_5_VisionTransformerPretrainedModel) shares the
+// processor, the patch order and the 2-D RoPE, but its norms are RMSNorms
+// without biases, its MLPs are down(silu(gate(x)) * up(x)) with biases, its
+// patch embedding has no bias and it has no learned positions. Outside
+// fullatt_block_indexes a patch attends only within its window: the merged
+// grid cut into window x window squares from the top-left corner, the right
+// and bottom ones partial. Its merger RMSNorms each patch (ln_q).
+//
 // Patches run in merge-block order (block rows, block columns, then row and
 // column within the block), so merged tokens follow the merged grid row by
 // row: token_grid is that grid, which the decoder's M-RoPE positions follow.
@@ -50,6 +58,9 @@ struct Qwen35VisionConfig {
   int text_hidden_size = 0;  // out_hidden_size
   int image_token_id = -1;
   std::vector<int> deepstack;  // deepstack_visual_indexes, increasing
+  bool qwen2_5 = false;             // Qwen2.5-VL's tower
+  int window = 0;                   // its windows' side in merged tokens
+  std::vector<int> full_attention;  // its fullatt_block_indexes, increasing
   int64_t min_pixels = 65536;     // the processor's size.shortest_edge
   int64_t max_pixels = 16777216;  // and size.longest_edge
   float rescale = 1.0f / 255.0f;
@@ -63,25 +74,29 @@ struct Qwen35VisionConfig {
   static Qwen35VisionConfig from_json(const Json& config, const Json* preprocessor);
 };
 
-// Whether config.json describes a Qwen3.5 or Qwen3-VL (dense or MoE) vision-language model.
+// Whether config.json describes a Qwen3.5, Qwen3-VL (dense or MoE) or
+// Qwen2.5-VL vision-language model.
 bool is_qwen3_5_vision(const Json& config);
 
 struct Qwen35VisionWeights {
   struct Layer {
-    std::vector<float> norm1_weight, norm1_bias, norm2_weight, norm2_bias;
-    Linear qkv, proj, fc1, fc2;  // views into the checkpoint
-    std::vector<float> qkv_bias, proj_bias, fc1_bias, fc2_bias;
+    std::vector<float> norm1_weight, norm1_bias, norm2_weight, norm2_bias;  // no biases for RMSNorms
+    // Views into the checkpoint: Qwen3.5's MLP is fc2(gelu_tanh(fc1(.))),
+    // Qwen2.5-VL's down(silu(gate(.)) * up(.)).
+    Linear qkv, proj, fc1, fc2, gate, up, down;
+    std::vector<float> qkv_bias, proj_bias, fc1_bias, fc2_bias, gate_bias, up_bias, down_bias;
   };
 
   Qwen35VisionConfig config;
   std::shared_ptr<Checkpoint> checkpoint;
   // Owned float32: the patch embedding summed over time, [hidden, 3 * P * P]
   // over (channel, row, column), whichever layout the checkpoint stores; its
-  // bias; the position table [side * side, hidden].
+  // bias and the position table [side * side, hidden] (both empty for
+  // Qwen2.5-VL).
   std::vector<float> patch_weight, patch_bias, positions;
   std::vector<Layer> layers;
   // fc2(gelu(fc1(norm(.)))): the norm covers one patch (the merger) or a
-  // concatenated square (the deepstack mergers).
+  // concatenated square (the deepstack mergers); Qwen2.5-VL's is an RMSNorm.
   struct Merger {
     std::vector<float> norm_weight, norm_bias;
     Linear fc1, fc2;
@@ -113,6 +128,9 @@ class Qwen35VisionEncoder : public VisionEncoder {
   std::vector<float> patches(const Image& image) const;
   // Patch i's (row, column) in merge-block order.
   std::pair<int, int> patch_position(int index, int cols) const;
+  // Qwen2.5-VL: the patches of each window of a rows x cols patch grid, in
+  // merge-block order.
+  std::vector<std::vector<int>> windows(int rows, int cols) const;
   // Adds patch `index`'s position embedding, the table bilinearly
   // interpolated to a rows x cols patch grid (linspace sample points), to x.
   void add_position(float* x, int index, int rows, int cols) const;

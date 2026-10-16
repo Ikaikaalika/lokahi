@@ -989,6 +989,83 @@ void test_qwen3_vl_config() {
   EXPECT(vision.deepstack == std::vector<int>({5, 11, 17}) && vision.depth == 24 && vision.text_hidden_size == 2048);
 }
 
+// Qwen/Qwen2.5-VL-3B-Instruct's config.json, as published (Transformers 4:
+// the text fields at the top level).
+static const char* kQwen25VL3BConfig = R"({
+  "architectures": ["Qwen2_5_VLForConditionalGeneration"], "attention_dropout": 0.0, "bos_token_id": 151643,
+  "eos_token_id": 151645, "vision_start_token_id": 151652, "vision_end_token_id": 151653,
+  "vision_token_id": 151654, "image_token_id": 151655, "video_token_id": 151656, "hidden_act": "silu",
+  "hidden_size": 2048, "initializer_range": 0.02, "intermediate_size": 11008, "max_position_embeddings": 128000,
+  "max_window_layers": 70, "model_type": "qwen2_5_vl", "num_attention_heads": 16, "num_hidden_layers": 36,
+  "num_key_value_heads": 2, "rms_norm_eps": 1e-06, "rope_theta": 1000000.0, "sliding_window": 32768,
+  "tie_word_embeddings": true, "torch_dtype": "bfloat16", "transformers_version": "4.41.2", "use_cache": true,
+  "use_sliding_window": false,
+  "vision_config": {
+    "depth": 32, "hidden_act": "silu", "hidden_size": 1280, "intermediate_size": 3420, "num_heads": 16,
+    "in_chans": 3, "out_hidden_size": 2048, "patch_size": 14, "spatial_merge_size": 2, "spatial_patch_size": 14,
+    "window_size": 112, "fullatt_block_indexes": [7, 15, 23, 31], "tokens_per_second": 2,
+    "temporal_patch_size": 2},
+  "rope_scaling": {"type": "mrope", "mrope_section": [16, 24, 24]},
+  "vocab_size": 151936
+})";
+
+void test_qwen2_5_vl_config() {
+  // Chunked sections [temporal 16, rows 24, columns 24] over 64 frequencies.
+  auto chunked = [](const DecoderConfig& c, int temporal, int rows) {
+    if (c.rope_axes.size() != 64) return false;
+    for (int i = 0; i < 64; ++i) {
+      if (c.rope_axes[static_cast<size_t>(i)] != (i < temporal ? 0 : i < temporal + rows ? 1 : 2)) return false;
+    }
+    return true;
+  };
+  const DecoderConfig c = DecoderConfig::from_json(Json::parse(kQwen25VL3BConfig));
+  EXPECT(c.architecture == "qwen2_5_vl" && c.num_layers == 36 && c.hidden_size == 2048 && c.head_dim == 128);
+  EXPECT(c.qkv_bias && !c.qk_norm && c.num_kv_heads == 2 && c.rotary_dim == 0 && chunked(c, 16, 24));
+  EXPECT(std::fabs(c.rope_theta - 1e6f) < 1.0f && c.eos_token_ids == std::vector<int32_t>({151645}));
+  EXPECT(c.injection_rules(3).mrope && c.injection_rules(3).deepstack_layers == 0 &&
+         !c.injection_rules(3).bidirectional_blocks && c.injection_rules(3).rope_offset == 3);
+  // Uneven sections, and Transformers' default [16, 24, 24] without any.
+  std::string uneven = kQwen25VL3BConfig;
+  uneven.replace(uneven.find("[16, 24, 24]"), 12, "[10, 30, 24]");
+  EXPECT(chunked(DecoderConfig::from_json(Json::parse(uneven)), 10, 30));
+  std::string unsectioned = kQwen25VL3BConfig;
+  const std::string section = R"(, "mrope_section": [16, 24, 24])";
+  unsectioned.erase(unsectioned.find(section), section.size());
+  EXPECT(chunked(DecoderConfig::from_json(Json::parse(unsectioned)), 16, 24));
+  // Outside Qwen2.5-VL, {"type": "mrope"} is no scaling the Llama family knows.
+  std::string plain = kQwen25VL3BConfig;
+  const std::string type = R"("model_type": "qwen2_5_vl")";
+  plain.replace(plain.find(type), type.size(), R"("model_type": "qwen2")");
+  EXPECT(throws([&] { DecoderConfig::from_json(Json::parse(plain)); }));
+  // Transformers 5 saves text_config with rope_parameters (rope_theta inside)
+  // and layer_types; without any rope_theta its default is 1000000.
+  const std::string v5 = R"({"model_type": "qwen2_5_vl", "image_token_id": 151655, "text_config": {
+    "model_type": "qwen2_5_vl_text", "hidden_size": 2048, "intermediate_size": 11008, "num_hidden_layers": 2,
+    "num_attention_heads": 16, "num_key_value_heads": 2, "rms_norm_eps": 1e-06, "vocab_size": 151936,
+    "use_sliding_window": false, "sliding_window": null, "layer_types": ["full_attention", "full_attention"],
+    "rope_parameters": {"type": "mrope", "mrope_section": [8, 28, 28], "rope_theta": 250000.0, "rope_type": "default"}},
+    "vision_config": {}})";
+  const DecoderConfig five = DecoderConfig::from_json(Json::parse(v5));
+  EXPECT(five.architecture == "qwen2_5_vl" && chunked(five, 8, 28) && std::fabs(five.rope_theta - 2.5e5f) < 1.0f);
+  std::string untheta = v5;
+  const std::string theta = R"(, "rope_theta": 250000.0)";
+  untheta.erase(untheta.find(theta), theta.size());
+  EXPECT(std::fabs(DecoderConfig::from_json(Json::parse(untheta)).rope_theta - 1e6f) < 1.0f);
+
+  const Json processor = Json::parse(R"({"min_pixels": 3136, "max_pixels": 12845056, "patch_size": 14,
+    "temporal_patch_size": 2, "merge_size": 2})");
+  const Qwen35VisionConfig vision = Qwen35VisionConfig::from_json(Json::parse(kQwen25VL3BConfig), &processor);
+  EXPECT(vision.qwen2_5 && vision.depth == 32 && vision.hidden_size == 1280 && vision.patch_size == 14);
+  EXPECT(vision.window == 4 && vision.full_attention == std::vector<int>({7, 15, 23, 31}) && vision.deepstack.empty());
+  EXPECT(vision.position_side == 0 && vision.text_hidden_size == 2048 && vision.factor() == 28);
+  EXPECT(vision.min_pixels == 3136 && vision.max_pixels == 12845056 && std::fabs(vision.mean[0] - 0.48145466f) < 1e-7f);
+  // A window_size that is not a multiple of the merged patch floors, as in
+  // Transformers (112 // 2 // 14 == 4, 120 // 2 // 14 == 4).
+  std::string wider = kQwen25VL3BConfig;
+  wider.replace(wider.find("\"window_size\": 112"), 18, "\"window_size\": 120");
+  EXPECT(Qwen35VisionConfig::from_json(Json::parse(wider), &processor).window == 4);
+}
+
 void test_mrope_injection_plan() {
   // Two images in a 20-token prefill at position 10, after earlier images
   // moved RoPE positions 5 ahead: a 2x3 grid at 12 and a 4x2 grid at 20.
@@ -1083,6 +1160,7 @@ int main() {
   test_qwen3_5_configs();
   test_mrope_injection_plan();
   test_qwen3_vl_config();
+  test_qwen2_5_vl_config();
   test_qwen3_5_vision_config();
   if (g_failures) {
     std::fprintf(stderr, "%d expectation(s) failed\n", g_failures);
