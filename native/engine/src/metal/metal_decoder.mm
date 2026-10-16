@@ -252,7 +252,8 @@ class DecoderMetal final : public Model {
  public:
   DecoderMetal(std::shared_ptr<DecoderWeights> weights, const LoadOptions& options)
       : w_(std::move(weights)), c_(w_->config), max_context_(options.max_context),
-        chunk_(std::max(1, std::min(options.prefill_chunk, options.max_context))) {
+        chunk_(std::max(1, std::min(options.prefill_chunk, options.max_context))),
+        kv_f16_(kv_cache_f16(options, c_, true)) {
     @autoreleasepool {
       device_ = MTLCreateSystemDefaultDevice();
       LK_CHECK(device_ != nil, "metal: no Metal device");
@@ -271,6 +272,8 @@ class DecoderMetal final : public Model {
   const char* architecture() const override { return c_.architecture.c_str(); }
   int vocab_size() const override { return c_.vocab_size; }
   int max_context() const override { return max_context_; }
+  const char* kv_cache() const override { return kv_f16_ ? "f16" : "f32"; }
+  double kv_bytes() const { return kv_f16_ ? 2.0 : 4.0; }
   int position() const override { return position_; }
   size_t weight_bytes() const override { return w_->matrix_bytes(); }
   const std::vector<int32_t>& eos_token_ids() const override { return c_.eos_token_ids; }
@@ -724,8 +727,9 @@ class DecoderMetal final : public Model {
       // written before its queries read the preceding window.
       G.capacity = G.sliding ? std::min(max_context_, c_.sliding_window + chunk_) : max_context_;
       const size_t width = static_cast<size_t>(G.kv_heads) * static_cast<size_t>(G.head_dim);
-      G.k_cache = private_buffer(width * static_cast<size_t>(G.capacity) * f);
-      G.v_cache = private_buffer(width * static_cast<size_t>(G.capacity) * f);
+      const size_t element = kv_f16_ ? sizeof(uint16_t) : sizeof(float);
+      G.k_cache = private_buffer(width * static_cast<size_t>(G.capacity) * element);
+      G.v_cache = private_buffer(width * static_cast<size_t>(G.capacity) * element);
     }
     x_ = private_buffer(chunk * hidden * f);
     h_ = private_buffer(chunk * hidden * f);
@@ -1100,7 +1104,7 @@ class DecoderMetal final : public Model {
   }
 
   void encode_rope(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n, int start) {
-    [enc setComputePipelineState:pipeline("qk_norm_rope_store")];
+    [enc setComputePipelineState:pipeline(kv_f16_ ? "qk_norm_rope_store_h" : "qk_norm_rope_store")];
     bind(enc, q_, 0, 0);
     bind(enc, kt_, 0, 1);
     bind(enc, vt_, 0, 2);
@@ -1147,7 +1151,8 @@ class DecoderMetal final : public Model {
     const int block = std::max(min_block, (keys_max + max_blocks - 1) / max_blocks);
     const int n_blocks = (keys_max + block - 1) / block;
     const int group = c_.num_heads / G.kv_heads;
-    const std::string name = "attn_partial_g" + std::to_string(group) + "_d" + std::to_string(G.head_dim / 32);
+    const std::string name =
+        "attn_partial_g" + std::to_string(group) + "_d" + std::to_string(G.head_dim / 32) + (kv_f16_ ? "_h" : "");
     [enc setComputePipelineState:pipeline(name)];
     bind(enc, q_, 0, 0);
     bind(enc, G.k_cache, 0, 1);
@@ -1569,10 +1574,13 @@ class DecoderMetal final : public Model {
                                 (G.own_kv && !G.k_eq_v ? traffic::linear(L.v_proj, n) : 0.0)
                           : 0.0);
         encode_rope(enc, G, n, start);
+        // q in and out, k and v in, and k and v written to the cache.
         section(enc, "rope_kv",
-                profiling ? traffic::rows(G.head_dim, n, 2 * c_.num_heads + (G.own_kv ? 4 * G.kv_heads : 0)) : 0.0);
+                profiling ? traffic::rows(G.head_dim, n, 2 * c_.num_heads + (G.own_kv ? 2 * G.kv_heads : 0)) +
+                                (G.own_kv ? kv_bytes() / 4.0 * traffic::rows(G.head_dim, n, 2 * G.kv_heads) : 0.0)
+                          : 0.0);
         encode_attention(enc, G, n, start);
-        section(enc, "attention", profiling ? traffic::attention(c_, layer, start, n) : 0.0);
+        section(enc, "attention", profiling ? traffic::attention(c_, layer, start, n, kv_bytes()) : 0.0);
         const int gated = n * c_.num_heads * G.head_dim;
         if (c_.attn_output_gate) encode_mul_sigmoid(enc, attn_, out_gate_, 1, gated);
         encode_qmm(enc, G.o, attn_, n, r_);
@@ -1755,6 +1763,7 @@ class DecoderMetal final : public Model {
   const DecoderConfig& c_;
   int max_context_;
   int chunk_;
+  bool kv_f16_;  // standard attention's keys and values stored as FP16
   int position_ = 0;
 
   id<MTLDevice> device_ = nil;

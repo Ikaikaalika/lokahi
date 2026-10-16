@@ -312,13 +312,22 @@ runs that kernel on arbitrary logits for testing.
 - Chunks of up to `--prefill-chunk` tokens all go into one command buffer.
 - The vocabulary projection runs only for the final prompt token.
 
-**KV cache.** Global layers hold `max_context` slots. Sliding-window layers
-hold `window + prefill_chunk` slots in a ring, so a whole chunk can be written
-before its queries read the preceding window.
+**KV cache.**
+- Global layers hold `max_context` slots. Sliding-window layers hold
+  `window + prefill_chunk` slots in a ring, so a whole chunk can be written
+  before its queries read the preceding window.
+- Keys and values are stored as FP16 by default (`--kv-cache auto`, or
+  `"kv_cache"` in the service config), as llama.cpp stores them. Decode reads
+  every visible key and value once per token, so FP16 halves that traffic and
+  the cache's memory; at long contexts it rivals the weights. `--kv-cache f32`
+  keeps float32 for comparison.
+- Latent attention's cache stays float32.
+- The CPU backend keeps float32 unless `--kv-cache f16` asks it to round keys
+  and values as Metal stores them.
 
-**Numerics.** Activations, norms, attention and the KV cache are float32.
-Weights stay in their packed 4-bit or 8-bit form and are dequantized inside
-the kernels.
+**Numerics.** Activations, norms and attention are float32, and the KV cache is
+FP16 as above. Weights stay packed (2 to 8 bits, or MXFP4) and are dequantized
+inside the kernels.
 
 **Tokenizer.** `tokenizer.json` is interpreted natively and must agree with
 Hugging Face `tokenizers` id for id; components it cannot reproduce exactly

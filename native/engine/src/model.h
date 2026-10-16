@@ -17,6 +17,9 @@ struct LoadOptions {
   int max_context = 4096;
   int prefill_chunk = 512;
   unsigned cpu_threads = 0;  // 0: hardware concurrency
+  // The keys' and values' element type: auto (f16 on Metal, f32 on the CPU
+  // reference backend), f16 or f32. Latent attention keeps f32.
+  std::string kv_cache = "auto";
 };
 
 struct GenerationTiming {
@@ -116,6 +119,8 @@ class Model {
   virtual int max_context() const = 0;
   virtual int position() const = 0;
   virtual size_t weight_bytes() const = 0;
+  // The KV cache's element type ("f16" or "f32").
+  virtual const char* kv_cache() const { return "f32"; }
   virtual const std::vector<int32_t>& eos_token_ids() const = 0;
 
   virtual void reset() = 0;

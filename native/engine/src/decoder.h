@@ -298,13 +298,18 @@ Linear latent_absorption(const DecoderConfig& config, const DecoderLayer& layer,
 // Minimum memory traffic, in bytes, of forward-pass sections over n tokens,
 // shared by every backend's profiler so attributions are comparable.
 // Activations are float32; weights count once per call.
+// Whether keys and values are stored as FP16, from LoadOptions::kv_cache:
+// auto picks FP16 on Metal and FP32 on the CPU; latent attention and an
+// unknown value fail closed when FP16 is asked for.
+bool kv_cache_f16(const LoadOptions& options, const DecoderConfig& config, bool metal);
+
 namespace traffic {
 double linear(const Linear& weights, int n);           // weights, inputs, outputs
 double embed(const Linear& embed, int n);              // n gathered rows, outputs
 double rows(int64_t width, int n, int arrays);         // `arrays` [n, width] tensors
 // q reads, output writes, and every visible key and value read once per kv
 // head for tokens at positions [start, start + n).
-double attention(const DecoderConfig& config, int layer, int start, int n);
+double attention(const DecoderConfig& config, int layer, int start, int n, double kv_element_bytes = 4.0);
 // Latent attention's query and latent projections with every head's
 // absorption, and its per-head expansions with o_proj.
 double latent_qkv(const DecoderConfig& config, const DecoderLayer& layer, int n);

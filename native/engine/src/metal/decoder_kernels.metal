@@ -11,6 +11,12 @@
 #include <metal_simdgroup_matrix>
 using namespace metal;
 
+// The Linux syntax check (tests/syntax_stubs) parses this file as C++, which
+// does not accept attributes on explicit instantiations; it blanks this macro.
+#ifndef LOKAHI_INSTANCE_ATTRS
+#define LOKAHI_INSTANCE_ATTRS(name) [[host_name(name)]] [[kernel]]
+#endif
+
 constant int QBITS [[function_constant(0)]];
 constant int QGROUP [[function_constant(1)]];
 constant bool QSCALE_BF16 [[function_constant(2)]];
@@ -979,11 +985,13 @@ inline float rotate_partial(threadgroup const float* head, int j, int rh, RopePo
   return j < rh ? head[j] * cs - head[j + rh] * sn : head[j] * cs + head[j - rh] * sn;
 }
 
-kernel void qk_norm_rope_store(device float* q [[buffer(0)]],
+// KV is the cache's element type: half (qk_norm_rope_store_h) or float.
+template <typename KV>
+[[kernel]] void qk_norm_rope_store(device float* q [[buffer(0)]],
                                const device float* k_in [[buffer(1)]],
                                const device float* v_in [[buffer(2)]],
-                               device float* k_cache [[buffer(3)]],
-                               device float* v_cache [[buffer(4)]],
+                               device KV* k_cache [[buffer(3)]],
+                               device KV* v_cache [[buffer(4)]],
                                const device float* q_norm [[buffer(5)]],
                                const device float* k_norm [[buffer(6)]],
                                const device float* inv_freq [[buffer(7)]],
@@ -1051,11 +1059,11 @@ kernel void qk_norm_rope_store(device float* q [[buffer(0)]],
     return;
   }
   const int slot = pos % p.capacity;
-  device float* kd = k_cache + (kvh * p.capacity + slot) * p.head_dim;
-  kd[i] = ra;
-  kd[i + half_dim] = rb;
+  device KV* kd = k_cache + (kvh * p.capacity + slot) * p.head_dim;
+  kd[i] = KV(ra);
+  kd[i + half_dim] = KV(rb);
   const device float* vs = v_in + (t * p.kv_heads + kvh) * p.head_dim;
-  device float* vd = v_cache + (kvh * p.capacity + slot) * p.head_dim;
+  device KV* vd = v_cache + (kvh * p.capacity + slot) * p.head_dim;
   const device float* vb = v_bias + kvh * p.head_dim;
   float v_lo = vs[i] + (p.qkv_bias != 0 ? vb[i] : 0.0f);
   float v_hi = vs[i + half_dim] + (p.qkv_bias != 0 ? vb[i + half_dim] : 0.0f);
@@ -1065,9 +1073,12 @@ kernel void qk_norm_rope_store(device float* q [[buffer(0)]],
     v_lo *= inv;
     v_hi *= inv;
   }
-  vd[i] = v_lo;
-  vd[i + half_dim] = v_hi;
+  vd[i] = KV(v_lo);
+  vd[i + half_dim] = KV(v_hi);
 }
+
+template LOKAHI_INSTANCE_ATTRS("qk_norm_rope_store") decltype(qk_norm_rope_store<float>) qk_norm_rope_store<float>;
+template LOKAHI_INSTANCE_ATTRS("qk_norm_rope_store_h") decltype(qk_norm_rope_store<half>) qk_norm_rope_store<half>;
 
 // ---------------------------------------------------------------------------
 // Multi-head latent attention's per-token RoPE and cache write. Threadgroup
@@ -1481,10 +1492,11 @@ struct AttnParams {
   int groups_per_kv;  // threadgroups of G query heads per kv head: 1, or heads / G for latent attention
 };
 
-template <int G, int DPL>
+// KV is the cache's element type: half (the _h instances) or float.
+template <int G, int DPL, typename KV>
 [[kernel]] void attn_partial(const device float* q [[buffer(0)]],
-                             const device float* k_cache [[buffer(1)]],
-                             const device float* v_cache [[buffer(2)]],
+                             const device KV* k_cache [[buffer(1)]],
+                             const device KV* v_cache [[buffer(2)]],
                              device float* part_o [[buffer(3)]],
                              device float* part_ml [[buffer(4)]],
                              constant AttnParams& p [[buffer(5)]],
@@ -1521,12 +1533,12 @@ template <int G, int DPL>
 
   for (int key = kb + int(sg); key < ke; key += ATT_SIMDGROUPS) {
     const int slot = key % p.capacity;
-    const device float* kp = k_cache + (kvh * p.capacity + slot) * D + int(lane) * DPL;
-    const device float* vp = v_cache + (kvh * p.capacity + slot) * D + int(lane) * DPL;
+    const device KV* kp = k_cache + (kvh * p.capacity + slot) * D + int(lane) * DPL;
+    const device KV* vp = v_cache + (kvh * p.capacity + slot) * D + int(lane) * DPL;
     float kv[DPL], vv[DPL];
     for (int j = 0; j < DPL; ++j) {
-      kv[j] = kp[j];
-      vv[j] = vp[j];
+      kv[j] = float(kp[j]);
+      vv[j] = float(vp[j]);
     }
     for (int g = 0; g < G; ++g) {
       float partial = 0.0f;
@@ -1583,14 +1595,10 @@ template <int G, int DPL>
   }
 }
 
-// The Linux syntax check (tests/syntax_stubs) parses this file as C++, which
-// does not accept attributes on explicit instantiations; it blanks this macro.
-#ifndef LOKAHI_INSTANCE_ATTRS
-#define LOKAHI_INSTANCE_ATTRS(name) [[host_name(name)]] [[kernel]]
-#endif
-#define LOKAHI_ATTN(G, DPL)                                                 \
-  template LOKAHI_INSTANCE_ATTRS("attn_partial_g" #G "_d" #DPL)             \
-  decltype(attn_partial<G, DPL>) attn_partial<G, DPL>;
+#define LOKAHI_ATTN_KV(G, DPL, KV, suffix)                                  \
+  template LOKAHI_INSTANCE_ATTRS("attn_partial_g" #G "_d" #DPL suffix)      \
+  decltype(attn_partial<G, DPL, KV>) attn_partial<G, DPL, KV>;
+#define LOKAHI_ATTN(G, DPL) LOKAHI_ATTN_KV(G, DPL, float, "") LOKAHI_ATTN_KV(G, DPL, half, "_h")
 
 // Query heads per kv head (G) seen in supported checkpoints run from 1 to 8
 // (Qwen 2.5 uses 6 and 7, Qwen 3 14B uses 5); head_dim is 32 * DPL, up to
@@ -1606,9 +1614,9 @@ LOKAHI_ATTN_ALL_DPL(7)
 LOKAHI_ATTN_ALL_DPL(8)
 // Multi-head latent attention: four query heads per threadgroup over the
 // one latent key head, 576 wide in every released model (96 in the tiny
-// fixtures).
-LOKAHI_ATTN(4, 3)
-LOKAHI_ATTN(4, 18)
+// fixtures). Its cache stays float32.
+LOKAHI_ATTN_KV(4, 3, float, "")
+LOKAHI_ATTN_KV(4, 18, float, "")
 
 struct ReduceParams {
   int heads;

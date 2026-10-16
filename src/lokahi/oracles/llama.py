@@ -54,6 +54,10 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+# The type the engine's KV cache stores keys and values in (np.float16 for
+# its FP16 cache); None keeps them exact.
+KV_STORAGE = None
+
 from .gemma3 import load_dense_weights
 
 FAMILIES = ("llama", "mistral", "qwen2", "qwen3", "qwen3_moe", "gpt_oss", "glm4_moe")
@@ -299,6 +303,9 @@ class LlamaFamilyReference:
         angles = positions[cfg.rope_axes()].T
         q = np.concatenate([_rope(q[..., :rot], angles, inv_freq), q[..., rot:]], axis=-1) * factor
         k = np.concatenate([_rope(k[..., :rot], angles, inv_freq), k[..., rot:]], axis=-1) * factor
+        if KV_STORAGE is not None:  # keys and values as a cache of that type holds them
+            k = k.astype(KV_STORAGE).astype(np.float32)
+            v = v.astype(KV_STORAGE).astype(np.float32)
 
         # Causal by sequence index (M-RoPE positions repeat within an image).
         i = np.arange(tokens)[:, None]

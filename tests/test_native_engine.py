@@ -316,6 +316,77 @@ def test_logits_match_oracle(native_cli, fixture_model, backend, prefill, chunk,
     np.testing.assert_array_equal(got.argmax(axis=1), expected.argmax(axis=1))
 
 
+def _latent(directory: Path) -> bool:
+    config = json.loads((directory / "config.json").read_text())
+    text = config.get("text_config") or config
+    return bool(text.get("kv_lora_rank"))
+
+
+@pytest.mark.parametrize("backend", _backends())
+@pytest.mark.parametrize("kv_cache", ["f16", "f32"])
+def test_kv_cache_element_type_matches_oracle(native_cli, fixture_model, backend, kv_cache, tmp_path):
+    # Keys and values stored as FP16 (Metal's default) or FP32. The CPU rounds
+    # them through FP16 as Metal stores them; latent attention keeps FP32.
+    directory, oracle = fixture_model
+    _skip_unsupported(directory, backend)
+    args = ("--model", str(directory), "--backend", backend, "--kv-cache", kv_cache)
+    if kv_cache == "f16" and _latent(directory):
+        assert "latent attention keeps its cache in f32" in _load_error(native_cli, directory, backend, kv_cache)
+        return
+    assert _run(native_cli, "info", *args)["kv_cache"] == kv_cache
+    out = tmp_path / "logits.bin"
+    # Prefill 9 tokens in chunks of 4, then decode the rest one at a time.
+    report = _run(native_cli, "logits", *args, "--tokens", ",".join(map(str, TOKENS)),
+                  "--prefill", "9", "--prefill-chunk", "4", "--out", str(out))
+    got = np.fromfile(out, dtype=np.float32).reshape(report["rows"], oracle.config.vocab_size)
+    expected = oracle.logits(TOKENS)[8:]
+    # FP16 keys and values move these fixtures' logits by 0.006-0.4% of their
+    # scale (GPT-OSS's the most), inside Metal's 2% (correctness evidence only).
+    tolerance = 2e-2 if backend == "metal" else 1e-2 if kv_cache == "f16" else 2e-4
+    np.testing.assert_allclose(got, expected, atol=tolerance * np.abs(expected).max(), rtol=0)
+    np.testing.assert_array_equal(got.argmax(axis=1), expected.argmax(axis=1))
+    if backend == "cpu" and kv_cache == "f16":  # the rounding happened
+        exact = tmp_path / "exact.bin"
+        _run(native_cli, "logits", "--model", str(directory), "--backend", "cpu", "--tokens",
+             ",".join(map(str, TOKENS)), "--prefill", "9", "--prefill-chunk", "4", "--out", str(exact))
+        assert not np.array_equal(got, np.fromfile(exact, dtype=np.float32).reshape(got.shape))
+
+
+@pytest.mark.parametrize("name", ["llama3-tied-rope-llama3", "mistral-sliding-untied"])
+def test_cpu_f16_cache_rounds_keys_and_values_as_numpy_does(native_cli, tmp_path, monkeypatch, name):
+    # The CPU's FP16 cache rounds keys and values to nearest even, as Metal
+    # stores them and as NumPy converts, so it lands much nearer the oracle
+    # with keys and values stored as np.float16 than the exact oracle. Values
+    # within 1e-6 of a rounding midpoint can round either way, so it is not
+    # exactly the rounded oracle: measured 0.09 and 0.21 of the way here, and
+    # 1.2 and 1.4 with only the keys rounded.
+    import lokahi.oracles.llama as llama
+
+    directory = write_tiny_dense(tmp_path / "model", DENSE_VARIANTS[name])
+    exact = LlamaFamilyReference.load(directory).logits(TOKENS)[8:]
+    monkeypatch.setattr(llama, "KV_STORAGE", np.float16)
+    rounded = LlamaFamilyReference.load(directory).logits(TOKENS)[8:]
+    out = tmp_path / "logits.bin"
+    _run(native_cli, "logits", "--model", str(directory), "--backend", "cpu", "--kv-cache", "f16",
+         "--tokens", ",".join(map(str, TOKENS)), "--prefill", "9", "--prefill-chunk", "4", "--out", str(out))
+    got = np.fromfile(out, dtype=np.float32).reshape(exact.shape)
+    assert np.abs(rounded - exact).max() > 1e-4 * np.abs(exact).max()
+    assert np.abs(got - rounded).max() < 0.5 * np.abs(got - exact).max()
+
+
+@pytest.mark.parametrize("backend", _backends())
+def test_kv_cache_defaults_to_f16_on_metal(native_cli, fixture_model, backend):
+    directory, _ = fixture_model
+    _skip_unsupported(directory, backend)
+    expected = "f16" if backend == "metal" and not _latent(directory) else "f32"
+    assert _run(native_cli, "info", "--model", str(directory), "--backend", backend)["kv_cache"] == expected
+
+
+def test_unknown_kv_cache_type_fails_closed(native_cli, tmp_path):
+    directory = write_tiny_qwen35(tmp_path / "model", QWEN35_VARIANTS["qwen3.5-mlx"])
+    assert "kv_cache must be auto, f16 or f32, not 'bf16'" in _load_error(native_cli, directory, "cpu", "bf16")
+
+
 @pytest.mark.parametrize("backend", _backends())
 def test_greedy_generation_matches_full_recompute(native_cli, fixture_model, backend):
     directory, oracle = fixture_model
@@ -454,9 +525,10 @@ def _gathered_table_bytes(directory: Path) -> int:
     return total
 
 
-def _load_error(native_cli: Path, directory: Path, backend: str = "cpu") -> str:
+def _load_error(native_cli: Path, directory: Path, backend: str = "cpu", kv_cache: str = "auto") -> str:
     result = subprocess.run(
-        [str(native_cli), "info", "--model", str(directory), "--backend", backend], capture_output=True, text=True
+        [str(native_cli), "info", "--model", str(directory), "--backend", backend, "--kv-cache", kv_cache],
+        capture_output=True, text=True,
     )
     assert result.returncode != 0
     return result.stderr

@@ -50,4 +50,24 @@ inline float f16_to_f32(uint16_t h) {
   return out;
 }
 
+// To the nearest FP16, ties to even, as Metal converts float to half; values
+// from 65520 up become infinity.
+inline uint16_t f32_to_f16(float value) {
+  uint32_t bits;
+  std::memcpy(&bits, &value, sizeof(bits));
+  const uint32_t sign = (bits >> 16) & 0x8000u;
+  const uint32_t magnitude = bits & 0x7FFFFFFFu;
+  if (magnitude >= 0x7F800000u) return static_cast<uint16_t>(sign | (magnitude > 0x7F800000u ? 0x7E00u : 0x7C00u));
+  if (magnitude >= 0x477FF000u) return static_cast<uint16_t>(sign | 0x7C00u);
+  if (magnitude < 0x38800000u) {  // below 2^-14: a subnormal (or zero) in units of 2^-24
+    float scaled;
+    std::memcpy(&scaled, &magnitude, sizeof(scaled));
+    return static_cast<uint16_t>(sign | static_cast<uint32_t>(std::nearbyint(scaled * 16777216.0f)));
+  }
+  uint32_t half = (magnitude - 0x38000000u) >> 13;  // rebiased exponent and the top 10 mantissa bits
+  const uint32_t rest = magnitude & 0x1FFFu;
+  if (rest > 0x1000u || (rest == 0x1000u && (half & 1u))) ++half;  // a carry moves to the next exponent
+  return static_cast<uint16_t>(sign | half);
+}
+
 }  // namespace lokahi
