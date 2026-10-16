@@ -67,7 +67,7 @@ jobs:
           LOKAHI_TEST_BACKENDS: cpu,metal
           LOKAHI_MODEL_ROOT: ${{ vars.LOKAHI_MODEL_ROOT }}
         run: |
-          PYTHONPATH=src "$PYTHON" -m pytest -q tests/test_native_engine.py tests/test_mlx_crosscheck.py tests/test_mlx_vlm_crosscheck.py \
+          PYTHONPATH=src "$PYTHON" -m pytest -q tests/test_native_engine.py tests/test_mtp.py tests/test_mlx_crosscheck.py tests/test_mlx_vlm_crosscheck.py \
             tests/test_tokenizer.py tests/test_c_abi.py tests/test_sampling.py
 
       - name: Full Python suite

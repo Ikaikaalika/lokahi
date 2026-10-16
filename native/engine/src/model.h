@@ -21,6 +21,9 @@ struct LoadOptions {
   // The keys' and values' element type: auto (f16 on Metal, f32 on the CPU
   // reference backend), f16 or f32. Latent attention keeps f32.
   std::string kv_cache = "auto";
+  // A qwen3_5_mtp drafter directory: a multi-token prediction head split
+  // from the checkpoint (DecoderWeights::mtp).
+  std::string draft_model;
 };
 
 struct GenerationTiming {
@@ -149,6 +152,16 @@ class Model {
   virtual bool can_verify() const { return false; }
   virtual const float* verify(const int32_t* tokens, int n);
   virtual void accept(int kept);
+
+  // Multi-token prediction (Qwen3.5's MTP head). While the head follows the
+  // model, which must start from an empty context, every pass also writes
+  // the head's rows; mtp_draft then drafts up to `count` greedy tokens after
+  // `token`, the last token generated (not yet fed), and appends each
+  // draft's [vocab] logits to `logits` when given. Greedy generation with an
+  // MTP drafter arranges the following itself.
+  virtual bool has_mtp() const { return false; }
+  virtual void follow_mtp(bool on);
+  virtual std::vector<int32_t> mtp_draft(int32_t token, int count, std::vector<float>* logits = nullptr);
 
   // Greedy generation drafts up to options.max_draft tokens per verify pass
   // (speculation.h); other sampling decodes one token at a time.

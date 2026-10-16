@@ -5,7 +5,10 @@
 //   lokahi generate   --model DIR (--tokens 2,5,9 | --prompt TEXT) --max-new N [--no-eos-stop]
 //                     [--images A.rgb,B.rgb]
 //                     [--temperature T] [--top-p P] [--top-k K] [--min-p M] [--seed S]
-//                     [--speculate N [--draft-reference FILE]]   # greedy: verify up to N drafts a pass
+//                     [--speculate N [--draft-reference FILE] [--drafter lookup|mtp|both]]
+//                                       # greedy: verify up to N drafts a pass
+//                     [--mtp-probe K [--mtp-logits FILE]]   # the MTP head's next K drafts
+//   (every command)   [--draft-model DIR]   # a qwen3_5_mtp drafter for --drafter mtp
 //   lokahi image-features --model DIR --images A.ppm[,B.ppm] --out FILE [--backend B]
 //   lokahi image-geometry --model DIR --width W --height H   # the processor's resize target
 //   lokahi sample     --logits-file F.f32 --vocab V [sampling flags] [--steps N] [--first-step S]
@@ -128,6 +131,7 @@ LoadOptions load_options(const Args& args) {
   options.prefill_chunk = args.get_int("prefill-chunk", 512);
   options.cpu_threads = static_cast<unsigned>(args.get_int("threads", 0));
   options.kv_cache = args.get("kv-cache", "auto");
+  options.draft_model = args.get("draft-model", "");
   return options;
 }
 
@@ -296,9 +300,9 @@ int cmd_info(const Args& args) {
   }
   std::printf(
       "{\"architecture\":\"%s\",\"backend\":\"%s\",\"vocab_size\":%d,\"max_context\":%d,"
-      "\"kv_cache\":\"%s\",\"weight_bytes\":%zu%s}\n",
+      "\"kv_cache\":\"%s\",\"weight_bytes\":%zu,\"mtp\":%s%s}\n",
       model->architecture(), model->backend(), model->vocab_size(), model->max_context(), model->kv_cache(),
-      model->weight_bytes(), vision.c_str());
+      model->weight_bytes(), model->has_mtp() ? "true" : "false", vision.c_str());
   return 0;
 }
 
@@ -337,6 +341,10 @@ int cmd_generate(const Args& args) {
   speculation.max_draft = args.get_int("speculate", 0);
   LK_CHECK(speculation.max_draft >= 0, "--speculate must not be negative");
   if (args.has("draft-reference")) speculation.reference = parse_tokens(read_text_file(args.get("draft-reference")));
+  // --drafter mtp drafts with the model's multi-token prediction head (in
+  // the checkpoint, or --draft-model's qwen3_5_mtp drafter); both prefers a
+  // lookup draft when there is one.
+  speculation.drafter = parse_drafter(args.get("drafter", "lookup"));
   model->set_speculation(std::move(speculation));
   auto generated = model->generate(tokens, args.get_int("max-new", 16), sampling_options(args),
                                    !args.has("no-eos-stop"), &timing);
@@ -355,13 +363,29 @@ int cmd_generate(const Args& args) {
     }
     continued = ",\"continued\":" + json_tokens(more);
   }
+  // --mtp-probe K reports the K drafts the MTP head makes after the last
+  // token, and --mtp-logits FILE writes their [K, vocab] logits.
+  std::string probe;
+  if (args.has("mtp-probe") && !generated.empty()) {
+    const int32_t last = continued.empty() ? generated.back() : -1;
+    LK_CHECK(last >= 0, "--mtp-probe does not combine with --continue");
+    std::vector<float> logits;
+    const std::vector<int32_t> drafts = model->mtp_draft(last, args.get_int("mtp-probe", 0), &logits);
+    if (args.has("mtp-logits")) {
+      std::ofstream out(args.get("mtp-logits"), std::ios::binary);
+      LK_CHECK(out.good(), "cannot write " + args.get("mtp-logits"));
+      out.write(reinterpret_cast<const char*>(logits.data()),
+                static_cast<std::streamsize>(sizeof(float) * logits.size()));
+    }
+    probe = ",\"mtp_drafts\":" + json_tokens(drafts);
+  }
   const SpeculationStats& stats = model->speculation_stats();
   const std::string speculated = ",\"speculation\":{\"passes\":" + std::to_string(stats.passes) +
                                  ",\"drafted\":" + std::to_string(stats.drafted) +
                                  ",\"accepted\":" + std::to_string(stats.accepted) + "}";
-  std::printf("{\"backend\":\"%s\",\"tokens\":%s%s%s%s,\"prefill_seconds\":%.9f,\"decode_seconds\":%.9f}\n",
-              model->backend(), json_tokens(generated).c_str(), text.c_str(), continued.c_str(), speculated.c_str(),
-              timing.prefill_seconds, timing.decode_seconds);
+  std::printf("{\"backend\":\"%s\",\"tokens\":%s%s%s%s%s,\"prefill_seconds\":%.9f,\"decode_seconds\":%.9f}\n",
+              model->backend(), json_tokens(generated).c_str(), text.c_str(), continued.c_str(), probe.c_str(),
+              speculated.c_str(), timing.prefill_seconds, timing.decode_seconds);
   return 0;
 }
 

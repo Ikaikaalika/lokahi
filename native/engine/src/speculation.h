@@ -7,13 +7,23 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace lokahi {
 
+// Where drafts come from: prompt lookup (below); the model's multi-token
+// prediction head (Model::mtp_draft); or lookup when it finds a draft and the
+// head otherwise.
+enum class Drafter { Lookup, Mtp, Both };
+
+// "lookup", "mtp" or "both".
+Drafter parse_drafter(const std::string& name);
+
 struct SpeculationOptions {
   int max_draft = 0;                // 0 disables speculation
   std::vector<int32_t> reference;   // a document drafts may also come from (e.g. text being edited)
+  Drafter drafter = Drafter::Lookup;
 };
 
 struct SpeculationStats {

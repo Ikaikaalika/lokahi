@@ -12,6 +12,7 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -202,6 +203,9 @@ struct DecoderConfig {
   // output gate (head_dim each), and the attention output is multiplied by
   // sigmoid(gate) before o_proj.
   bool attn_output_gate = false;
+  // Qwen3.5's multi-token prediction head (DecoderWeights::mtp): its layer
+  // is layer num_layers of the per-layer fields above, a full-attention one.
+  int mtp_layers = 0;
 
   static DecoderConfig from_json(const Json& raw);
   // RoPE inverse frequencies (half the layer kind's head size); rotations a
@@ -280,8 +284,23 @@ struct DecoderWeights {
   std::vector<float> per_layer_proj_norm;
   std::vector<DecoderLayer> layers;
   bool tied_lm_head = false;
+  // Qwen3.5's multi-token prediction head, which drafts the token after the
+  // next one: from the target's final-normed hidden state h at position t
+  // and the embedding e of token t + 1, x = fc([norm_e(e) | norm_h(h)]), then
+  // one decoder layer at position t (config layer num_layers), then norm;
+  // lm_head gives the logits, and x feeds the head again for the draft after.
+  // It shares the decoder's embedding and lm_head.
+  struct Mtp {
+    Linear fc;  // [hidden, 2 * hidden]
+    std::vector<float> embedding_norm, hidden_norm, final_norm;
+    DecoderLayer layer;
+    std::string source;  // "checkpoint", or the drafter directory
+    std::shared_ptr<Checkpoint> checkpoint;  // the tensors' file (a drafter's own)
+  };
+  std::optional<Mtp> mtp;
 
-  static std::shared_ptr<DecoderWeights> load(const std::string& directory);
+  // `draft_model`: a qwen3_5_mtp drafter directory whose head to load.
+  static std::shared_ptr<DecoderWeights> load(const std::string& directory, const std::string& draft_model = "");
   size_t matrix_bytes() const;
   // Whether any matrix other than an expert is MXFP4: the Metal kernels read
   // MXFP4 only for experts so far.

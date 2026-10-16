@@ -126,6 +126,14 @@ void Model::accept(int) {
   throw Error(std::string(backend()) + ": speculative decoding is not supported on this backend");
 }
 
+void Model::follow_mtp(bool on) {
+  LK_CHECK(!on, std::string(backend()) + ": multi-token prediction is not supported on this backend");
+}
+
+std::vector<int32_t> Model::mtp_draft(int32_t, int, std::vector<float>*) {
+  throw Error(std::string(backend()) + ": multi-token prediction is not supported on this backend");
+}
+
 std::vector<int32_t> Model::generate(const std::vector<int32_t>& prompt, int max_new,
                                      const SamplingParams& sampling, bool stop_at_eos, GenerationTiming* timing,
                                      const TokenCallback& on_token) {
@@ -168,6 +176,9 @@ std::vector<int32_t> Model::generate_speculative(const std::vector<int32_t>& pro
   const int vocab = vocab_size();
   auto pick = [&](const float* logits) { return sample_token(logits, vocab, sampling, static_cast<int>(out.size())); };
   PromptLookupDrafter drafter(speculation_.reference);
+  const bool lookup = speculation_.drafter != Drafter::Mtp;
+  const bool mtp = speculation_.drafter != Drafter::Lookup;
+  if (mtp) follow_mtp(true);
   std::vector<int32_t> context = prompt;
   bool keep_going = true;
   // Emits one generated token; false once generation must stop after it.
@@ -192,7 +203,9 @@ std::vector<int32_t> Model::generate_speculative(const std::vector<int32_t>& pro
     // A pass yields up to one token beyond its drafts, so it drafts at most
     // the tokens still wanted minus one.
     const int room = std::min(speculation_.max_draft, max_new - static_cast<int>(out.size()) - 1);
-    const std::vector<int32_t> draft = drafter.propose(context, room);
+    // Lookup's draft when it finds one, else the MTP head's.
+    std::vector<int32_t> draft = lookup ? drafter.propose(context, room) : std::vector<int32_t>{};
+    if (draft.empty() && mtp && room > 0) draft = mtp_draft(token, room);
     if (draft.empty()) {
       token = pick(decode(token));
       more = emit(token);
@@ -220,7 +233,7 @@ std::vector<int32_t> Model::generate_speculative(const std::vector<int32_t>& pro
 }
 
 std::unique_ptr<Model> load_model(const std::string& directory, const LoadOptions& options) {
-  auto weights = DecoderWeights::load(directory);
+  auto weights = DecoderWeights::load(directory, options.draft_model);
   std::string backend = options.backend;
 #if defined(LOKAHI_WITH_METAL)
   // Metal reads MXFP4 only for experts so far.
