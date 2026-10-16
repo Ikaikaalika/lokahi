@@ -1,13 +1,14 @@
 // Decoder-only transformers (Gemma 3, Gemma 4, Llama 3.x, Mistral, Qwen 2/2.5,
-// Qwen 3, Qwen 3 MoE, GPT-OSS, GLM-4.5, DeepSeek V2 and V3): configuration,
-// weight binding, and the CPU backend.
+// Qwen 3, Qwen 3 MoE, GPT-OSS, GLM-4.5, DeepSeek V2 and V3, Qwen3.5 and
+// Qwen3-Next): configuration, weight binding, and the CPU backend.
 // One configuration describes how the families differ (norm style and
 // placement, activation, per-head Q/K norm, q/k/v biases, RoPE bases,
 // scaling and partial rotation, sliding windows, logit soft-capping,
 // Gemma 4's per-layer geometry, KV sharing and per-layer inputs, DeepSeek's
-// multi-head latent attention, and mixture-of-experts layers), so a family
-// is a config parser rather than a fork. Both backends implement every
-// option; the Metal backend refuses only matrix formats its kernels lack.
+// multi-head latent attention, Qwen3.5's Gated DeltaNet layers and gated
+// attention, and mixture-of-experts layers), so a family is a config parser
+// rather than a fork. The CPU backend implements every option; the Metal
+// backend refuses Gated DeltaNet models and matrix formats its kernels lack.
 #pragma once
 
 #include <memory>
@@ -123,6 +124,10 @@ struct DecoderConfig {
   int n_group = 1, topk_group = 1;
   float routed_scaling = 1.0f;
   int shared_intermediate = 0;  // width of the always-on shared expert; 0 for none
+  // The shared expert's output times sigmoid(shared_expert_gate(x)), a
+  // [1, hidden] projection, as Qwen 2 MoE gates it (Qwen3.5, Qwen3-Next);
+  // its modules are then mlp.shared_expert rather than mlp.shared_experts.
+  bool shared_expert_gate = false;
   std::string router_module = "mlp.gate";  // relative to the layer
   bool router_bias = false;
   bool expert_bias = false;     // biases on every expert projection
@@ -159,6 +164,33 @@ struct DecoderConfig {
   float latent_norm_eps = 1e-6f;
   bool mla() const { return kv_lora_rank > 0; }
   int latent_width() const { return kv_lora_rank + qk_rope_dim; }
+
+  // Gated DeltaNet (Qwen3.5, Qwen3-Next): the layers marked in layer_linear
+  // replace attention with a linear-attention recurrence. A depthwise causal
+  // conv1d of linear_conv taps, then SiLU, runs over the [q | k | v]
+  // channels; q and k are L2-normalized per key head and q is scaled by
+  // linear_k_dim^-0.5. Each of the linear_v_heads value heads reads key head
+  // h / (linear_v_heads / linear_k_heads) and keeps a [linear_k_dim,
+  // linear_v_dim] state S. Per token, S decays by exp(g), with
+  // g = -exp(A_log) * softplus(a + dt_bias); it takes k (beta (v - S^T k))^T,
+  // with beta = sigmoid(b); and it outputs S^T q. A gated RMSNorm per value
+  // head, rms(o) * w * silu(z) with a plain weight, comes before out_proj.
+  // The states and the conv's last linear_conv - 1 inputs carry across
+  // passes until reset.
+  std::vector<bool> layer_linear;
+  int linear_k_heads = 0, linear_v_heads = 0, linear_k_dim = 0, linear_v_dim = 0, linear_conv = 0;
+  int linear_channels() const { return 2 * linear_k_heads * linear_k_dim + linear_v_heads * linear_v_dim; }
+  bool is_linear(int layer) const { return !layer_linear.empty() && layer_linear[static_cast<size_t>(layer)]; }
+  bool has_linear() const {
+    for (bool linear : layer_linear) {
+      if (linear) return true;
+    }
+    return false;
+  }
+  // Qwen3.5's full attention: q_proj gives each head its query and then an
+  // output gate (head_dim each), and the attention output is multiplied by
+  // sigmoid(gate) before o_proj.
+  bool attn_output_gate = false;
 
   static DecoderConfig from_json(const Json& raw);
   // RoPE inverse frequencies (half the layer kind's head size); rotations a
@@ -208,6 +240,15 @@ struct DecoderLayer {
   Linear q_a_proj, kv_a_proj, kv_b_proj;
   std::vector<float> q_a_norm, kv_a_norm;
   std::vector<Linear> embed_q, unembed_out;
+  // Gated DeltaNet: Qwen3.5's in_proj_qkv [channels, hidden], in_proj_z
+  // [Hv * dv, hidden], in_proj_b and in_proj_a [Hv, hidden], or else
+  // Qwen3-Next's in_proj_qkvz and in_proj_ba, whose rows group [q, k, v, z]
+  // and [b, a] by key head; the conv's [channels, linear_conv] taps, the
+  // decay rates exp(A_log) and dt_bias [Hv], the gated norm's weight [dv],
+  // and out_proj [hidden, Hv * dv].
+  Linear in_proj_qkv, in_proj_z, in_proj_b, in_proj_a, in_proj_qkvz, in_proj_ba, out_proj;
+  std::vector<float> conv, decay_rate, dt_bias, linear_norm;
+  Linear shared_expert_gate;  // [1, hidden], with shared_expert_gate
   // Per-layer inputs (Gemma 4): gate [P, hidden], projection [hidden, P].
   Linear per_layer_gate, per_layer_proj;
   std::vector<float> per_layer_norm;
@@ -257,6 +298,10 @@ double attention(const DecoderConfig& config, int layer, int start, int n);
 // absorption, and its per-head expansions with o_proj.
 double latent_qkv(const DecoderConfig& config, const DecoderLayer& layer, int n);
 double latent_out(const DecoderLayer& layer, int n);
+// Gated DeltaNet's input projections, and its recurrence: every state read
+// and written once per pass, plus each token's q, k, v, gates and output.
+double linear_projections(const DecoderLayer& layer, int n);
+double linear_recurrence(const DecoderConfig& config, int n);
 }  // namespace traffic
 
 }  // namespace lokahi

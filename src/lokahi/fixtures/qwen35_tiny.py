@@ -62,6 +62,7 @@ class TinyQwen35Spec:
     mlp_only_layers: tuple[int, ...] = ()  # Qwen3-Next
     norm_topk_prob: bool = True  # Qwen3-Next
     tie_word_embeddings: bool = False
+    qk_scale: float = 1.0  # scales the q and k channels' conv taps; small q and k make the L2 norm's epsilon matter
     mlx: bool = True  # False: Transformers' BF16 layout
     bits: int = 4
     group_size: int = 32
@@ -225,6 +226,7 @@ def write_tiny_qwen35(directory: Path, spec: TinyQwen35Spec = TinyQwen35Spec()) 
                 linear(f"{lin}.in_proj_b", hv, hidden, hidden**-0.5 * 2.0)
                 linear(f"{lin}.in_proj_a", hv, hidden, hidden**-0.5 * 2.0)
             conv = rng.normal(0.0, 0.5, (conv_dim, kernel)).astype(np.float32)
+            conv[: 2 * hk * dk] *= np.float32(spec.qk_scale)
             conv = conv[:, :, None] if spec.mlx else conv[:, None, :]
             tensors[f"{lin}.conv1d.weight"] = ("BF16", f32_to_bf16(conv))
             # Decays between about 0.4 and 0.95 per token so the state keeps

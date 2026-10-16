@@ -347,6 +347,9 @@ class DecoderMetal final : public Model {
   // ---- setup --------------------------------------------------------------
 
   void validate() const {
+    LK_CHECK(!c_.has_linear() && !c_.attn_output_gate && !c_.shared_expert_gate,
+             "metal: the Metal backend does not implement " + c_.architecture +
+                 " (Gated DeltaNet) yet; use --backend cpu");
     // Experts run only through the matrix-vector kernels, which also read
     // MXFP4; other matrices must be affine.
     auto check_any = [&](const Linear& l) {
