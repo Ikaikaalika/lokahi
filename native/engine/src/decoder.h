@@ -7,8 +7,8 @@
 // Gemma 4's per-layer geometry, KV sharing and per-layer inputs, DeepSeek's
 // multi-head latent attention, Qwen3.5's Gated DeltaNet layers and gated
 // attention, and mixture-of-experts layers), so a family is a config parser
-// rather than a fork. The CPU backend implements every option; the Metal
-// backend refuses Gated DeltaNet models and matrix formats its kernels lack.
+// rather than a fork. Both backends implement every option; the Metal backend
+// refuses only matrix formats its kernels lack.
 #pragma once
 
 #include <memory>
@@ -298,10 +298,13 @@ double attention(const DecoderConfig& config, int layer, int start, int n);
 // absorption, and its per-head expansions with o_proj.
 double latent_qkv(const DecoderConfig& config, const DecoderLayer& layer, int n);
 double latent_out(const DecoderLayer& layer, int n);
-// Gated DeltaNet's input projections, and its recurrence: every state read
-// and written once per pass, plus each token's q, k, v, gates and output.
+// Gated DeltaNet's input projections; its conv, q/k norms and gates; its
+// recurrence (every state read and written once per pass, plus each token's
+// q, k, v, gates and output); and its gated norm with out_proj.
 double linear_projections(const DecoderLayer& layer, int n);
+double linear_conv(const DecoderConfig& config, int n);
 double linear_recurrence(const DecoderConfig& config, int n);
+double linear_out(const DecoderConfig& config, const DecoderLayer& layer, int n);
 }  // namespace traffic
 
 }  // namespace lokahi

@@ -1,4 +1,5 @@
-// Metal backend for decoders (Gemma 3, Gemma 4, the Llama family and DeepSeek).
+// Metal backend for decoders (Gemma 3, Gemma 4, the Llama family, DeepSeek and
+// Qwen3.5).
 //
 // One serial compute encoder per command buffer runs a whole prefill (all
 // chunks) or one decode step: embedding, every layer, the last-row
@@ -111,6 +112,16 @@ struct GpuLayer {
   GpuExperts embed_q, unembed_out;
   bool absorbed = false;  // embed_q, rather than kv_b_proj's key rows
   BufRef q_a_norm, kv_a_norm;
+  // Gated DeltaNet (Qwen3.5, Qwen3-Next): Qwen3.5's four input projections or
+  // Qwen3-Next's two grouped ones, the conv taps, decay rates exp(A_log),
+  // dt_bias and the gated norm's weight, out_proj; and the conv history and
+  // states, double-buffered by position parity (see gdn_recurrence).
+  bool linear = false, grouped = false;
+  GpuLinear in_qkv, in_z, in_b, in_a, in_qkvz, in_ba, out_proj;
+  BufRef conv_taps, decay_rate, dt_bias, linear_norm;
+  std::array<id<MTLBuffer>, 2> conv_history = {nil, nil};
+  std::array<id<MTLBuffer>, 2> delta_state = {nil, nil};
+  GpuLinear shared_expert_gate;  // Qwen's [1, hidden] gate on the shared expert
   // A KV-shared layer's caches and capacity are its source layer's.
   id<MTLBuffer> k_cache = nil;
   id<MTLBuffer> v_cache = nil;
@@ -199,6 +210,13 @@ struct GatherParams { int rows; int cols; int k; int input_rows; int act; int ha
 struct AbsorbParams { int heads; int nope; int head_rows; int cols; int x_stride; int y_stride; };
 struct MlaRopeParams { int heads; int nope; int rope; int rank; int start_pos; float eps; int pairs; float factor; };
 struct MoeCombineParams { int cols; int k; int count; int has_shared; };
+struct GdnSplitParams { int key_heads; int key_dim; int ratio; int value_dim; int n; };
+struct GdnConvParams { int channels; int taps; int n; };
+struct GdnNormParams { int key_heads; int key_dim; int channels; float q_scale; };
+struct GdnGateParams { int value_heads; int count; };
+struct GdnRecurrenceParams { int key_heads; int value_heads; int key_dim; int value_dim; int channels; int n; };
+struct SplitGateParams { int head_dim; int count; };
+struct SigmoidScaleParams { int cols; int count; };
 struct MoeGroupedParams { int experts; int k; int groups; int topk_groups; int norm_topk; float scaling; int exclude; };
 struct DenseParams { int rows; int cols; int dtype; };
 struct AttnParams {
@@ -243,6 +261,7 @@ class DecoderMetal final : public Model {
       validate();
       upload();
       allocate_state();
+      zero_states();
     }
   }
 
@@ -260,6 +279,7 @@ class DecoderMetal final : public Model {
     drain();
     position_ = 0;
     injection_ = {};
+    zero_states();
   }
 
   const float* prefill(const int32_t* tokens, int n) override {
@@ -347,9 +367,13 @@ class DecoderMetal final : public Model {
   // ---- setup --------------------------------------------------------------
 
   void validate() const {
-    LK_CHECK(!c_.has_linear() && !c_.attn_output_gate && !c_.shared_expert_gate,
-             "metal: the Metal backend does not implement " + c_.architecture +
-                 " (Gated DeltaNet) yet; use --backend cpu");
+    if (c_.has_linear()) {
+      // The conv keeps its taps in registers, and each lane of the recurrence
+      // at most 8 rows of a state column.
+      LK_CHECK(c_.linear_conv <= 8, "metal: Gated DeltaNet is built for at most 8 conv taps");
+      LK_CHECK(c_.linear_k_dim <= 256 && c_.linear_v_dim <= 1024,
+               "metal: Gated DeltaNet is built for key heads up to 256 and value heads up to 1024 wide");
+    }
     // Experts run only through the matrix-vector kernels, which also read
     // MXFP4; other matrices must be affine.
     auto check_any = [&](const Linear& l) {
@@ -380,7 +404,16 @@ class DecoderMetal final : public Model {
     }
     for (int i = 0; i < c_.num_layers; ++i) {
       const DecoderLayer& L = w_->layers[static_cast<size_t>(i)];
-      for (const Linear* l : {&L.q_proj, &L.o_proj}) check(*l);
+      if (c_.is_linear(i)) {
+        const bool grouped = L.in_proj_qkvz.rows > 0;
+        for (const Linear* l : {&L.in_proj_qkvz, &L.in_proj_ba, &L.in_proj_qkv, &L.in_proj_z, &L.in_proj_b,
+                                &L.in_proj_a}) {
+          if ((l == &L.in_proj_qkvz || l == &L.in_proj_ba) == grouped) check(*l);
+        }
+        check(L.out_proj);
+      } else {
+        for (const Linear* l : {&L.q_proj, &L.o_proj}) check(*l);
+      }
       if (c_.mla()) {
         if (c_.q_lora_rank > 0) check(L.q_a_proj);
         check(L.kv_a_proj);
@@ -403,6 +436,7 @@ class DecoderMetal final : public Model {
         if (c_.shared_intermediate > 0) {
           for (const Linear* l : {&L.shared_gate, &L.shared_up, &L.shared_down}) check(*l);
         }
+        if (c_.shared_expert_gate) check(L.shared_expert_gate);
         for (const auto* experts : {&L.expert_gate, &L.expert_up, &L.expert_down}) {
           for (const Linear& e : *experts) check_any(e);
         }
@@ -418,7 +452,7 @@ class DecoderMetal final : public Model {
         check(L.per_layer_gate);
         check(L.per_layer_proj);
       }
-      if (c_.mla()) continue;  // no k/v projections; the latent's geometry is checked above
+      if (c_.mla() || c_.is_linear(i)) continue;  // no k/v projections
       if (!c_.shares_kv(i)) check(L.k_proj);
       if (!c_.shares_kv(i) && !c_.k_eq_v(i)) check(L.v_proj);
       const int dim = c_.head_dim_of(i), dpl = dim / 32;
@@ -528,10 +562,29 @@ class DecoderMetal final : public Model {
       G.own_kv = !c_.shares_kv(layer);
       G.k_eq_v = c_.k_eq_v(layer);
       G.scalar = L.layer_scalar;
-      G.q = add_linear(arena, L.q_proj, linear_fix, &G.q);
-      if (G.own_kv && !c_.mla()) G.k = add_linear(arena, L.k_proj, linear_fix, &G.k);
-      if (G.own_kv && !G.k_eq_v && !c_.mla()) G.v = add_linear(arena, L.v_proj, linear_fix, &G.v);
-      G.o = add_linear(arena, L.o_proj, linear_fix, &G.o);
+      G.linear = c_.is_linear(layer);
+      if (G.linear) {
+        G.grouped = L.in_proj_qkvz.rows > 0;
+        if (G.grouped) {
+          G.in_qkvz = add_linear(arena, L.in_proj_qkvz, linear_fix, &G.in_qkvz);
+          G.in_ba = add_linear(arena, L.in_proj_ba, linear_fix, &G.in_ba);
+        } else {
+          G.in_qkv = add_linear(arena, L.in_proj_qkv, linear_fix, &G.in_qkv);
+          G.in_z = add_linear(arena, L.in_proj_z, linear_fix, &G.in_z);
+          G.in_b = add_linear(arena, L.in_proj_b, linear_fix, &G.in_b);
+          G.in_a = add_linear(arena, L.in_proj_a, linear_fix, &G.in_a);
+        }
+        G.out_proj = add_linear(arena, L.out_proj, linear_fix, &G.out_proj);
+      } else {
+        G.q = add_linear(arena, L.q_proj, linear_fix, &G.q);
+        if (G.own_kv && !c_.mla()) G.k = add_linear(arena, L.k_proj, linear_fix, &G.k);
+        if (G.own_kv && !G.k_eq_v && !c_.mla()) G.v = add_linear(arena, L.v_proj, linear_fix, &G.v);
+        G.o = add_linear(arena, L.o_proj, linear_fix, &G.o);
+      }
+      add_optional(L.conv, &G.conv_taps);
+      add_optional(L.decay_rate, &G.decay_rate);
+      add_optional(L.dt_bias, &G.dt_bias);
+      add_optional(L.linear_norm, &G.linear_norm);
       if (c_.mla()) {
         if (c_.q_lora_rank > 0) G.q_a = add_linear(arena, L.q_a_proj, linear_fix, &G.q_a);
         G.kv_a = add_linear(arena, L.kv_a_proj, linear_fix, &G.kv_a);
@@ -561,6 +614,9 @@ class DecoderMetal final : public Model {
           G.shared_gate = add_linear(arena, L.shared_gate, linear_fix, &G.shared_gate);
           G.shared_up = add_linear(arena, L.shared_up, linear_fix, &G.shared_up);
           G.shared_down = add_linear(arena, L.shared_down, linear_fix, &G.shared_down);
+        }
+        if (c_.shared_expert_gate) {
+          G.shared_expert_gate = add_linear(arena, L.shared_expert_gate, linear_fix, &G.shared_expert_gate);
         }
         add_experts(arena, L.expert_gate, &G.expert_gate);
         add_experts(arena, L.expert_up, &G.expert_up);
@@ -641,6 +697,16 @@ class DecoderMetal final : public Model {
     for (size_t i = 0; i < layers_.size(); ++i) {
       GpuLayer& G = layers_[i];
       G.sliding = c_.layer_is_sliding[i];
+      if (G.linear) {  // no keys or values: the conv history and the states, two of each
+        const size_t history = static_cast<size_t>(c_.linear_conv - 1) * static_cast<size_t>(c_.linear_channels());
+        const size_t state = static_cast<size_t>(c_.linear_v_heads) * static_cast<size_t>(c_.linear_k_dim) *
+                             static_cast<size_t>(c_.linear_v_dim);
+        for (int parity = 0; parity < 2; ++parity) {
+          G.conv_history[static_cast<size_t>(parity)] = private_buffer(history * f);
+          G.delta_state[static_cast<size_t>(parity)] = private_buffer(state * f);
+        }
+        continue;
+      }
       if (c_.mla()) {  // one latent per position, whose prefix is also the value
         G.capacity = max_context_;
         G.k_cache = private_buffer(static_cast<size_t>(c_.latent_width()) * static_cast<size_t>(G.capacity) * f);
@@ -691,6 +757,22 @@ class DecoderMetal final : public Model {
       per_layer_proj_ = private_buffer(chunk * width * f);
       per_layer_gate_ = private_buffer(chunk * static_cast<size_t>(c_.per_layer_input) * f);
     }
+    if (c_.has_linear()) {
+      const size_t values = static_cast<size_t>(c_.linear_v_heads) * static_cast<size_t>(c_.linear_v_dim);
+      const size_t heads = static_cast<size_t>(c_.linear_v_heads);
+      mixed_ = private_buffer(chunk * static_cast<size_t>(c_.linear_channels()) * f);
+      lin_z_ = private_buffer(chunk * values * f);
+      lin_out_ = private_buffer(chunk * values * f);
+      lin_b_ = private_buffer(chunk * heads * f);
+      lin_a_ = private_buffer(chunk * heads * f);
+      grouped_ = private_buffer(chunk * (static_cast<size_t>(c_.linear_channels()) + values) * f);
+      grouped_ba_ = private_buffer(chunk * 2 * heads * f);
+    }
+    if (c_.attn_output_gate) {
+      q_gate_ = private_buffer(chunk * H * D * 2 * f);
+      out_gate_ = private_buffer(chunk * H * D * f);
+    }
+    if (c_.shared_expert_gate) shared_scale_ = private_buffer(chunk * f);
     if (c_.mla()) {
       const size_t width = static_cast<size_t>(c_.latent_width());
       latent_q_ = private_buffer(chunk * H * width * f);
@@ -713,6 +795,29 @@ class DecoderMetal final : public Model {
     inject_index_ = shared_buffer(static_cast<size_t>(max_context_) * sizeof(int32_t));
     if (c_.per_layer_input > 0) per_layer_tokens_ = shared_buffer(static_cast<size_t>(max_context_) * sizeof(int32_t));
     last_key_ = shared_buffer(static_cast<size_t>(max_context_) * sizeof(int32_t));
+  }
+
+  // Zeroes every conv history and state (private buffers start undefined).
+  void zero_states() {
+    if (!c_.has_linear()) return;
+    const int history = (c_.linear_conv - 1) * c_.linear_channels();
+    const int state = c_.linear_v_heads * c_.linear_k_dim * c_.linear_v_dim;
+    id<MTLCommandBuffer> cb = [queue_ commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pipeline("zero_floats")];
+    for (const GpuLayer& G : layers_) {
+      if (!G.linear) continue;
+      for (size_t parity = 0; parity < 2; ++parity) {
+        for (auto [buffer, count] : {std::pair{G.conv_history[parity], history}, std::pair{G.delta_state[parity], state}}) {
+          bind(enc, buffer, 0, 0);
+          bytes(enc, ElementwiseParams{count}, 1);
+          encode_elementwise(enc, count);
+        }
+      }
+    }
+    [enc endEncoding];
+    [cb commit];
+    wait(cb);
   }
 
   id<MTLComputePipelineState> pipeline(const std::string& name) {
@@ -853,9 +958,23 @@ class DecoderMetal final : public Model {
         threadsPerThreadgroup:MTLSizeMake(norm_threads(pso), 1, 1)];
   }
 
+  // q_proj into q_ (or, with an output gate, into q_gate_ and then split into
+  // q_ and out_gate_), and k and v into kt_ and vt_.
   void encode_qkv(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n) {
+    encode_qkv_into(enc, G, n, c_.attn_output_gate ? q_gate_ : q_);
+    if (!c_.attn_output_gate) return;
+    [enc setComputePipelineState:pipeline("split_query_gate")];
+    bind(enc, q_gate_, 0, 0);
+    bind(enc, q_, 0, 1);
+    bind(enc, out_gate_, 0, 2);
+    const int count = n * c_.num_heads * G.head_dim;
+    bytes(enc, SplitGateParams{G.head_dim, count}, 3);
+    encode_elementwise(enc, count);
+  }
+
+  void encode_qkv_into(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n, id<MTLBuffer> q_out) {
     if (!G.own_kv || G.k_eq_v) {  // queries only, or queries and the keys that double as values
-      encode_qmm(enc, G.q, h_, n, q_);
+      encode_qmm(enc, G.q, h_, n, q_out);
       if (G.own_kv) encode_qmm(enc, G.k, h_, n, kt_);
       return;
     }
@@ -865,7 +984,7 @@ class DecoderMetal final : public Model {
       bind_weights(enc, G.k, 3);
       bind_weights(enc, G.v, 6);
       bind(enc, h_, 0, 9);
-      bind(enc, q_, 0, 10);
+      bind(enc, q_out, 0, 10);
       bind(enc, kt_, 0, 11);
       bind(enc, vt_, 0, 12);
       bytes(enc, QkvParams{G.q.rows, G.k.rows, G.q.cols}, 13);
@@ -873,9 +992,104 @@ class DecoderMetal final : public Model {
           threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
       return;
     }
-    encode_qmm(enc, G.q, h_, n, q_);
+    encode_qmm(enc, G.q, h_, n, q_out);
     encode_qmm(enc, G.k, h_, n, kt_);
     encode_qmm(enc, G.v, h_, n, vt_);
+  }
+
+  // x[i] *= sigmoid(scales[i / cols]) over `count` values.
+  void encode_mul_sigmoid(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> x, id<MTLBuffer> scales, int cols, int count) {
+    [enc setComputePipelineState:pipeline("mul_sigmoid")];
+    bind(enc, x, 0, 0);
+    bind(enc, scales, 0, 1);
+    bytes(enc, SigmoidScaleParams{cols, count}, 2);
+    encode_elementwise(enc, count);
+  }
+
+  // ---- Gated DeltaNet -----------------------------------------------------
+
+  // The input projections into mixed_ ([q | k | v] channels), lin_z_, and the
+  // raw b and a in lin_b_ and lin_a_; Qwen3-Next's grouped rows are split.
+  void encode_gdn_projections(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n) {
+    if (!G.grouped) {
+      encode_qmm(enc, G.in_qkv, h_, n, mixed_);
+      encode_qmm(enc, G.in_z, h_, n, lin_z_);
+      encode_qmm(enc, G.in_b, h_, n, lin_b_);
+      encode_qmm(enc, G.in_a, h_, n, lin_a_);
+      return;
+    }
+    encode_qmm(enc, G.in_qkvz, h_, n, grouped_);
+    encode_qmm(enc, G.in_ba, h_, n, grouped_ba_);
+    const int hk = c_.linear_k_heads, ratio = c_.linear_v_heads / hk;
+    const int per_head = 2 * c_.linear_k_dim + 2 * ratio * c_.linear_v_dim + 2 * ratio;
+    [enc setComputePipelineState:pipeline("gdn_split")];
+    bind(enc, grouped_, 0, 0);
+    bind(enc, grouped_ba_, 0, 1);
+    bind(enc, mixed_, 0, 2);
+    bind(enc, lin_z_, 0, 3);
+    bind(enc, lin_b_, 0, 4);
+    bind(enc, lin_a_, 0, 5);
+    bytes(enc, GdnSplitParams{hk, c_.linear_k_dim, ratio, c_.linear_v_dim, n}, 6);
+    [enc dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(hk * per_head), static_cast<NSUInteger>(n), 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  }
+
+  // The conv (history from parity start % 2 to (start + n) % 2) and SiLU, the
+  // q/k L2 norms, and beta and the decay.
+  void encode_gdn_conv(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n, int start) {
+    const int channels = c_.linear_channels();
+    [enc setComputePipelineState:pipeline("gdn_conv")];
+    bind(enc, mixed_, 0, 0);
+    bind(enc, G.conv_taps, 1);
+    bind(enc, G.conv_history[static_cast<size_t>(start % 2)], 0, 2);
+    bind(enc, G.conv_history[static_cast<size_t>((start + n) % 2)], 0, 3);
+    bytes(enc, GdnConvParams{channels, c_.linear_conv, n}, 4);
+    encode_elementwise(enc, channels);
+    [enc setComputePipelineState:pipeline("gdn_qk_norm")];
+    bind(enc, mixed_, 0, 0);
+    bytes(enc, GdnNormParams{c_.linear_k_heads, c_.linear_k_dim, channels,
+                             1.0f / std::sqrt(static_cast<float>(c_.linear_k_dim))},
+          1);
+    [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(2 * c_.linear_k_heads), static_cast<NSUInteger>(n), 1)
+        threadsPerThreadgroup:MTLSizeMake(static_cast<NSUInteger>(c_.linear_k_dim), 1, 1)];
+    [enc setComputePipelineState:pipeline("gdn_gates")];
+    bind(enc, lin_b_, 0, 0);
+    bind(enc, lin_a_, 0, 1);
+    bind(enc, G.decay_rate, 2);
+    bind(enc, G.dt_bias, 3);
+    const int count = n * c_.linear_v_heads;
+    bytes(enc, GdnGateParams{c_.linear_v_heads, count}, 4);
+    encode_elementwise(enc, count);
+  }
+
+  void encode_gdn_recurrence(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n, int start) {
+    [enc setComputePipelineState:pipeline("gdn_recurrence")];
+    bind(enc, mixed_, 0, 0);
+    bind(enc, lin_b_, 0, 1);
+    bind(enc, lin_a_, 0, 2);
+    bind(enc, G.delta_state[static_cast<size_t>(start % 2)], 0, 3);
+    bind(enc, G.delta_state[static_cast<size_t>((start + n) % 2)], 0, 4);
+    bind(enc, lin_out_, 0, 5);
+    bytes(enc, GdnRecurrenceParams{c_.linear_k_heads, c_.linear_v_heads, c_.linear_k_dim, c_.linear_v_dim,
+                                   c_.linear_channels(), n},
+          6);
+    [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((c_.linear_v_dim + 3) / 4),
+                                          static_cast<NSUInteger>(c_.linear_v_heads), 1)
+        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+  }
+
+  // The gated norm per value head, then out_proj into r_.
+  void encode_gdn_out(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n) {
+    id<MTLComputePipelineState> pso = pipeline("gated_rms_norm_rows");
+    [enc setComputePipelineState:pso];
+    bind(enc, lin_out_, 0, 0);
+    bind(enc, G.linear_norm, 1);
+    bind(enc, lin_z_, 0, 2);
+    bytes(enc, NormParams{c_.linear_v_dim, c_.rms_norm_eps, 0.0f}, 3);
+    const NSUInteger threads = std::min<NSUInteger>(256, static_cast<NSUInteger>((c_.linear_v_dim + 31) / 32 * 32));
+    [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(n * c_.linear_v_heads), 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+    encode_qmm(enc, G.out_proj, lin_out_, n, r_);
   }
 
   void encode_rope(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n, int start) {
@@ -1164,6 +1378,10 @@ class DecoderMetal final : public Model {
         threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
     const bool shared = c_.shared_intermediate > 0;
     if (shared) encode_shared_expert(enc, G, n);
+    if (shared && c_.shared_expert_gate) {  // times sigmoid(shared_expert_gate(x))
+      encode_qmm(enc, G.shared_expert_gate, input, n, shared_scale_);
+      encode_mul_sigmoid(enc, shared_out_, shared_scale_, c_.hidden_size, n * c_.hidden_size);
+    }
     [enc setComputePipelineState:pipeline("moe_combine")];
     bind(enc, expert_out_, 0, 0);
     bind(enc, expert_weights_, 0, 1);
@@ -1216,7 +1434,8 @@ class DecoderMetal final : public Model {
                traffic::linear(L.expert_down[static_cast<size_t>(e)], m);
     }
     if (c_.shared_intermediate > 0) {
-      bytes += traffic::linear(L.shared_gate, n) + traffic::linear(L.shared_up, n) + traffic::linear(L.shared_down, n);
+      bytes += traffic::linear(L.shared_gate, n) + traffic::linear(L.shared_up, n) + traffic::linear(L.shared_down, n) +
+               (c_.shared_expert_gate ? traffic::linear(L.shared_expert_gate, n) : 0.0);
     }
     return bytes + traffic::rows(c_.hidden_size, n, 1);
   }
@@ -1303,7 +1522,16 @@ class DecoderMetal final : public Model {
       const GpuLayer& G = layers_[l];
       const DecoderLayer& L = w_->layers[l];
       const int layer = static_cast<int>(l);
-      if (c_.mla()) {
+      if (G.linear) {
+        encode_gdn_projections(enc, G, n);
+        section(enc, "qkv", profiling ? traffic::linear_projections(L, n) : 0.0);
+        encode_gdn_conv(enc, G, n, start);
+        section(enc, "rope_kv", profiling ? traffic::linear_conv(c_, n) : 0.0);
+        encode_gdn_recurrence(enc, G, n, start);
+        section(enc, "attention", profiling ? traffic::linear_recurrence(c_, n) : 0.0);
+        encode_gdn_out(enc, G, n);
+        section(enc, "o_proj", profiling ? traffic::linear_out(c_, L, n) : 0.0);
+      } else if (c_.mla()) {
         encode_latent_qkv(enc, G, n);
         section(enc, "qkv", profiling ? traffic::latent_qkv(c_, L, n) : 0.0);
         encode_latent_rope(enc, G, n, start);
@@ -1323,6 +1551,8 @@ class DecoderMetal final : public Model {
                 profiling ? traffic::rows(G.head_dim, n, 2 * c_.num_heads + (G.own_kv ? 4 * G.kv_heads : 0)) : 0.0);
         encode_attention(enc, G, n, start);
         section(enc, "attention", profiling ? traffic::attention(c_, layer, start, n) : 0.0);
+        const int gated = n * c_.num_heads * G.head_dim;
+        if (c_.attn_output_gate) encode_mul_sigmoid(enc, attn_, out_gate_, 1, gated);
         encode_qmm(enc, G.o, attn_, n, r_);
         if (c_.o_bias) {
           [enc setComputePipelineState:pipeline("add_bias_rows")];
@@ -1332,7 +1562,9 @@ class DecoderMetal final : public Model {
           bytes(enc, BiasParams{c_.hidden_size, count}, 2);
           encode_elementwise(enc, count);
         }
-        section(enc, "o_proj", profiling ? traffic::linear(L.o_proj, n) : 0.0);
+        section(enc, "o_proj",
+                profiling ? traffic::linear(L.o_proj, n) + (c_.attn_output_gate ? traffic::rows(gated, 1, 3) : 0.0)
+                          : 0.0);
       }
       encode_residual_norm(enc, G.attn_post_norm, &G.mlp_norm, n);
       section(enc, "residual_norm", residual_bytes);
@@ -1522,6 +1754,13 @@ class DecoderMetal final : public Model {
   // heads, latent width], the query latent [chunk, q_lora_rank], and each
   // (token, head) pair's head.
   id<MTLBuffer> latent_q_ = nil, latent_out_ = nil, q_latent_ = nil, head_index_ = nil;
+  // Gated DeltaNet: the [q | k | v] channels, z and the recurrence's outputs
+  // [chunk, Hv * dv], b (then beta) and a (then the decay) [chunk, Hv], and
+  // Qwen3-Next's grouped projections.
+  id<MTLBuffer> mixed_ = nil, lin_z_ = nil, lin_out_ = nil, lin_b_ = nil, lin_a_ = nil, grouped_ = nil, grouped_ba_ = nil;
+  // Gated attention: q_proj's [query | gate] rows and the gates; the shared
+  // expert's gate logits [chunk].
+  id<MTLBuffer> q_gate_ = nil, out_gate_ = nil, shared_scale_ = nil;
   std::vector<id<MTLCommandBuffer>> pending_;
   // The command buffer encode_forward is appending to (sections replace it
   // while profiling).

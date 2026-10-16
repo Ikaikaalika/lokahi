@@ -302,8 +302,21 @@ int cmd_generate(const Args& args) {
                                    !args.has("no-eos-stop"), &timing);
   std::string text;
   if (args.has("prompt")) text = ",\"text\":" + json_string(load_tokenizer(args).decode(generated, true));
-  std::printf("{\"backend\":\"%s\",\"tokens\":%s%s,\"prefill_seconds\":%.9f,\"decode_seconds\":%.9f}\n",
-              model->backend(), json_tokens(generated).c_str(), text.c_str(), timing.prefill_seconds,
+  // --continue N decodes N more tokens greedily after the generation, from its
+  // last token: after a stop, the model must resume from the tokens it kept
+  // (Metal discards the decode steps it launched past the stop).
+  std::string continued;
+  if (args.has("continue") && !generated.empty()) {
+    std::vector<int32_t> more;
+    int32_t token = generated.back();
+    for (int i = 0; i < args.get_int("continue", 0); ++i) {
+      token = argmax(model->decode(token), model->vocab_size());
+      more.push_back(token);
+    }
+    continued = ",\"continued\":" + json_tokens(more);
+  }
+  std::printf("{\"backend\":\"%s\",\"tokens\":%s%s%s,\"prefill_seconds\":%.9f,\"decode_seconds\":%.9f}\n",
+              model->backend(), json_tokens(generated).c_str(), text.c_str(), continued.c_str(), timing.prefill_seconds,
               timing.decode_seconds);
   return 0;
 }

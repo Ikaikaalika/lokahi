@@ -1224,6 +1224,17 @@ double linear_projections(const DecoderLayer& L, int n) {
   return linear(L.in_proj_qkv, n) + linear(L.in_proj_z, n) + linear(L.in_proj_b, n) + linear(L.in_proj_a, n);
 }
 
+double linear_conv(const DecoderConfig& c, int n) {
+  const int64_t channels = c.linear_channels(), taps = c.linear_conv;
+  return rows(channels, n, 2) + 4.0 * static_cast<double>(channels) * (2.0 * (taps - 1) + taps) +
+         rows(c.linear_v_heads, n, 4);
+}
+
+double linear_out(const DecoderConfig& c, const DecoderLayer& L, int n) {
+  return linear(L.out_proj, n) + rows(static_cast<int64_t>(c.linear_v_heads) * c.linear_v_dim, n, 3) +
+         4.0 * c.linear_v_dim;
+}
+
 double linear_recurrence(const DecoderConfig& c, int n) {
   const double state = static_cast<double>(c.linear_v_heads) * c.linear_k_dim * c.linear_v_dim;
   const double per_token = 2.0 * c.linear_k_heads * c.linear_k_dim + 2.0 * c.linear_v_heads * c.linear_v_dim +
@@ -1858,9 +1869,7 @@ class DecoderCpu final : public Model {
       }
     }
     {
-      Section section(profiler_, "rope_kv",
-                      profiling ? traffic::rows(C, n, 2) + 4.0 * C * (2.0 * (taps - 1) + taps) + traffic::rows(Hv, n, 4)
-                                : 0.0);
+      Section section(profiler_, "rope_kv", profiling ? traffic::linear_conv(c_, n) : 0.0);
       // The causal depthwise conv over the pass's inputs, preceded by the
       // layer's last taps - 1, then SiLU.
       std::vector<float>& state = conv_state_[static_cast<size_t>(l)];
@@ -1945,8 +1954,7 @@ class DecoderCpu final : public Model {
         }
       });
     }
-    Section section(profiler_, "o_proj",
-                    profiling ? traffic::linear(L.out_proj, n) + traffic::rows(values, n, 3) + 4.0 * dv : 0.0);
+    Section section(profiler_, "o_proj", profiling ? traffic::linear_out(c_, L, n) : 0.0);
     // The gated norm per value head: rms(o) * w * silu(z), with a plain weight.
     for (size_t row = 0; row < sn * Hv; ++row) {
       float* o = linear_out_.data() + row * dv;
