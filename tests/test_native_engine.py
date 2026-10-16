@@ -198,6 +198,12 @@ DEEPSEEK_VARIANTS = {
         model_type="deepseek_v2", num_attention_heads=8, kv_lora_rank=512, q_lora_rank=None, qk_nope_head_dim=128,
         qk_rope_head_dim=64, v_head_dim=128, norm_topk_prob=False, n_shared_experts=2, rope_scaling=DEEPSEEK_V2_YARN,
         group_size=64, seed=20),
+    # GLM-4.7-Flash (glm4_moe_lite): V3 with a query rank, absorbed tensors,
+    # values wider than the unrotated keys (as 256 against 192), top-4 times
+    # 1.8, rms_norm_eps 1e-5, no YaRN.
+    "glm4.7-flash-shape": TinyDeepseekSpec(
+        model_type="glm4_moe_lite", absorbed=True, qk_nope_head_dim=64, v_head_dim=96, num_experts_per_tok=4,
+        routed_scaling_factor=1.8, rms_norm_eps=1e-5, rope_theta=1e6, rope_scaling=None, seed=21),
 }
 VARIANTS = sorted(GEMMA3_VARIANTS) + sorted(GEMMA4_VARIANTS) + sorted(DENSE_VARIANTS) + sorted(DEEPSEEK_VARIANTS)
 
@@ -702,7 +708,7 @@ def test_deepseek_fixtures_route_far_from_ties_and_exercise_every_feature(tmp_pa
             used.update(chosen.ravel().tolist())
             logits = (x @ oracle.w[f"model.layers.{layer}.mlp.gate"].T).astype(np.float64)
             selection = oracle.selection(layer, x)
-            if cfg.model_type == "deepseek_v3":
+            if cfg.model_type != "deepseek_v2":
                 raw = 1.0 / (1.0 + np.exp(-logits))
                 corrected = raw + oracle.w[f"model.layers.{layer}.mlp.gate.e_score_correction_bias"]
                 group_scores = -np.sort(-corrected.reshape(len(x), groups, per_group), axis=-1)[..., :2].sum(axis=-1)
@@ -723,7 +729,7 @@ def test_deepseek_fixtures_route_far_from_ties_and_exercise_every_feature(tmp_pa
         assert used == set(range(cfg.n_routed_experts)), name
         if groups > 1:
             assert changed["groups"] > 0, name
-        if cfg.model_type == "deepseek_v3":
+        if cfg.model_type != "deepseek_v2":
             assert changed["bias"] > 0, name
             if groups > 1:
                 assert changed["zero"] > 0, name
@@ -764,6 +770,35 @@ def test_latent_norms_keep_their_own_epsilon(native_cli, backend, tmp_path, monk
     got = np.fromfile(out, dtype=np.float32).reshape(report["rows"], spec.vocab_size)
     tolerance = 2e-4 if backend == "cpu" else 2e-2
     np.testing.assert_allclose(got, expected[-1:], atol=tolerance * np.abs(expected).max(), rtol=0)
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"partial_rotary_factor": 0.5}, "glm4_moe_lite: partial_rotary_factor is not supported"),
+        ({"first_k_dense_replace": 2}, "glm4_moe_lite: first_k_dense_replace other than 1 needs mlp_layer_types"),
+        ({"mlp_layer_types": ["dense", "moe", "sparse"]}, "glm4_moe_lite: mlp_layer_types entries must be dense or sparse"),
+        ({"mlp_layer_types": ["dense", "sparse"]}, "glm4_moe_lite: mlp_layer_types length mismatch"),
+    ],
+)
+def test_unsupported_glm4_moe_lite_configurations_fail_closed(native_cli, tmp_path, change, message):
+    directory = write_tiny_deepseek(tmp_path / "model", TinyDeepseekSpec(model_type="glm4_moe_lite", extra=change))
+    assert message in _load_error(native_cli, directory)
+
+
+def test_glm4_moe_lite_reads_mlp_layer_types(native_cli, tmp_path):
+    # Transformers lists GLM-4.7-Flash's dense and sparse layers in
+    # mlp_layer_types; here the middle layer is dense.
+    spec = replace(DEEPSEEK_VARIANTS["glm4.7-flash-shape"], mlp_layer_types=("dense", "dense", "sparse"))
+    directory = write_tiny_deepseek(tmp_path / "model", spec)
+    oracle = DeepseekReference.load(directory)
+    assert [oracle.config.sparse(i) for i in range(3)] == [False, False, True]
+    out = tmp_path / "logits.bin"
+    report = _run(native_cli, "logits", "--model", str(directory), "--backend", "cpu",
+                  "--tokens", ",".join(map(str, TOKENS)), "--prefill", str(len(TOKENS)), "--out", str(out))
+    got = np.fromfile(out, dtype=np.float32).reshape(report["rows"], spec.vocab_size)
+    expected = oracle.logits(TOKENS)[-1:]
+    np.testing.assert_allclose(got, expected, atol=2e-4 * np.abs(expected).max(), rtol=0)
 
 
 def test_kimi_k2_reads_as_deepseek_v3(native_cli, tmp_path):

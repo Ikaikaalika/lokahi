@@ -1,4 +1,4 @@
-"""Write tiny, randomly initialized DeepSeek V2 and V3 checkpoints.
+"""Write tiny, randomly initialized DeepSeek V2 and V3 (and GLM-4.7-Flash) checkpoints.
 
 The tensor names and layouts are those of the checkpoints the engine reads:
 ``mlx-community``'s affine-quantized conversions, whose attention keeps
@@ -54,6 +54,7 @@ class TinyDeepseekSpec:
     norm_topk_prob: bool = True
     routed_scaling_factor: float = 1.0
     first_k_dense_replace: int = 1
+    mlp_layer_types: tuple[str, ...] | None = None  # GLM-4.7-Flash's per-layer "dense" or "sparse"
     correction_bias_mean: float = 0.0
     latent_scale: float = 1.0  # scales q_a_proj and kv_a_proj, so small latents make the norms' epsilon matter
     absorbed: bool = False  # MLX's embed_q and unembed_out instead of kv_b_proj
@@ -64,14 +65,18 @@ class TinyDeepseekSpec:
     extra: dict = field(default_factory=dict)
 
     def sparse(self, layer: int) -> bool:
+        if self.mlp_layer_types is not None:
+            return self.mlp_layer_types[layer] == "sparse"
         return layer >= self.first_k_dense_replace
 
     def config(self) -> dict:
-        v3 = self.model_type == "deepseek_v3"
-        if self.model_type not in ("deepseek_v2", "deepseek_v3"):
+        architectures = {"deepseek_v2": "DeepseekV2ForCausalLM", "deepseek_v3": "DeepseekV3ForCausalLM",
+                         "glm4_moe_lite": "Glm4MoeLiteForCausalLM"}
+        if self.model_type not in architectures:
             raise ValueError(f"unknown model_type {self.model_type!r}")
+        v3 = self.model_type != "deepseek_v2"
         config = {
-            "architectures": ["DeepseekV3ForCausalLM" if v3 else "DeepseekV2ForCausalLM"],
+            "architectures": [architectures[self.model_type]],
             "model_type": self.model_type,
             "vocab_size": self.vocab_size,
             "hidden_size": self.hidden_size,
@@ -110,6 +115,11 @@ class TinyDeepseekSpec:
         }
         if v3:
             config["num_nextn_predict_layers"] = 0
+        if self.model_type == "glm4_moe_lite":
+            config["partial_rotary_factor"] = 1.0
+            del config["scoring_func"]  # GLM-4.7-Flash's config leaves it out
+        if self.mlp_layer_types is not None:
+            config["mlp_layer_types"] = list(self.mlp_layer_types)
         if self.rope_interleave is not None:
             config["rope_interleave"] = self.rope_interleave
         if self.bits:
@@ -181,7 +191,7 @@ def write_tiny_deepseek(directory: Path, spec: TinyDeepseekSpec = TinyDeepseekSp
         # wide one keeps the top-k choice far from ties.
         tensors[f"{base}.mlp.gate.weight"] = (
             "BF16", f32_to_bf16(rng.normal(0.0, hidden**-0.5 * 4.0, (experts, hidden)).astype(np.float32)))
-        if spec.model_type == "deepseek_v3":
+        if spec.model_type != "deepseek_v2":
             tensors[f"{base}.mlp.gate.e_score_correction_bias"] = (
                 "F32", rng.normal(spec.correction_bias_mean, 0.3, experts).astype(np.float32))
         if spec.stacked_experts:

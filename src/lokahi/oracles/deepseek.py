@@ -1,7 +1,9 @@
 """NumPy reference for DeepSeek V2 and V3: multi-head latent attention and DeepSeek MoE.
 
 Semantics follow Transformers' ``DeepseekV2ForCausalLM`` and
-``DeepseekV3ForCausalLM`` (Kimi K2 and Moonlight use the V3 architecture):
+``DeepseekV3ForCausalLM`` (Kimi K2 and Moonlight use the V3 architecture),
+and ``Glm4MoeLiteForCausalLM`` (GLM-4.7-Flash), which is V3 with its dense
+and sparse layers listed in ``mlp_layer_types`` (by default the first dense):
 
 * multi-head latent attention: each head's query is ``q_proj(x)``, or
   ``q_b_proj(rms(q_a_proj(x)))`` with a query rank, split into
@@ -45,7 +47,7 @@ import numpy as np
 
 from .gemma3 import load_dense_weights
 
-FAMILIES = ("deepseek_v2", "deepseek_v3")
+FAMILIES = ("deepseek_v2", "deepseek_v3", "glm4_moe_lite")
 LATENT_NORM_EPS = 1e-6
 
 
@@ -81,6 +83,7 @@ class DeepseekConfig:
     topk_method: str
     norm_topk_prob: bool
     routed_scaling_factor: float
+    mlp_layer_types: tuple[str, ...] = ()
 
     @classmethod
     def from_dict(cls, cfg: Mapping[str, Any]) -> "DeepseekConfig":
@@ -92,7 +95,13 @@ class DeepseekConfig:
         scaling = cfg.get("rope_scaling")
         if scaling and scaling.get("rope_type", scaling.get("type")) not in ("default", "yarn"):
             raise NotImplementedError(f"rope_scaling {scaling!r}")
-        v3 = model_type == "deepseek_v3"
+        v3 = model_type != "deepseek_v2"
+        if float(cfg.get("partial_rotary_factor", 1.0)) != 1.0:
+            raise NotImplementedError("partial_rotary_factor")
+        layers = int(cfg["num_hidden_layers"])
+        types = cfg.get("mlp_layer_types")
+        if model_type == "glm4_moe_lite" and types is None:
+            types = ["dense"] + ["sparse"] * (layers - 1)
         q_rank = cfg.get("q_lora_rank")
         return cls(
             model_type=model_type,
@@ -121,6 +130,7 @@ class DeepseekConfig:
             topk_method=str(cfg.get("topk_method") or ("noaux_tc" if v3 else "greedy")),
             norm_topk_prob=bool(cfg.get("norm_topk_prob", v3)),
             routed_scaling_factor=float(cfg.get("routed_scaling_factor") or 1.0),
+            mlp_layer_types=tuple(types or ()),
         )
 
     @property
@@ -128,6 +138,8 @@ class DeepseekConfig:
         return self.qk_nope_head_dim + self.qk_rope_head_dim
 
     def sparse(self, layer: int) -> bool:
+        if self.mlp_layer_types:
+            return self.mlp_layer_types[layer] == "sparse"
         return self.n_routed_experts > 0 and layer >= self.first_k_dense_replace
 
     def _yarn(self) -> Mapping[str, Any] | None:
@@ -287,7 +299,7 @@ class DeepseekReference:
         cfg = self.config
         logits = (x @ self.w[f"model.layers.{index}.mlp.gate"].T).astype(np.float64)
         tokens, groups = logits.shape[0], cfg.n_group
-        if cfg.model_type == "deepseek_v3":
+        if cfg.model_type != "deepseek_v2":
             scores = 1.0 / (1.0 + np.exp(-logits)) + self.w[f"model.layers.{index}.mlp.gate.e_score_correction_bias"]
             group_scores = -np.sort(-scores.reshape(tokens, groups, -1), axis=-1)[..., :2].sum(axis=-1)
             fill = -np.inf
@@ -309,7 +321,7 @@ class DeepseekReference:
         cfg = self.config
         chosen = np.argsort(-self.selection(index, x), axis=-1, kind="stable")[:, : cfg.num_experts_per_tok]
         logits = (x @ self.w[f"model.layers.{index}.mlp.gate"].T).astype(np.float64)
-        if cfg.model_type == "deepseek_v3":
+        if cfg.model_type != "deepseek_v2":
             weights = np.take_along_axis(1.0 / (1.0 + np.exp(-logits)), chosen, axis=-1)
             if cfg.norm_topk_prob:
                 weights /= weights.sum(axis=-1, keepdims=True) + 1e-20
