@@ -26,6 +26,7 @@ set(LOKAHI_CORE_SOURCES
   src/json.cpp
   src/model.cpp
   src/quant.cpp
+  src/qwen3_5_vision.cpp
   src/regex.cpp
   src/safetensors.cpp
   src/sampling.cpp

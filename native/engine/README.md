@@ -29,6 +29,7 @@ cmake --build build/engine -j
 | Decoders on Metal (every family above) | Implemented; correctness verified on a virtual GPU | Hosted macOS CI runs the Metal suites against the oracles on its paravirtual device (correctness only, no performance claims); hardware runs wait for the self-hosted runner. Gemma 4 covers 512-wide heads, KV sharing, `attention_k_eq_v`, the V norm, partial RoPE, per-layer inputs and layer scalars. Mixture-of-experts layers route on the GPU (`moe_route`) and run each token's experts with gathered matrix-vector kernels over stacked expert weights, affine or MXFP4. GPT-OSS adds sinks in the attention reduction, attention and expert biases and the clamped SwiGLU; GLM-4.5 adds a dense router kernel, grouped sigmoid routing (`moe_route_grouped`), the shared expert and classic partial RoPE. Gemma 4 26B-A4B runs its experts beside the dense MLP, routing on its own normed input with per-expert weight scales (`moe_route`), and sums the two post-normed branches (`residual_norm_rows`). Qwen3.5 and Qwen3-Next run Gated DeltaNet in five kernels: Qwen3-Next's grouped projections are split (`gdn_split`); the causal conv and SiLU run one thread per channel (`gdn_conv`); q and k are L2-normalized (`gdn_qk_norm`); beta and the decay are computed (`gdn_gates`); each simdgroup runs one value column of a head's state over the pass, with its rows spread across the lanes (`gdn_recurrence`); then the gated norm (`gated_rms_norm_rows`) and `out_proj`. The conv histories and states are double-buffered by position parity, so a decode step launched past a stop token and discarded never overwrites the state the next step reads; full attention gates its output and the shared expert is gated (`mul_sigmoid`). DeepSeek's latent attention absorbs each head's query with the gathered matrix-vector kernel over MLX's `embed_q`, or straight from `kv_b_proj`'s quantized key rows (`qmv_t_heads`), writes normed, rotated latents into a 576-float cache per token (`mla_rope_store`), attends with the split-key kernel four query heads at a time over the one latent key head (`attn_partial_g4_d18`), and expands each head's output with the gathered kernel; V2's group-limited softmax routing (`moe_route`) and V3's group exclusion (`moe_route_grouped`) run on the GPU for up to 512 experts (Kimi K2 has 384). Unquantized (BF16) checkpoints run on the CPU. MXFP4 outside experts is refused (`--backend auto` picks the CPU) until the prefill matrix kernel and embedding gather read it |
 | Gemma 3 images on CPU and Metal (SigLIP tower and projector, `src/vision.h`, `src/metal/metal_vision.mm`; `--images`, `lokahi image-features`) | Implemented; Metal verified for correctness on a virtual GPU | Correctness: features, logits and greedy tokens match the NumPy oracle (`oracles/siglip.py`, Transformers' semantics) on a tiny vision-language fixture in mlx-community's layout, with prefill chunks that would cut an image, a window shorter than an image, and both convolution layouts; every mutant of the masks, the injection, the chunking and the tower fails the suite (`tests/test_gemma3_vision.py`). The published 4B config parses (`tests/engine_tests.cpp`). Hosted CI's virtual GPU checks the Metal encoder and the Metal decoder's injections against the same oracle, including matrix products over several tiles (correctness only). The CPU encoder is a correctness path: 896-pixel images cost about 5 TFLOP on its scalar matmul |
 | Gemma 4 images on CPU and Metal (variable-resolution tower, `src/gemma4_vision.h`) | Implemented; Metal verified for correctness on a virtual GPU | Correctness: features, logits and greedy tokens match the NumPy oracle (`oracles/gemma4_vision.py`, Transformers' semantics) on a tiny fixture in mlx-community's 31B layout (BF16 tower, quantized embedder): two aspect ratios, chunked prefills that would cut an image, a window shorter than an image, and causal images without `use_bidirectional_attention: "vision"`. Every mutant of the block rule, the 2-D RoPE, the norms, the pooling, the scaling and the patches fails the suite (`tests/test_gemma4_vision.py`); the published 31B config and processor sizes parse. Hosted CI's virtual GPU runs the same tests on the Metal encoder and decoder (correctness only). E2B/E4B (per-layer inputs) look up the pad token's per-layer embedding at image positions and project the features, as Transformers does |
+| Qwen3.5 images (Qwen3-VL's tower without deepstack on the CPU, `src/qwen3_5_vision.h`; interleaved M-RoPE in the CPU and Metal decoders) | Implemented; the decoder's Metal path awaits its first virtual-GPU run | Correctness: features, logits and greedy tokens match the NumPy oracle (`oracles/qwen3_5_vision.py`) for Qwen3.5 and Qwen3.5-MoE in both checkpoint layouts, with two images of opposite aspect, prefill passes that end inside an image, and decoding past them (`tests/test_qwen35_vision.py`). The fixture is guarded so that row positions, column positions, swapping them, and the offset of the text after an image each move the logits by more than the Metal tolerance, and every mutant of the positions, the planner, the config and the tower fails the suite. The oracle matches Transformers' `Qwen2VLImageProcessorPil` (resize rule and patch layout) and MLX-VLM 0.4.4 (tower, positions and single-image logits; `tests/test_mlx_vlm_crosscheck.py`). The published 0.8B vision and RoPE configs parse (`tests/engine_tests.cpp`) |
 | Oracles vs MLX-LM (`gemma3_text`, `gemma4`, `llama`, `qwen2`, `qwen3`, `qwen3_moe`, `gpt_oss`, `glm4_moe`, `glm4_moe_lite`, `deepseek_v2`, `deepseek_v3`, `qwen3_5`, `qwen3_5_moe`, `qwen3_next`) | Implemented | Correctness: hosted macOS CI runs `tests/test_mlx_crosscheck.py` against pinned MLX 0.32.3 and MLX-LM 0.32.0 in float32. MLX-LM adds the zero-centered norms' 1 to Transformers-layout BF16 weights in BF16, so those Qwen3.5 cases run on exact float32 copies of the weights |
 | MLX affine 2/4/8-bit weights, BF16/F16 scales, per-module bit overrides | Implemented | Unit tests; MLX cross-check on Apple Silicon |
 | MLX MXFP4 weights (E2M1 codes, E8M0 scale per 32; GPT-OSS's expert format), on CPU and in Metal's matrix-vector and expert kernels | Implemented | Correctness: unit tests against hand-computed rows, the OCP encodings, and oracle parity on MXFP4 MLPs and experts (`tests/test_native_engine.py`); `mx.dequantize` cross-check on Apple Silicon. Per-module overrides follow `mlx.nn.quantize`: keys an override omits take its mode's defaults. Metal reads MXFP4 experts (GPT-OSS) and refuses MXFP4 elsewhere, since its prefill matrix kernel and embedding gather are affine only |
@@ -123,8 +124,19 @@ then feeds `out_proj`. Each value head reads key head
 `h / (linear_num_value_heads / linear_num_key_heads)`. The full attention
 layers gate their output by `sigmoid` of a second half of each head's
 `q_proj` rows, norm q and k per head, and rotate halves within the first
-`partial_rotary_factor` (0.25) of each head (Qwen3.5's multimodal RoPE is
-plain RoPE for text). Every RMSNorm but the gated one is zero-centered,
+`partial_rotary_factor` (0.25) of each head. Qwen3.5's RoPE is interleaved
+M-RoPE: rotary frequency i reads a token's row position when `i % 3 == 1`
+and `i < 3 · mrope_section[1]`, its column position when `i % 3 == 2` and
+`i < 3 · mrope_section[2]`, and its temporal one otherwise. Text tokens'
+three positions coincide, so text alone sees plain RoPE. Image tokens take
+grid coordinates: an injection's `grids` gives each image's (rows,
+columns), and an image starting at RoPE position `s` takes
+`(s, s + row, s + column)`, row by row. The text after it continues at
+`s + max(rows, columns)`, and from then on RoPE positions run that far
+ahead of KV positions (`rope_offset`), through decoding and later
+prefills, until `reset`. A later prefill's images take the positions a full
+recompute of the conversation gives them (Transformers' cached path gives
+them plain positions instead). Every RMSNorm but the gated one is zero-centered,
 `x · rms · (1 + w)`; MLX conversions store `1 + w` and their conv weights as
 `[C, K, 1]` rather than `[C, 1, K]`, which is how the load tells them apart.
 Qwen3.5-MoE has experts in every layer, always renormalized; Qwen3-Next's
@@ -158,8 +170,10 @@ the prompt's runs of `image_token_index`, which `Model::inject` hands to the
 next prefill: the rows replace those tokens' scaled embeddings as they are,
 and each image's tokens also attend to its later tokens. The sliding window
 still applies, as in Transformers' `AND(window, OR(causal, block))`. A
-prefill pass never splits an image; images longer than `--prefill-chunk`
-fail closed. Both backends share these checks (`plan_injection`). Gemma 3
+prefill pass never splits such an image; images longer than
+`--prefill-chunk` fail closed. Models whose images stay causal (Gemma 4
+without bidirectional vision, Qwen3.5) let passes split images. Both
+backends share these checks (`plan_injection`). Gemma 3
 applies the image blocks on every layer; Gemma 4 only on sliding layers, and
 only with `use_bidirectional_attention: "vision"` (full layers stay causal, as
 Transformers' `create_masks_for_vision_model` builds them). Gemma 4's tower
@@ -172,6 +186,25 @@ reads the checkpoint's dense F32, F16 or BF16 weights as stored, including
 attention's: per head, `Q K^T`, a row softmax, then `P V`. MLX-VLM scales the features differently and builds no image
 mask, so the oracle follows Transformers, and there is no MLX cross-check for
 this path.
+
+Qwen3.5's tower takes images whose sides are multiples of
+`patch_size · spatial_merge_size` (32) and whose area lies within the
+processor's `shortest_edge` and `longest_edge` pixels (`image-geometry`
+follows `smart_resize`, which rounds half to even). The image is rescaled
+and normalized and its patches embedded by the Conv3d kernel summed over its
+two frames (an image's frames are equal). Learned positions are interpolated
+bilinearly from a square table. Each block applies LayerNorms, biased qkv,
+2-D RoPE over the whole head (rows, then columns) with every patch seeing
+every patch, and a tanh-GELU MLP; the merger concatenates each 2 × 2 square
+of patches through an exact-GELU MLP into the text width. Patches run in
+merge-block order, so the image's tokens fill its merged grid row by row.
+The encoder reports that grid (`token_grid`), which `place_images` passes
+in the injection for the decoder's M-RoPE positions. The tower runs on the
+CPU whichever decoder backend is chosen, and `image-features` reports
+`"backend": "cpu"`. MLX-VLM 0.4.4 places a second image's positions
+differently from Transformers (it sums every `vision_start` index), so
+multi-image prompts follow Transformers and are cross-checked with MLX-VLM
+for one image only.
 
 **Loading.** Checkpoints are memory-mapped safetensors (single file or
 shards) in MLX layout. The Metal backend copies every matrix once into a few

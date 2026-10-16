@@ -1,6 +1,7 @@
 #include "decoder.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <functional>
 #include <limits>
@@ -589,6 +590,30 @@ DecoderConfig qwen3_5_config(const Json& raw) {
   c.rotary_dim = static_cast<int>(c.head_dim * rope.number_or("partial_rotary_factor", 0.25));
   LK_CHECK(c.rotary_dim > 0 && c.rotary_dim <= c.head_dim && c.rotary_dim % 2 == 0,
            arch + ": partial_rotary_factor must rotate an even number of dimensions");
+  if (!next) {
+    // Interleaved M-RoPE, as Transformers and MLX-VLM apply it whatever
+    // mrope_interleaved says (so a false one, meant for chunked sections, is
+    // refused): frequency i reads the row position when i % 3 == 1 and
+    // i < 3 * section[1], the column position when i % 3 == 2 and
+    // i < 3 * section[2], and the temporal one otherwise.
+    const Json* interleaved = rope.find("mrope_interleaved");
+    LK_CHECK(interleaved == nullptr || interleaved->is_null() || (interleaved->is_bool() && interleaved->as_bool()),
+             arch + ": only interleaved M-RoPE is supported");
+    std::vector<int> section = {11, 11, 10};  // the references' default
+    if (const Json* given = rope.find("mrope_section"); given != nullptr && !given->is_null()) {
+      LK_CHECK(given->is_array() && given->as_array().size() == 3, arch + ": mrope_section must have 3 entries");
+      for (size_t axis = 0; axis < 3; ++axis) {
+        section[axis] = static_cast<int>(given->as_array()[axis].as_int());
+        LK_CHECK(section[axis] >= 0, arch + ": mrope_section entries must not be negative");
+      }
+    }
+    c.rope_axes.assign(static_cast<size_t>(c.rotary_dim / 2), 0);
+    for (int axis = 1; axis <= 2; ++axis) {
+      for (int i = axis; i < std::min(3 * section[static_cast<size_t>(axis)], c.rotary_dim / 2); i += 3) {
+        c.rope_axes[static_cast<size_t>(i)] = axis;
+      }
+    }
+  }
 
   // Transformers reads layer_types, MLX-LM only full_attention_interval.
   const int interval = static_cast<int>(cfg.int_or("full_attention_interval", 4));
@@ -1351,6 +1376,7 @@ class DecoderCpu final : public Model {
   const std::vector<int32_t>& eos_token_ids() const override { return c_.eos_token_ids; }
   void reset() override {
     position_ = 0;
+    rope_offset_ = 0;
     injection_ = {};
     // Keys and values are rewritten before they are read; recurrent states
     // are not.
@@ -1384,7 +1410,8 @@ class DecoderCpu final : public Model {
   void begin_injection(int n) {
     active_ = std::move(injection_);
     injection_ = {};
-    plan_ = plan_injection(active_, position_, n, c_.hidden_size, chunk_);
+    plan_ = plan_injection(active_, position_, n, c_.hidden_size, chunk_, c_.injection_rules(rope_offset_));
+    rope_offset_ = plan_.rope_offset;  // for the tokens after this prefill
   }
 
   void end_injection() {
@@ -1396,6 +1423,18 @@ class DecoderCpu final : public Model {
   int injected_row(int pos) const {
     const int rel = pos - plan_.base;
     return rel >= 0 && rel < static_cast<int>(plan_.row.size()) ? plan_.row[static_cast<size_t>(rel)] : -1;
+  }
+
+  // The (temporal, row, column) RoPE positions of position `pos`: the plan's
+  // during an M-RoPE prefill with images, otherwise pos + rope_offset_ on
+  // every axis.
+  std::array<int, 3> rope_position(int pos) const {
+    const int rel = pos - plan_.base;
+    if (rel >= 0 && static_cast<size_t>(rel) * 3 < plan_.rope.size()) {
+      const int32_t* at = plan_.rope.data() + static_cast<size_t>(rel) * 3;
+      return {at[0], at[1], at[2]};
+    }
+    return {pos + rope_offset_, pos + rope_offset_, pos + rope_offset_};
   }
 
   // The last key position `pos` attends to: itself, or the last position of
@@ -1428,6 +1467,24 @@ class DecoderCpu final : public Model {
       const double f = inv_freq[static_cast<size_t>(i)];
       if (f == 0.0) continue;  // a dimension partial rotation leaves alone
       const double angle = static_cast<double>(pos) * f;
+      const float cs = static_cast<float>(std::cos(angle));
+      const float sn = static_cast<float>(std::sin(angle));
+      const float a = vec[i], b = vec[i + half];
+      vec[i] = a * cs - b * sn;
+      vec[i + half] = b * cs + a * sn;
+    }
+  }
+
+  // RoPE at a token's three positions: frequency i reads the one on axis
+  // rope_axes[i] (always the first without M-RoPE).
+  void apply_rope(float* vec, int dims, const std::array<int, 3>& pos, const std::vector<double>& inv_freq) const {
+    const int half = dims / 2;
+    const std::vector<int>& axes = c_.rope_axes;
+    for (int i = 0; i < half; ++i) {
+      const double f = inv_freq[static_cast<size_t>(i)];
+      if (f == 0.0) continue;
+      const int axis = static_cast<size_t>(i) < axes.size() ? axes[static_cast<size_t>(i)] : 0;
+      const double angle = static_cast<double>(pos[static_cast<size_t>(axis)]) * f;
       const float cs = static_cast<float>(std::cos(angle));
       const float sn = static_cast<float>(std::sin(angle));
       const float a = vec[i], b = vec[i + half];
@@ -1585,16 +1642,17 @@ class DecoderCpu final : public Model {
           const auto& inv_freq = sliding ? inv_freq_local_ : inv_freq_global_;
           const int rotated = c_.rotary_dim > 0 ? c_.rotary_dim : D;
           for (int t = 0; t < n; ++t) {
+            const std::array<int, 3> pos = rope_position(start + t);
             for (int hh = 0; hh < H; ++hh) {
               float* qv = q_.data() + (static_cast<size_t>(t) * H + hh) * D;
               if (c_.qk_norm) norm(qv, L.q_norm, D, qv);
-              apply_rope(qv, rotated, start + t, inv_freq);
+              apply_rope(qv, rotated, pos, inv_freq);
             }
             if (!own_kv) continue;
             for (int kv = 0; kv < KV; ++kv) {
               float* kvec = k_.data() + (static_cast<size_t>(t) * KV + kv) * D;
               if (c_.qk_norm) norm(kvec, L.k_norm, D, kvec);
-              apply_rope(kvec, rotated, start + t, inv_freq);
+              apply_rope(kvec, rotated, pos, inv_freq);
               if (c_.v_norm) {
                 float* vvec = v_.data() + (static_cast<size_t>(t) * KV + kv) * D;
                 rms_norm(vvec, nullptr, D, c_.rms_norm_eps, 0.0f, vvec);
@@ -2287,6 +2345,9 @@ class DecoderCpu final : public Model {
   int position_ = 0;
   size_t max_q_ = 0, max_kv_ = 0, max_inter_ = 0;  // per-token widths, the largest over layers
   std::vector<int> capacity_;                       // ring positions per layer; 0 for KV-shared layers
+  // How far RoPE positions run ahead of KV positions (M-RoPE: images move
+  // the text after them), until reset().
+  int rope_offset_ = 0;
   // The injection of the prefill in progress and its plan.
   PromptInjection active_;
   InjectionPlan plan_;

@@ -888,14 +888,32 @@ struct RopeParams {
   int qkv_bias;
   int v_norm;
   int rotary;  // dimensions RoPE rotates: head_dim, or fewer for classic partial RoPE (GLM)
+  // M-RoPE (Qwen3.5): frequency k reads the token's position on axis
+  // rope_axes[k]. The pass's positions come from rope_pos [n, 3] when
+  // rope_given, otherwise each is the KV position plus rope_offset.
+  int mrope;
+  int rope_given;
+  int rope_offset;
 };
+
+// A token's (temporal, row, column) RoPE positions.
+struct RopePos {
+  int t, r, c;
+};
+
+// The angle of rotary frequency k at a token's positions.
+inline float rope_angle(int k, RopePos pos, int mrope, const device int* axes, const device float* inv_freq) {
+  const int axis = mrope != 0 ? axes[k] : 0;
+  return float(axis == 1 ? pos.r : axis == 2 ? pos.c : pos.t) * inv_freq[k];
+}
 
 // Classic partial RoPE for value j of a normed head in `head`: rotate-half
 // within the first 2 * rh dimensions; the rest pass through.
-inline float rotate_partial(threadgroup const float* head, int j, int rh, int pos, const device float* inv_freq) {
+inline float rotate_partial(threadgroup const float* head, int j, int rh, RopePos pos, int mrope,
+                            const device int* axes, const device float* inv_freq) {
   if (j >= 2 * rh) return head[j];
   const int k = j < rh ? j : j - rh;
-  const float angle = float(pos) * inv_freq[k];
+  const float angle = rope_angle(k, pos, mrope, axes, inv_freq);
   const float cs = precise::cos(angle);
   const float sn = precise::sin(angle);
   return j < rh ? head[j] * cs - head[j + rh] * sn : head[j] * cs + head[j - rh] * sn;
@@ -913,6 +931,8 @@ kernel void qk_norm_rope_store(device float* q [[buffer(0)]],
                                const device float* q_bias [[buffer(9)]],
                                const device float* k_bias [[buffer(10)]],
                                const device float* v_bias [[buffer(11)]],
+                               const device int* rope_pos [[buffer(12)]],
+                               const device int* rope_axes [[buffer(13)]],
                                uint2 tgp [[threadgroup_position_in_grid]],
                                uint2 tid2 [[thread_position_in_threadgroup]],
                                uint2 tpg2 [[threads_per_threadgroup]],
@@ -927,6 +947,8 @@ kernel void qk_norm_rope_store(device float* q [[buffer(0)]],
   const int t = int(tgp.y);
   const int half_dim = p.head_dim / 2;
   const int pos = p.start_pos + t;
+  const RopePos rpos = p.rope_given != 0 ? RopePos{rope_pos[3 * t], rope_pos[3 * t + 1], rope_pos[3 * t + 2]}
+                                         : RopePos{pos + p.rope_offset, pos + p.rope_offset, pos + p.rope_offset};
   const bool is_q = head < p.heads;
   const int kvh = head - p.heads;
   const device float* src = is_q ? q + (t * p.heads + head) * p.head_dim
@@ -950,7 +972,7 @@ kernel void qk_norm_rope_store(device float* q [[buffer(0)]],
   }
   float ra, rb;
   if (p.rotary == p.head_dim) {
-    const float angle = float(pos) * inv_freq[i];
+    const float angle = rope_angle(i, rpos, p.mrope, rope_axes, inv_freq);
     const float cs = precise::cos(angle);
     const float sn = precise::sin(angle);
     ra = na * cs - nb * sn;
@@ -959,8 +981,8 @@ kernel void qk_norm_rope_store(device float* q [[buffer(0)]],
     normed[i] = na;
     normed[i + half_dim] = nb;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    ra = rotate_partial(normed, i, p.rotary / 2, pos, inv_freq);
-    rb = rotate_partial(normed, i + half_dim, p.rotary / 2, pos, inv_freq);
+    ra = rotate_partial(normed, i, p.rotary / 2, rpos, p.mrope, rope_axes, inv_freq);
+    rb = rotate_partial(normed, i + half_dim, p.rotary / 2, rpos, p.mrope, rope_axes, inv_freq);
   }
   if (is_q) {
     device float* dst = q + (t * p.heads + head) * p.head_dim;

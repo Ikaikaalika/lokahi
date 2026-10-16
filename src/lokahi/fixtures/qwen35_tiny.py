@@ -48,6 +48,7 @@ class TinyQwen35Spec:
     head_dim: int = 64
     partial_rotary_factor: float = 0.25
     rope_theta: float = 10_000_000.0
+    mrope_section: tuple[int, ...] = (3, 3, 2)  # sums to the 8 rotary frequencies, as 11 + 11 + 10 does to 32
     linear_num_key_heads: int = 2
     linear_num_value_heads: int = 4
     linear_key_head_dim: int = 32
@@ -124,7 +125,7 @@ class TinyQwen35Spec:
                         decoder_sparse_step=self.decoder_sparse_step, mlp_only_layers=list(self.mlp_only_layers),
                         norm_topk_prob=self.norm_topk_prob, intermediate_size=self.intermediate_size)
         else:
-            text["rope_parameters"] = {**rope, "mrope_section": [11, 11, 10], "mrope_interleaved": True}
+            text["rope_parameters"] = {**rope, "mrope_section": list(self.mrope_section), "mrope_interleaved": True}
             text.update(attn_output_gate=True, mlp_only_layers=[], mamba_ssm_dtype="float32")
         if self.model_type == "qwen3_5":
             text["intermediate_size"] = self.intermediate_size

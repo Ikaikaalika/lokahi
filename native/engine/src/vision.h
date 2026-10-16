@@ -4,8 +4,9 @@
 // Each model family's encoder computes its processor's normalization, its
 // vision tower and its projector into the text width, as Transformers does:
 // Gemma 3's SigLIP (siglip.h) and Gemma 4's tower (gemma4_vision.h), on the
-// CPU or, through metal/metal_vision.h, the GPU. Images arrive already
-// resized to a size the model takes (target_size says which).
+// CPU or, through metal/metal_vision.h, the GPU, and Qwen3.5's
+// (qwen3_5_vision.h) on the CPU. Images arrive already resized to a size the
+// model takes (target_size says which).
 #pragma once
 
 #include <cstdint>
@@ -53,6 +54,9 @@ class VisionEncoder {
   // Feature rows of an image of this size; fails closed on a size the model
   // does not take.
   virtual int tokens_for(int width, int height) const = 0;
+  // The (rows, columns) an image's tokens fill, row by row, for models whose
+  // decoder positions follow it (Qwen3.5's M-RoPE); {0, 0} for the others.
+  virtual std::pair<int, int> token_grid(int /*width*/, int /*height*/) const { return {0, 0}; }
   // An image at an accepted size to its features [tokens_for(width, height),
   // text_hidden_size].
   virtual std::vector<float> encode(const Image& image) = 0;
@@ -60,8 +64,10 @@ class VisionEncoder {
 
 // Places images' features at the runs of `image_token` in `tokens`, a prompt
 // whose first token sits at position `start`: image i fills the next
-// features[i].size() / width tokens, which become its block.
+// features[i].size() / width tokens, which become its block. `grids`, when
+// not empty, gives each image's token_grid.
 PromptInjection place_images(const std::vector<int32_t>& tokens, int start, int image_token, int width,
-                             const std::vector<std::vector<float>>& features);
+                             const std::vector<std::vector<float>>& features,
+                             const std::vector<std::pair<int, int>>& grids = {});
 
 }  // namespace lokahi

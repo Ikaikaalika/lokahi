@@ -31,12 +31,17 @@ int InjectionPlan::pass_length(int start, int count) const {
   return count;
 }
 
-InjectionPlan plan_injection(const PromptInjection& injection, int base, int n, int width, int chunk) {
+InjectionPlan plan_injection(const PromptInjection& injection, int base, int n, int width, int chunk,
+                             const InjectionRules& rules) {
   InjectionPlan plan;
   plan.base = base;
+  plan.rope_offset = rules.rope_offset;
   if (injection.empty()) return plan;
   LK_CHECK(injection.rows.size() == injection.positions.size() * static_cast<size_t>(width),
            "injected rows must be hidden_size wide");
+  LK_CHECK(rules.mrope || injection.grids.empty(), "this model's positions do not follow image grids");
+  LK_CHECK(!rules.mrope || injection.grids.size() == injection.blocks.size(),
+           "this model's positions follow each image's grid: give one grid per image block");
   plan.row.assign(static_cast<size_t>(n), -1);
   plan.last_key.resize(static_cast<size_t>(n));
   for (int t = 0; t < n; ++t) plan.last_key[static_cast<size_t>(t)] = base + t;
@@ -46,18 +51,50 @@ InjectionPlan plan_injection(const PromptInjection& injection, int base, int n, 
     LK_CHECK(plan.row[static_cast<size_t>(rel)] < 0, "an image position is given twice");
     plan.row[static_cast<size_t>(rel)] = static_cast<int>(i);
   }
-  std::vector<bool> taken(static_cast<size_t>(n), false);
-  for (const auto& [begin, end] : injection.blocks) {
+  std::vector<int> block_of(static_cast<size_t>(n), -1);
+  for (size_t b = 0; b < injection.blocks.size(); ++b) {
+    const auto [begin, end] = injection.blocks[b];
     LK_CHECK(begin >= base && begin < end && end <= base + n, "image blocks must fall inside the prefill");
+    for (int pos = begin; pos < end; ++pos) {
+      LK_CHECK(block_of[static_cast<size_t>(pos - base)] < 0, "image blocks overlap");
+      block_of[static_cast<size_t>(pos - base)] = static_cast<int>(b);
+    }
+    if (rules.mrope) {
+      const auto [rows, cols] = injection.grids[b];
+      LK_CHECK(rows > 0 && cols > 0 && int64_t{rows} * cols == end - begin,
+               "an image's grid must cover its block's " + std::to_string(end - begin) + " tokens");
+    }
+    if (!rules.bidirectional_blocks) continue;
     LK_CHECK(end - begin <= chunk, "an image's " + std::to_string(end - begin) +
                                        " tokens do not fit one prefill chunk of " + std::to_string(chunk));
-    for (int pos = begin; pos < end; ++pos) {
-      LK_CHECK(!taken[static_cast<size_t>(pos - base)], "image blocks overlap");
-      taken[static_cast<size_t>(pos - base)] = true;
-      plan.last_key[static_cast<size_t>(pos - base)] = end - 1;
-    }
+    for (int pos = begin; pos < end; ++pos) plan.last_key[static_cast<size_t>(pos - base)] = end - 1;
     plan.reach = std::max(plan.reach, end - 1 - begin);
     plan.blocks.emplace_back(begin, end);
+  }
+  if (rules.mrope) {
+    plan.rope.resize(static_cast<size_t>(n) * 3);
+    int offset = rules.rope_offset;
+    for (int t = 0; t < n;) {
+      int32_t* out = plan.rope.data() + static_cast<size_t>(t) * 3;
+      const int b = block_of[static_cast<size_t>(t)];
+      if (b < 0) {
+        LK_CHECK(plan.row[static_cast<size_t>(t)] < 0, "this model's image features must lie in image blocks");
+        out[0] = out[1] = out[2] = base + t + offset;
+        ++t;
+        continue;
+      }
+      // An image starting at s takes (s, s + row, s + column) over its grid.
+      const auto [rows, cols] = injection.grids[static_cast<size_t>(b)];
+      const int start = base + t + offset;
+      for (int j = 0; j < rows * cols; ++j, ++t) {
+        int32_t* at = plan.rope.data() + static_cast<size_t>(t) * 3;
+        at[0] = start;
+        at[1] = start + j / cols;
+        at[2] = start + j % cols;
+      }
+      offset += std::max(rows, cols) - rows * cols;
+    }
+    plan.rope_offset = offset;
   }
   return plan;
 }
