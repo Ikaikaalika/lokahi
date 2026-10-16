@@ -7,7 +7,8 @@ tower, the merger, the M-RoPE positions and the full model's logits, and MLX-VLM
 ``qwen3_vl`` / ``qwen3_vl_moe`` for deepstack and the Qwen 3 text models.
 ``Qwen25VLReference`` is pinned to MLX-VLM's ``qwen2_5_vl`` (the window order,
 the tower, the positions and the logits) and to Transformers' processor and
-``Qwen2_5_VLConfig``. They need
+``Qwen2_5_VLConfig``, and ``Qwen2VLReference`` to MLX-VLM's ``qwen2_vl`` and
+``Qwen2VLConfig``. They need
 ``mlx``, ``mlx_vlm`` and ``transformers``: hosted macOS CI runs them on its
 virtual GPU, and ``mlx[cpu]`` runs them on Linux.
 """
@@ -235,19 +236,21 @@ def test_qwen3_vl_moe_text_model_matches_mlx_vlm(tmp_path):
 # Transformers' own re-save of the flat config instead.
 # ---------------------------------------------------------------------------
 
-def _qwen2_5_vl(directory, layout="mlx"):
+def _qwen2_5_vl(directory, layout="mlx", family="qwen2_5_vl"):
     import mlx.core as mx
 
-    from lokahi.fixtures import TinyQwen25VLSpec, write_tiny_qwen2_5_vl
-    from lokahi.oracles import Qwen25VLReference
+    from lokahi.fixtures import write_tiny_qwen2_5_vl
+    from lokahi.oracles import Qwen2VLReference, Qwen25VLReference
+    from test_qwen2_5_vl import QWEN2_SPEC, SPEC
 
-    directory = write_tiny_qwen2_5_vl(directory, TinyQwen25VLSpec(layout=layout))
+    spec = replace(QWEN2_SPEC if family == "qwen2_vl" else SPEC, layout=layout)
+    directory = write_tiny_qwen2_5_vl(directory, spec)
     if layout != "mlx":  # float32 copies, as above
         path = str(directory / "model.safetensors")
         weights = {name: value.astype(mx.float32) if value.dtype == mx.bfloat16 else value
                    for name, value in mx.load(path).items()}
         mx.save_safetensors(path, weights, metadata={"format": "pt"})
-    return directory, Qwen25VLReference.load(directory)
+    return directory, (Qwen2VLReference if family == "qwen2_vl" else Qwen25VLReference).load(directory)
 
 
 def test_qwen2_5_vl_target_size_matches_transformers_smart_resize():
@@ -295,12 +298,16 @@ def test_qwen2_5_vl_window_index_matches_mlx_vlm(tmp_path):
         assert np.diff(bounds).tolist() == [length * 4 for length in lengths], (rows, cols)
 
 
+@pytest.mark.parametrize("family", ["qwen2_5_vl", "qwen2_vl"])
 @pytest.mark.parametrize("shape", [(48, 80), (64, 32), (64, 64), (32, 96), (80, 48)])
-def test_qwen2_5_vl_tower_matches_mlx_vlm(tmp_path, shape):
-    import mlx.core as mx
-    from mlx_vlm.models.qwen2_5_vl import VisionConfig, VisionModel
+def test_qwen2_5_vl_tower_matches_mlx_vlm(tmp_path, shape, family):
+    import importlib
 
-    directory, oracle = _qwen2_5_vl(tmp_path / "model")
+    import mlx.core as mx
+
+    vision = importlib.import_module(f"mlx_vlm.models.{family}")
+    VisionConfig, VisionModel = vision.VisionConfig, vision.VisionModel
+    directory, oracle = _qwen2_5_vl(tmp_path / "model", family=family)
     model = VisionModel(VisionConfig.from_dict(json.loads((directory / "config.json").read_text())["vision_config"]))
     prefix = "vision_tower."
     weights = mx.load(str(directory / "model.safetensors"))
@@ -313,12 +320,13 @@ def test_qwen2_5_vl_tower_matches_mlx_vlm(tmp_path, shape):
     np.testing.assert_allclose(np.array(features), expected, rtol=0, atol=1e-5 * np.abs(expected).max())
 
 
+@pytest.mark.parametrize("family", ["qwen2_5_vl", "qwen2_vl"])
 @pytest.mark.parametrize("layout", ["mlx", "hf"])
-def test_qwen2_5_vl_matches_mlx_vlm_with_an_image(tmp_path, layout):
+def test_qwen2_5_vl_matches_mlx_vlm_with_an_image(tmp_path, layout, family):
     import mlx.core as mx
     from mlx_vlm.utils import load_model
 
-    directory, oracle = _qwen2_5_vl(tmp_path / "model", layout)
+    directory, oracle = _qwen2_5_vl(tmp_path / "model", layout, family)
     cfg = oracle.config
     image = _image((48, 80), 2)
     rows, cols = oracle.merged_grid(image)
@@ -341,22 +349,26 @@ def test_qwen2_5_vl_matches_mlx_vlm_with_an_image(tmp_path, layout):
     assert int(np.array(delta).reshape(-1)[0]) == our_delta
 
 
-def test_qwen2_5_vl_transformers_5_layout_is_what_transformers_saves(tmp_path):
-    from transformers import Qwen2_5_VLConfig
+@pytest.mark.parametrize("family", ["qwen2_5_vl", "qwen2_vl"])
+def test_qwen2_5_vl_transformers_5_layout_is_what_transformers_saves(tmp_path, family):
+    from transformers import Qwen2_5_VLConfig, Qwen2VLConfig
 
-    from lokahi.fixtures import TinyQwen25VLSpec, write_tiny_qwen2_5_vl
+    from lokahi.fixtures import write_tiny_qwen2_5_vl
+    from test_qwen2_5_vl import QWEN2_SPEC, SPEC
 
-    flat = json.loads((write_tiny_qwen2_5_vl(tmp_path / "hf", TinyQwen25VLSpec(layout="hf")) / "config.json").read_text())
-    nested = json.loads((write_tiny_qwen2_5_vl(tmp_path / "hf5", TinyQwen25VLSpec(layout="hf5")) / "config.json")
+    spec = QWEN2_SPEC if family == "qwen2_vl" else SPEC
+    flat = json.loads((write_tiny_qwen2_5_vl(tmp_path / "hf", replace(spec, layout="hf")) / "config.json").read_text())
+    nested = json.loads((write_tiny_qwen2_5_vl(tmp_path / "hf5", replace(spec, layout="hf5")) / "config.json")
                         .read_text())
-    saved = Qwen2_5_VLConfig.from_dict(flat).to_diff_dict()
+    saved = (Qwen2VLConfig if family == "qwen2_vl" else Qwen2_5_VLConfig).from_dict(flat).to_diff_dict()
     for key in ("model_type", "image_token_id", "vision_start_token_id", "vision_end_token_id", "tie_word_embeddings"):
         assert nested[key] == saved[key], key
     for key in ("model_type", "hidden_size", "intermediate_size", "num_hidden_layers", "num_attention_heads",
                 "num_key_value_heads", "rms_norm_eps", "vocab_size", "rope_parameters", "use_sliding_window",
                 "layer_types", "hidden_act"):
         assert nested["text_config"][key] == saved["text_config"][key], key
-    for key in ("model_type", "depth", "hidden_size", "intermediate_size", "num_heads", "in_channels", "patch_size",
-                "spatial_merge_size", "temporal_patch_size", "window_size", "out_hidden_size",
-                "fullatt_block_indexes", "rope_parameters", "hidden_act"):
+    vision_keys = (("embed_dim", "mlp_ratio") if family == "qwen2_vl" else
+                   ("intermediate_size", "window_size", "out_hidden_size", "fullatt_block_indexes"))
+    for key in ("model_type", "depth", "hidden_size", "num_heads", "in_channels", "patch_size", "spatial_merge_size",
+                "temporal_patch_size", "rope_parameters", "hidden_act", *vision_keys):
         assert nested["vision_config"][key] == saved["vision_config"][key], key

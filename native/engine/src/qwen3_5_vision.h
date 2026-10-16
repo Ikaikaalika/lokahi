@@ -20,6 +20,12 @@
 //   merger of its own, which LayerNorms the concatenated square instead of
 //   each patch, gives one more set of feature rows (ImageFeatures::deepstack).
 //
+// Qwen2-VL's (Qwen2VisionTransformerPretrainedModel) is Qwen3.5's without
+// learned positions or a patch bias, with QuickGELU (x * sigmoid(1.702 x))
+// in its MLP and Qwen2.5-VL's merger with a LayerNorm ln_q. Its
+// vision_config calls the tower's width embed_dim, sizes the MLP by
+// mlp_ratio and gives the text width as hidden_size.
+//
 // Qwen2.5-VL's tower (Qwen2_5_VisionTransformerPretrainedModel) shares the
 // processor, the patch order and the 2-D RoPE, but its norms are RMSNorms
 // without biases, its MLPs are down(silu(gate(x)) * up(x)) with biases, its
@@ -58,9 +64,18 @@ struct Qwen35VisionConfig {
   int text_hidden_size = 0;  // out_hidden_size
   int image_token_id = -1;
   std::vector<int> deepstack;  // deepstack_visual_indexes, increasing
-  bool qwen2_5 = false;             // Qwen2.5-VL's tower
-  int window = 0;                   // its windows' side in merged tokens
+  // Qwen3.5's (and Qwen3-VL's) tower, Qwen2.5-VL's or Qwen2-VL's.
+  enum class Tower { Qwen3_5, Qwen2_5, Qwen2 } tower = Tower::Qwen3_5;
+  int window = 0;                   // Qwen2.5-VL's windows' side in merged tokens
   std::vector<int> full_attention;  // its fullatt_block_indexes, increasing
+
+  // Qwen2.5-VL: RMSNorms without biases, down(silu(gate) * up) MLPs and
+  // window attention. The others: LayerNorms, fc2(act(fc1)) MLPs (tanh GELU
+  // for Qwen3.5, QuickGELU for Qwen2-VL) and global attention.
+  bool qwen2_5() const { return tower == Tower::Qwen2_5; }
+  // Qwen3.5's learned positions, patch bias and merger names (norm,
+  // linear_fc1, linear_fc2) against the others' ln_q, mlp.0 and mlp.2.
+  bool qwen3_5() const { return tower == Tower::Qwen3_5; }
   int64_t min_pixels = 65536;     // the processor's size.shortest_edge
   int64_t max_pixels = 16777216;  // and size.longest_edge
   float rescale = 1.0f / 255.0f;
@@ -74,8 +89,8 @@ struct Qwen35VisionConfig {
   static Qwen35VisionConfig from_json(const Json& config, const Json* preprocessor);
 };
 
-// Whether config.json describes a Qwen3.5, Qwen3-VL (dense or MoE) or
-// Qwen2.5-VL vision-language model.
+// Whether config.json describes a Qwen3.5, Qwen3-VL (dense or MoE),
+// Qwen2.5-VL or Qwen2-VL vision-language model.
 bool is_qwen3_5_vision(const Json& config);
 
 struct Qwen35VisionWeights {
