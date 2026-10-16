@@ -1037,6 +1037,33 @@ def test_generation_that_stops_resumes_from_the_kept_tokens(native_cli, backend,
     assert report["continued"] == expected[stop + 1 : stop + 5]
 
 
+@pytest.mark.parametrize("backend", _backends())
+def test_generation_config_eos_replaces_the_config_eos(native_cli, backend, tmp_path):
+    # Qwen's checkpoints list <|im_end|> only in generation_config.json, whose
+    # eos_token_id Transformers and MLX-LM use instead of config.json's.
+    directory = write_tiny_qwen35(tmp_path / "model", QWEN35_VARIANTS["qwen3.5-mlx"])
+    _skip_unsupported(directory, backend)
+    prompt = TOKENS[:6]
+    expected = Qwen35Reference.load(directory).greedy(prompt, 12)
+    stop = next(i for i in range(2, 8) if expected[i] not in expected[:i])
+    unused = next(t for t in range(64) if t not in expected)
+    args = ("generate", "--model", str(directory), "--backend", backend, "--tokens", ",".join(map(str, prompt)),
+            "--max-new", "12")
+
+    def tokens(config_eos, generation: dict) -> list[int]:
+        _edit_text_config(directory, {"eos_token_id": config_eos})
+        (directory / "generation_config.json").write_text(json.dumps(generation))
+        return _run(native_cli, *args)["tokens"]
+
+    assert tokens(unused, {"eos_token_id": [unused, expected[stop]]}) == expected[: stop + 1]
+    # Its list replaces config.json's rather than adding to it...
+    assert tokens(expected[stop], {"eos_token_id": unused}) == expected
+    # ...and without an eos_token_id there, config.json's stands.
+    assert tokens(expected[stop], {"eos_token_id": None, "top_k": 20}) == expected[: stop + 1]
+    (directory / "generation_config.json").write_text("[1]")
+    assert "generation_config.json must be an object" in _load_error(native_cli, directory)
+
+
 _FULL_AT_3 = ["linear_attention"] * 3 + ["full_attention", "linear_attention"]
 _QWEN35_ROPE = {"rope_type": "default", "rope_theta": 1e7, "partial_rotary_factor": 0.25, "mrope_section": [3, 3, 2],
                 "mrope_interleaved": True}
@@ -1048,6 +1075,8 @@ _QWEN35_ROPE = {"rope_type": "default", "rope_theta": 1e7, "partial_rotary_facto
         ("qwen3_5", {"attn_output_gate": False}, (), "qwen3_5: attn_output_gate false is not supported"),
         ("qwen3_5", {"hidden_act": "gelu"}, (), "qwen3_5: unsupported activation gelu"),
         ("qwen3_5", {"attention_bias": True}, (), "qwen3_5: attention_bias is not supported"),
+        # Qwen3.8 names the Gated DeltaNet norm's gate; it is SiLU ("swish").
+        ("qwen3_5", {"output_gate_type": "sigmoid"}, (), "qwen3_5: output_gate_type 'sigmoid' is not supported"),
         ("qwen3_5", {"rope_parameters": {"rope_type": "yarn", "rope_theta": 1e7, "factor": 4.0}}, (),
          "qwen3_5: rope type 'yarn' is not supported"),
         ("qwen3_5", {"rope_parameters": {"rope_type": "default", "partial_rotary_factor": 0.25}}, (), "rope_theta"),
