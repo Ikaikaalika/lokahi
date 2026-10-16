@@ -190,6 +190,25 @@ static float e8m0_value(uint8_t e) {
   return out;
 }
 
+Linear row_slice(const Linear& linear, int64_t first, int64_t count) {
+  LK_CHECK(first >= 0 && count > 0 && first + count <= linear.rows, linear.name + ": row slice out of range");
+  Linear out = linear;
+  out.rows = count;
+  if (!linear.quant.quantized()) {
+    out.dense = static_cast<const uint8_t*>(linear.dense) +
+                static_cast<size_t>(first * linear.cols) * dtype_size(linear.dense_dtype);
+    return out;
+  }
+  out.words = linear.words + first * linear.words_per_row();
+  if (linear.quant.mxfp4()) {
+    out.exponents = linear.exponents + first * linear.groups_per_row();
+  } else {
+    out.scales = linear.scales + first * linear.groups_per_row();
+    out.biases = linear.biases + first * linear.groups_per_row();
+  }
+  return out;
+}
+
 void dequantize_row(const Linear& linear, int64_t row, float* out) {
   if (!linear.quant.quantized()) {
     for (int64_t c = 0; c < linear.cols; ++c) out[c] = dense_value(linear, row * linear.cols + c);

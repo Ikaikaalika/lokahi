@@ -57,6 +57,9 @@ Linear bind_linear(const Checkpoint& checkpoint, const Json& config, const std::
 std::vector<Linear> bind_expert_linears(const Checkpoint& checkpoint, const Json& config, const std::string& module,
                                         const std::string& quant_module);
 
+// Rows [first, first + count) of `linear` as a zero-copy view.
+Linear row_slice(const Linear& linear, int64_t first, int64_t count);
+
 // Dense 1-D vector (norm weights) as float32.
 void load_vector(const Checkpoint& checkpoint, const std::string& name, int64_t size, float* out);
 

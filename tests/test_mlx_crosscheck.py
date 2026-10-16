@@ -2,7 +2,8 @@
 
 These tests pin the oracles' semantics to an independent implementation:
 ``mx.dequantize`` for the packed affine layout, and MLX-LM's ``gemma3_text``,
-``gemma4``, ``llama``, ``qwen2``, ``qwen3``, ``qwen3_moe``, ``gpt_oss`` and ``glm4_moe`` models for the full decoders. They need
+``gemma4``, ``llama``, ``qwen2``, ``qwen3``, ``qwen3_moe``, ``gpt_oss``, ``glm4_moe``,
+``deepseek_v2`` and ``deepseek_v3`` models for the full decoders. They need
 ``mlx`` and ``mlx_lm`` and therefore run on Apple Silicon only.
 """
 from __future__ import annotations
@@ -13,15 +14,18 @@ import numpy as np
 import pytest
 
 from lokahi.fixtures import (
+    TinyDeepseekSpec,
     TinyDenseSpec,
     TinyGemma3Spec,
     TinyGemma4Spec,
+    write_tiny_deepseek,
     write_tiny_dense,
     write_tiny_gemma3,
     write_tiny_gemma4,
 )
 from lokahi.formats import QuantSpec, dequantize_affine, pack_affine
-from lokahi.oracles import Gemma3Reference, Gemma4Reference, LlamaFamilyReference
+from lokahi.fixtures.deepseek_tiny import DEEPSEEK_YARN
+from lokahi.oracles import DeepseekReference, Gemma3Reference, Gemma4Reference, LlamaFamilyReference
 
 pytestmark = pytest.mark.skipif(
     importlib.util.find_spec("mlx") is None or importlib.util.find_spec("mlx_lm") is None,
@@ -147,6 +151,30 @@ def test_oracle_matches_mlx_lm_gemma4(tmp_path, spec):
     directory = write_tiny_gemma4(tmp_path / "model", spec)
     # In float32, MLX-LM's scalar constants are not rounded to BF16.
     _assert_mlx_lm_matches(directory, Gemma4Reference.load(directory, bf16_constants=False).logits(TOKENS))
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        # MLX-LM reads the absorbed layout as is (it would requantize a
+        # quantized kv_b_proj), always rotates pairs, and scores dropped
+        # groups 0, so these biases keep every selection score positive.
+        TinyDeepseekSpec(absorbed=True, n_group=4, topk_group=2, num_experts_per_tok=3, routed_scaling_factor=2.5,
+                         correction_bias_mean=1.0, seed=20),
+        TinyDeepseekSpec(q_lora_rank=None, n_shared_experts=2, routed_scaling_factor=2.446, rms_norm_eps=1e-5,
+                         stacked_experts=False, absorbed=True,
+                         rope_scaling={**DEEPSEEK_YARN, "factor": 32, "mscale": 0.707, "mscale_all_dim": 1.0}, seed=20),
+        TinyDeepseekSpec(model_type="deepseek_v2", q_lora_rank=None, norm_topk_prob=False, n_shared_experts=2,
+                         rope_scaling={**DEEPSEEK_YARN, "mscale": 0.707, "mscale_all_dim": 0.707}, seed=37),
+        TinyDeepseekSpec(model_type="deepseek_v2", topk_method="group_limited_greedy", n_group=4, topk_group=2,
+                         num_experts_per_tok=3, norm_topk_prob=False, n_shared_experts=2, routed_scaling_factor=16.0,
+                         rope_scaling={**DEEPSEEK_YARN, "mscale": 0.707, "mscale_all_dim": 0.707}, seed=20),
+    ],
+    ids=["v3-absorbed-grouped", "v3-moonlight-factor", "v2-lite", "v2-grouped"],
+)
+def test_oracle_matches_mlx_lm_deepseek(tmp_path, spec):
+    directory = write_tiny_deepseek(tmp_path / "model", spec)
+    _assert_mlx_lm_matches(directory, DeepseekReference.load(directory).logits(TOKENS))
 
 
 def _assert_mlx_lm_matches(directory, expected):

@@ -16,15 +16,18 @@ import numpy as np
 import pytest
 
 from lokahi.fixtures import (
+    TinyDeepseekSpec,
     TinyDenseSpec,
     TinyGemma3Spec,
     TinyGemma4Spec,
+    write_tiny_deepseek,
     write_tiny_dense,
     write_tiny_gemma3,
     write_tiny_gemma4,
 )
+from lokahi.fixtures.deepseek_tiny import DEEPSEEK_YARN
 from lokahi.formats.safetensors import read_safetensors
-from lokahi.oracles import Gemma3Reference, Gemma4Reference, LlamaFamilyReference
+from lokahi.oracles import DeepseekReference, Gemma3Reference, Gemma4Reference, LlamaFamilyReference
 from lokahi.oracles.gemma3 import Gemma3Config
 
 TOKENS = [2, 5, 9, 33, 100, 7, 7, 7, 400, 3, 2, 11, 90, 91, 92, 93, 17, 18, 19, 20, 21, 22]
@@ -160,7 +163,36 @@ GEMMA4_MOE = TinyGemma4Spec(
     seed=41,
 )
 GEMMA4_VARIANTS["gemma4-26b-a4b-moe"] = GEMMA4_MOE
-VARIANTS = sorted(GEMMA3_VARIANTS) + sorted(GEMMA4_VARIANTS) + sorted(DENSE_VARIANTS)
+# DeepSeek V2-Lite's YaRN, and one whose attention factor (mscale over
+# mscale_all_dim) is not 1, so it scales the RoPE dimensions alone.
+DEEPSEEK_V2_YARN = {**DEEPSEEK_YARN, "mscale": 0.707, "mscale_all_dim": 0.707}
+DEEPSEEK_FACTOR_YARN = {**DEEPSEEK_YARN, "factor": 32, "mscale": 0.707, "mscale_all_dim": 1.0}
+DEEPSEEK_VARIANTS = {
+    # V3 (and Kimi K2) as recent MLX conversions store it: a query rank,
+    # absorbed embed_q/unembed_out, interleaved RoPE, YaRN, and the best 2 of
+    # 4 groups with negative correction biases, so excluding the dropped
+    # groups differs from scoring them 0.
+    "deepseek-v3-absorbed-grouped": TinyDeepseekSpec(
+        absorbed=True, n_group=4, topk_group=2, num_experts_per_tok=3, routed_scaling_factor=2.5,
+        correction_bias_mean=-0.3, seed=20),
+    # Moonlight's layout plus rope_interleave false: no query rank, kv_b_proj,
+    # two shared experts, rms_norm_eps 1e-5 (the latent norms keep 1e-6),
+    # Transformers' per-expert modules, and a YaRN attention factor below 1.
+    "deepseek-v3-kv-b-rotate-half": TinyDeepseekSpec(
+        q_lora_rank=None, rope_interleave=False, rope_scaling=DEEPSEEK_FACTOR_YARN, n_shared_experts=2,
+        routed_scaling_factor=2.446, rms_norm_eps=1e-5, stacked_experts=False, seed=20),
+    # V2-Lite: no query rank, greedy softmax routing, two shared experts.
+    "deepseek-v2-lite": TinyDeepseekSpec(
+        model_type="deepseek_v2", q_lora_rank=None, norm_topk_prob=False, n_shared_experts=2,
+        rope_scaling=DEEPSEEK_V2_YARN, seed=37),
+    # V2's group_limited_greedy times routed_scaling_factor 16, in
+    # Transformers' BF16 layout (kv_b_proj transposed exactly).
+    "deepseek-v2-grouped-bf16": TinyDeepseekSpec(
+        model_type="deepseek_v2", topk_method="group_limited_greedy", n_group=4, topk_group=2,
+        num_experts_per_tok=3, norm_topk_prob=False, n_shared_experts=2, routed_scaling_factor=16.0, bits=0,
+        stacked_experts=False, rope_scaling=DEEPSEEK_V2_YARN, seed=20),
+}
+VARIANTS = sorted(GEMMA3_VARIANTS) + sorted(GEMMA4_VARIANTS) + sorted(DENSE_VARIANTS) + sorted(DEEPSEEK_VARIANTS)
 
 
 @pytest.fixture(scope="module", params=VARIANTS)
@@ -172,11 +204,15 @@ def fixture_model(request, tmp_path_factory):
     if request.param in GEMMA4_VARIANTS:
         write_tiny_gemma4(directory, GEMMA4_VARIANTS[request.param])
         return directory, Gemma4Reference.load(directory)
+    if request.param in DEEPSEEK_VARIANTS:
+        write_tiny_deepseek(directory, DEEPSEEK_VARIANTS[request.param])
+        return directory, DeepseekReference.load(directory)
     write_tiny_dense(directory, DENSE_VARIANTS[request.param])
     return directory, LlamaFamilyReference.load(directory)
 
 
-CPU_ONLY: tuple[str, ...] = ()  # architectures the Metal backend refuses (none today)
+# Architectures the Metal backend refuses: it has no latent attention yet.
+CPU_ONLY: tuple[str, ...] = ("deepseek_v2", "deepseek_v3")
 
 
 def _dense_mxfp4(config: dict) -> bool:
@@ -619,3 +655,178 @@ def test_unsupported_moe_configurations_fail_closed(native_cli, tmp_path, change
     spec = TinyDenseSpec(model_type=model_type, head_dim=64, extra=change)
     directory = write_tiny_dense(tmp_path / "model", spec)
     assert message in _load_error(native_cli, directory)
+
+
+def _deepseek_routes(oracle: DeepseekReference) -> list[tuple[int, np.ndarray]]:
+    """Each MoE layer's router inputs over TOKENS, as the oracle computes them."""
+
+    inputs: list[tuple[int, np.ndarray]] = []
+    route = oracle.route
+
+    def traced(layer, x):
+        inputs.append((layer, x))
+        return route(layer, x)
+
+    oracle.route = traced
+    oracle.logits(TOKENS)
+    del oracle.route
+    return inputs
+
+
+def _top(scores: np.ndarray, k: int) -> np.ndarray:
+    return np.sort(np.argsort(-scores, axis=-1, kind="stable")[:, :k], axis=-1)
+
+
+def test_deepseek_fixtures_route_far_from_ties_and_exercise_every_feature(tmp_path):
+    # Guards the fixtures: every expert serves some token, the top-k and group
+    # choices are stable under float32 error (V2's on logits, which its
+    # probabilities only compress), and each routing mechanism changes some
+    # token's experts: the V3 correction bias, the group limits, and V3's
+    # exclusion of dropped groups rather than scoring them 0.
+    for name, spec in DEEPSEEK_VARIANTS.items():
+        oracle = DeepseekReference.load(write_tiny_deepseek(tmp_path / name, spec))
+        cfg = oracle.config
+        k, groups, per_group = cfg.num_experts_per_tok, cfg.n_group, cfg.n_routed_experts // cfg.n_group
+        used: set[int] = set()
+        changed = {"bias": 0, "groups": 0, "zero": 0}
+        for layer, x in _deepseek_routes(oracle):
+            chosen = np.sort(oracle.route(layer, x)[0], axis=-1)
+            used.update(chosen.ravel().tolist())
+            logits = (x @ oracle.w[f"model.layers.{layer}.mlp.gate"].T).astype(np.float64)
+            selection = oracle.selection(layer, x)
+            if cfg.model_type == "deepseek_v3":
+                raw = 1.0 / (1.0 + np.exp(-logits))
+                corrected = raw + oracle.w[f"model.layers.{layer}.mlp.gate.e_score_correction_bias"]
+                group_scores = -np.sort(-corrected.reshape(len(x), groups, per_group), axis=-1)[..., :2].sum(axis=-1)
+                changed["bias"] += (_top(raw, k) != chosen).any(axis=-1).sum()
+                changed["groups"] += (_top(corrected, k) != chosen).any(axis=-1).sum()
+                zeroed = np.where(np.isinf(selection), 0.0, selection)
+                changed["zero"] += (_top(zeroed, k) != chosen).any(axis=-1).sum()
+                ranked = selection
+            else:
+                group_scores = logits.reshape(len(x), groups, per_group).max(axis=-1)
+                changed["groups"] += (_top(logits, k) != chosen).any(axis=-1).sum()
+                ranked = np.where(selection > 0, logits, -np.inf)
+            ordered = -np.sort(-ranked, axis=-1)
+            assert (ordered[:, k - 1] - ordered[:, k]).min() > 1e-3, name
+            if groups > 1:
+                ordered = -np.sort(-group_scores, axis=-1)
+                assert (ordered[:, cfg.topk_group - 1] - ordered[:, cfg.topk_group]).min() > 1e-3, name
+        assert used == set(range(cfg.n_routed_experts)), name
+        if groups > 1:
+            assert changed["groups"] > 0, name
+        if cfg.model_type == "deepseek_v3":
+            assert changed["bias"] > 0, name
+            if groups > 1:
+                assert changed["zero"] > 0, name
+
+
+def test_deepseek_attention_features_are_live(tmp_path):
+    # Guards the fixtures: YaRN's softmax mscale and its attention factor on
+    # the RoPE dimensions each move the outputs, and the RoPE dimensions matter.
+    spec = DEEPSEEK_VARIANTS["deepseek-v3-kv-b-rotate-half"]
+    directory = write_tiny_deepseek(tmp_path / "model", spec)
+    oracle = DeepseekReference.load(directory)
+    cfg = oracle.config
+    assert abs(cfg.attention_factor() - (0.0707 * np.log(32) + 1) / (0.1 * np.log(32) + 1)) < 1e-12
+    assert abs(cfg.softmax_scale() - 64**-0.5 * (0.1 * np.log(32) + 1) ** 2) < 1e-12
+    expected = oracle.logits(TOKENS)
+    scale = np.abs(expected).max()
+    for change in ({"mscale": 1.0}, {"mscale_all_dim": 0.707}):
+        oracle.config = replace(cfg, rope_scaling={**DEEPSEEK_FACTOR_YARN, **change})
+        assert np.abs(oracle.logits(TOKENS) - expected).max() > 1e-3 * scale, change
+
+
+@pytest.mark.parametrize("backend", _backends())
+def test_latent_norms_keep_their_own_epsilon(native_cli, backend, tmp_path, monkeypatch):
+    # The query and latent norms use 1e-6 whatever rms_norm_eps says
+    # (Moonlight's is 1e-5). Small latents make the difference visible.
+    import lokahi.oracles.deepseek as deepseek
+
+    spec = TinyDeepseekSpec(rms_norm_eps=1e-5, latent_scale=0.01, seed=20)
+    directory = write_tiny_deepseek(tmp_path / "model", spec)
+    _skip_unsupported(directory, backend)
+    oracle = DeepseekReference.load(directory)
+    expected = oracle.logits(TOKENS)
+    monkeypatch.setattr(deepseek, "LATENT_NORM_EPS", 1e-5)
+    assert np.abs(oracle.logits(TOKENS) - expected).max() > 0.05 * np.abs(expected).max()
+    out = tmp_path / "logits.bin"
+    report = _run(native_cli, "logits", "--model", str(directory), "--backend", backend,
+                  "--tokens", ",".join(map(str, TOKENS)), "--prefill", str(len(TOKENS)), "--out", str(out))
+    got = np.fromfile(out, dtype=np.float32).reshape(report["rows"], spec.vocab_size)
+    tolerance = 2e-4 if backend == "cpu" else 2e-2
+    np.testing.assert_allclose(got, expected[-1:], atol=tolerance * np.abs(expected).max(), rtol=0)
+
+
+def test_latent_attention_runs_on_the_cpu_under_auto(native_cli, tmp_path):
+    directory = write_tiny_deepseek(tmp_path / "model", DEEPSEEK_VARIANTS["deepseek-v3-absorbed-grouped"])
+    info = _run(native_cli, "info", "--model", str(directory), "--backend", "auto")
+    assert (info["architecture"], info["backend"]) == ("deepseek_v3", "cpu")
+
+
+def test_kimi_k2_reads_as_deepseek_v3(native_cli, tmp_path):
+    directory = write_tiny_deepseek(tmp_path / "model", DEEPSEEK_VARIANTS["deepseek-v3-absorbed-grouped"])
+    config = json.loads((directory / "config.json").read_text())
+    config["model_type"] = "kimi_k2"
+    (directory / "config.json").write_text(json.dumps(config))
+    assert _run(native_cli, "info", "--model", str(directory), "--backend", "cpu")["architecture"] == "deepseek_v3"
+
+
+@pytest.mark.skipif("metal" not in _backends(), reason="needs the Metal backend")
+def test_metal_refuses_latent_attention(native_cli, tmp_path):
+    directory = write_tiny_deepseek(tmp_path / "model", DEEPSEEK_VARIANTS["deepseek-v2-lite"])
+    assert "metal: multi-head latent attention (deepseek_v2) is not implemented yet" in _load_error(
+        native_cli, directory, "metal")
+
+
+@pytest.mark.parametrize(
+    ("model_type", "change", "message"),
+    [
+        ("deepseek_v3", {"topk_method": "group_limited_greedy"},
+         "deepseek_v3: topk_method 'group_limited_greedy' is not supported"),
+        ("deepseek_v3", {"scoring_func": "softmax"}, "deepseek_v3: only sigmoid routing is supported"),
+        ("deepseek_v2", {"scoring_func": "sigmoid"}, "deepseek_v2: only softmax routing is supported"),
+        ("deepseek_v2", {"topk_method": "noaux_tc"}, "deepseek_v2: topk_method 'noaux_tc' is not supported"),
+        ("deepseek_v2", {"norm_topk_prob": True}, "deepseek_v2: norm_topk_prob is not supported"),
+        ("deepseek_v3", {"moe_layer_freq": 2}, "deepseek_v3: moe_layer_freq other than 1 is not supported"),
+        ("deepseek_v3", {"attention_bias": True}, "deepseek_v3: attention_bias is not supported"),
+        ("deepseek_v3", {"rope_scaling": {"type": "linear", "factor": 2.0}},
+         "deepseek_v3: rope_scaling type 'linear' is not supported"),
+        ("deepseek_v3", {"qk_rope_head_dim": 31}, "deepseek_v3: invalid latent attention sizes"),
+        ("deepseek_v3", {"n_group": 3}, "deepseek_v3: invalid expert configuration"),
+        ("deepseek_v3", {"num_experts_per_tok": 5, "n_group": 4, "topk_group": 2},
+         "deepseek_v3: invalid expert configuration"),
+    ],
+)
+def test_unsupported_deepseek_configurations_fail_closed(native_cli, tmp_path, model_type, change, message):
+    directory = write_tiny_deepseek(tmp_path / "model", TinyDeepseekSpec(model_type=model_type, extra=change))
+    assert message in _load_error(native_cli, directory)
+
+
+def test_fp8_checkpoints_fail_closed(native_cli, tmp_path):
+    # DeepSeek's and Moonshot's originals ship FP8 blocks; MLX-LM converts them.
+    fp8 = {"quant_method": "fp8", "fmt": "e4m3", "activation_scheme": "dynamic", "weight_block_size": [128, 128]}
+    directory = write_tiny_deepseek(tmp_path / "model", TinyDeepseekSpec(bits=0, extra={"quantization_config": fp8}))
+    assert "deepseek_v3: fp8 checkpoints are not supported; convert to MLX (or BF16) first" in _load_error(
+        native_cli, directory)
+
+
+def test_deepseek_without_routing_fields_fails_closed(native_cli, tmp_path):
+    # Transformers and MLX-LM default the routing fields differently, so the
+    # engine reads them without defaults.
+    directory = write_tiny_deepseek(tmp_path / "model", TinyDeepseekSpec())
+    config = json.loads((directory / "config.json").read_text())
+    del config["routed_scaling_factor"]
+    (directory / "config.json").write_text(json.dumps(config))
+    assert "routed_scaling_factor" in _load_error(native_cli, directory)
+
+
+def test_deepseek_unexpected_bias_fails_closed(native_cli, tmp_path):
+    directory = write_tiny_deepseek(tmp_path / "model", TinyDeepseekSpec())
+    path = directory / "model.safetensors"
+    tensors, metadata = read_safetensors(path)
+    tensors["model.layers.1.self_attn.kv_a_proj_with_mqa.bias"] = ("BF16", np.zeros(96, dtype=np.uint16))
+    from lokahi.formats.safetensors import write_safetensors
+
+    write_safetensors(path, tensors, metadata=metadata)
+    assert "layers.1.self_attn.kv_a_proj_with_mqa: unexpected bias for deepseek_v3" in _load_error(native_cli, directory)
