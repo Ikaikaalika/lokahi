@@ -198,7 +198,7 @@ struct ElementwiseParams { int count; };
 struct GluMulParams { int count; int silu; };
 struct RopeParams {
   int heads; int kv_heads; int head_dim; int start_pos; int capacity; float eps; float offset; int qk_norm;
-  int qkv_bias; int v_norm; int rotary;
+  int qkv_bias; int v_norm; int rotary; int mrope; int rope_given; int rope_offset;
 };
 struct PerLayerCombineParams { int size; int layers; float eps; float offset; float proj_scale; float input_scale; };
 struct PerLayerGateParams { int size; int layers; int layer; int count; };
@@ -278,6 +278,7 @@ class DecoderMetal final : public Model {
   void reset() override {
     drain();
     position_ = 0;
+    rope_offset_ = 0;
     injection_ = {};
     zero_states();
   }
@@ -795,6 +796,13 @@ class DecoderMetal final : public Model {
     inject_index_ = shared_buffer(static_cast<size_t>(max_context_) * sizeof(int32_t));
     if (c_.per_layer_input > 0) per_layer_tokens_ = shared_buffer(static_cast<size_t>(max_context_) * sizeof(int32_t));
     last_key_ = shared_buffer(static_cast<size_t>(max_context_) * sizeof(int32_t));
+    if (!c_.rope_axes.empty()) {
+      // M-RoPE: each prompt token's three positions, and each frequency's axis.
+      rope_pos_ = shared_buffer(static_cast<size_t>(max_context_) * 3 * sizeof(int32_t));
+      rope_axes_ = shared_buffer(c_.rope_axes.size() * sizeof(int32_t));
+      int32_t* axes = static_cast<int32_t*>([rope_axes_ contents]);
+      for (size_t i = 0; i < c_.rope_axes.size(); ++i) axes[i] = c_.rope_axes[i];
+    }
   }
 
   // Zeroes every conv history and state (private buffers start undefined).
@@ -1102,13 +1110,27 @@ class DecoderMetal final : public Model {
     bind(enc, G.q_norm, 5);
     bind(enc, G.k_norm, 6);
     bind(enc, G.sliding ? inv_freq_local_buf_ : inv_freq_global_buf_, 7);
+    // An M-RoPE prefill with images reads the plan's positions; every other
+    // pass offsets the KV positions by rope_offset_.
+    const bool given = !plan_.rope.empty();
     bytes(enc, RopeParams{c_.num_heads, G.kv_heads, G.head_dim, start, G.capacity, c_.rms_norm_eps,
                           c_.norm_offset, c_.qk_norm ? 1 : 0, c_.qkv_bias ? 1 : 0, c_.v_norm ? 1 : 0,
-                          c_.rotary_dim > 0 ? c_.rotary_dim : G.head_dim},
+                          c_.rotary_dim > 0 ? c_.rotary_dim : G.head_dim, rope_axes_ != nil ? 1 : 0, given ? 1 : 0,
+                          rope_offset_},
           8);
     bind(enc, G.q_bias, 9);
     bind(enc, G.k_bias, 10);
     bind(enc, G.v_bias, 11);
+    if (given) {
+      bind(enc, rope_pos_, sizeof(int32_t) * 3 * static_cast<size_t>(start - plan_.base), 12);
+    } else {
+      bind(enc, placeholder_, 12);
+    }
+    if (rope_axes_ != nil) {
+      bind(enc, rope_axes_, 0, 13);
+    } else {
+      bind(enc, placeholder_, 13);
+    }
     if (G.k_eq_v) bind(enc, kt_, 0, 2);  // values are the raw keys, before k_norm
     // KV-shared layers only rotate their queries.
     const int heads = c_.num_heads + (G.own_kv ? G.kv_heads : 0);
@@ -1657,7 +1679,9 @@ class DecoderMetal final : public Model {
     LK_CHECK(n > 0, "prefill requires at least one token");
     LK_CHECK(position_ + n <= max_context_, "context length exceeded");
     for (int i = 0; i < n; ++i) LK_CHECK(tokens[i] >= 0 && tokens[i] < c_.vocab_size, "token id out of range");
-    plan_ = plan_injection(active_, position_, n, c_.hidden_size, chunk_);
+    plan_ = plan_injection(active_, position_, n, c_.hidden_size, chunk_, c_.injection_rules(rope_offset_));
+    rope_offset_ = plan_.rope_offset;  // for the tokens after this prefill
+    if (!plan_.rope.empty()) std::memcpy([rope_pos_ contents], plan_.rope.data(), sizeof(int32_t) * plan_.rope.size());
     if (!plan_.empty()) {
       if (c_.per_layer_input > 0) {
         // Image positions look up the pad token's per-layer embedding.
@@ -1749,6 +1773,11 @@ class DecoderMetal final : public Model {
   PromptInjection active_;
   InjectionPlan plan_;
   id<MTLBuffer> inject_rows_ = nil, inject_index_ = nil, last_key_ = nil;
+  // M-RoPE: the prefill's positions [n, 3] (shared, written before each
+  // prefill), each frequency's axis, and how far RoPE positions run ahead
+  // of KV positions until reset().
+  id<MTLBuffer> rope_pos_ = nil, rope_axes_ = nil;
+  int rope_offset_ = 0;
   id<MTLBuffer> per_layer_tokens_ = nil;  // the prompt with image tokens replaced by the pad token
   // Multi-head latent attention: absorbed queries and latent outputs [chunk,
   // heads, latent width], the query latent [chunk, q_lora_rank], and each

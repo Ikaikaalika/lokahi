@@ -199,14 +199,23 @@ std::vector<std::string> split_list(const std::string& text) {
   return items;
 }
 
-// Each --images file through the vision tower, in order.
-std::vector<std::vector<float>> encode_images(const Args& args, VisionEncoder& encoder) {
+// Each --images file through the vision tower, in order, with the token
+// grids the decoder's positions follow (models with M-RoPE only).
+struct EncodedImages {
   std::vector<std::vector<float>> features;
+  std::vector<std::pair<int, int>> grids;
+};
+
+EncodedImages encode_images(const Args& args, VisionEncoder& encoder) {
+  EncodedImages out;
   for (const std::string& path : split_list(args.get("images"))) {
-    features.push_back(encoder.encode(read_image(path, encoder.fixed_size())));
+    const Image image = read_image(path, encoder.fixed_size());
+    out.features.push_back(encoder.encode(image));
+    const auto grid = encoder.token_grid(image.width, image.height);
+    if (grid.first > 0) out.grids.push_back(grid);
   }
-  LK_CHECK(!features.empty(), "--images names no files");
-  return features;
+  LK_CHECK(!out.features.empty(), "--images names no files");
+  return out;
 }
 
 // The vision encoder on the same backend as the decoder (--backend).
@@ -221,14 +230,15 @@ std::unique_ptr<VisionEncoder> load_vision(const Args& args) {
 void inject_images(const Args& args, Model& model, const std::vector<int32_t>& tokens) {
   if (!args.has("images")) return;
   auto encoder = load_vision(args);
+  const EncodedImages images = encode_images(args, *encoder);
   model.inject(place_images(tokens, model.position(), encoder->image_token_id(), encoder->text_hidden_size(),
-                            encode_images(args, *encoder)));
+                            images.features, images.grids));
 }
 
 int cmd_image_features(const Args& args) {
   LK_CHECK(args.has("images") && args.has("out"), "image-features needs --images and --out");
   auto encoder = load_vision(args);
-  const auto features = encode_images(args, *encoder);
+  const auto features = encode_images(args, *encoder).features;
   std::ofstream out(args.get("out"), std::ios::binary);
   LK_CHECK(out.good(), "cannot write " + args.get("out"));
   std::string tokens;

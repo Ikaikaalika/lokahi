@@ -123,8 +123,19 @@ then feeds `out_proj`. Each value head reads key head
 `h / (linear_num_value_heads / linear_num_key_heads)`. The full attention
 layers gate their output by `sigmoid` of a second half of each head's
 `q_proj` rows, norm q and k per head, and rotate halves within the first
-`partial_rotary_factor` (0.25) of each head (Qwen3.5's multimodal RoPE is
-plain RoPE for text). Every RMSNorm but the gated one is zero-centered,
+`partial_rotary_factor` (0.25) of each head. Qwen3.5's RoPE is interleaved
+M-RoPE: rotary frequency i reads a token's row position when `i % 3 == 1`
+and `i < 3 · mrope_section[1]`, its column position when `i % 3 == 2` and
+`i < 3 · mrope_section[2]`, and its temporal one otherwise. Text tokens'
+three positions coincide, so text alone sees plain RoPE. Image tokens take
+grid coordinates: an injection's `grids` gives each image's (rows,
+columns), and an image starting at RoPE position `s` takes
+`(s, s + row, s + column)`, row by row. The text after it continues at
+`s + max(rows, columns)`, and from then on RoPE positions run that far
+ahead of KV positions (`rope_offset`), through decoding and later
+prefills, until `reset`. A later prefill's images take the positions a full
+recompute of the conversation gives them (Transformers' cached path gives
+them plain positions instead). Every RMSNorm but the gated one is zero-centered,
 `x · rms · (1 + w)`; MLX conversions store `1 + w` and their conv weights as
 `[C, K, 1]` rather than `[C, 1, K]`, which is how the load tells them apart.
 Qwen3.5-MoE has experts in every layer, always renormalized; Qwen3-Next's
@@ -158,8 +169,10 @@ the prompt's runs of `image_token_index`, which `Model::inject` hands to the
 next prefill: the rows replace those tokens' scaled embeddings as they are,
 and each image's tokens also attend to its later tokens. The sliding window
 still applies, as in Transformers' `AND(window, OR(causal, block))`. A
-prefill pass never splits an image; images longer than `--prefill-chunk`
-fail closed. Both backends share these checks (`plan_injection`). Gemma 3
+prefill pass never splits such an image; images longer than
+`--prefill-chunk` fail closed. Models whose images stay causal (Gemma 4
+without bidirectional vision, Qwen3.5) let passes split images. Both
+backends share these checks (`plan_injection`). Gemma 3
 applies the image blocks on every layer; Gemma 4 only on sliding layers, and
 only with `use_bidirectional_attention: "vision"` (full layers stay causal, as
 Transformers' `create_masks_for_vision_model` builds them). Gemma 4's tower

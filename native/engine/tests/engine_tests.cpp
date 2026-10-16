@@ -886,6 +886,78 @@ void test_qwen3_5_configs() {
   EXPECT(next.num_experts == 512 && next.experts_per_token == 10 && next.norm_topk_prob && next.shared_expert_gate);
   EXPECT(next.is_moe(0) && next.is_moe(47) && linear_every_fourth(next) && rope_64_of_256(next));
   EXPECT(next.attn_output_gate && next.linear_v_heads == 32 && next.eos_token_ids == std::vector<int32_t>({151645}));
+
+  // Interleaved M-RoPE over the 32 rotary frequencies, sections [11, 11, 10]:
+  // rows at 1, 4, ..., 31, columns at 2, 5, ..., 29, time elsewhere.
+  auto interleaved = [](const DecoderConfig& c) {
+    if (c.rope_axes.size() != 32) return false;
+    for (int i = 0; i < 32; ++i) {
+      const int expected = i % 3 == 1 && i < 33 ? 1 : i % 3 == 2 && i < 30 ? 2 : 0;
+      if (c.rope_axes[static_cast<size_t>(i)] != expected) return false;
+    }
+    return true;
+  };
+  EXPECT(interleaved(small) && interleaved(moe) && next.rope_axes.empty());
+  // Without mrope_section, Transformers and MLX-VLM use [11, 11, 10].
+  std::string unsectioned = kQwen35_08BConfig;
+  const std::string section = "\"mrope_section\": [11, 11, 10], ";
+  unsectioned.erase(unsectioned.find(section), section.size());
+  EXPECT(interleaved(DecoderConfig::from_json(Json::parse(unsectioned))));
+  // Uneven sections [16, 6, 3]: rows at 1, 4, ..., 16, columns at 2, 5, 8.
+  std::string uneven = kQwen35_08BConfig;
+  uneven.replace(uneven.find("[11, 11, 10]"), 12, "[16, 6, 3]");
+  const DecoderConfig custom = DecoderConfig::from_json(Json::parse(uneven));
+  bool sections = custom.rope_axes.size() == 32;
+  for (int i = 0; sections && i < 32; ++i) {
+    const int expected = i % 3 == 1 && i < 18 ? 1 : i % 3 == 2 && i < 9 ? 2 : 0;
+    sections = custom.rope_axes[static_cast<size_t>(i)] == expected;
+  }
+  EXPECT(sections);
+  EXPECT(small.injection_rules(7).mrope && !small.injection_rules(7).bidirectional_blocks &&
+         small.injection_rules(7).rope_offset == 7);
+}
+
+void test_mrope_injection_plan() {
+  // Two images in a 20-token prefill at position 10, after earlier images
+  // moved RoPE positions 5 ahead: a 2x3 grid at 12 and a 4x2 grid at 20.
+  PromptInjection injection;
+  injection.blocks = {{12, 18}, {20, 28}};
+  injection.grids = {{2, 3}, {4, 2}};
+  for (int pos = 12; pos < 28; ++pos) {
+    if (pos >= 18 && pos < 20) continue;
+    injection.positions.push_back(pos);
+    injection.rows.push_back(static_cast<float>(pos));
+  }
+  const InjectionRules mrope{false, true, 5};
+  const InjectionPlan plan = plan_injection(injection, 10, 20, 1, 4, mrope);
+  std::vector<int32_t> expected = {15, 15, 15, 16, 16, 16};  // text: index + 5
+  for (int j = 0; j < 6; ++j) expected.insert(expected.end(), {17, 17 + j / 3, 17 + j % 3});
+  expected.insert(expected.end(), {20, 20, 20, 21, 21, 21});  // 5 + max(2, 3) - 6 = 2 ahead
+  for (int j = 0; j < 8; ++j) expected.insert(expected.end(), {22, 22 + j / 2, 22 + j % 2});
+  expected.insert(expected.end(), {26, 26, 26, 27, 27, 27});  // 2 + max(4, 2) - 8 = -2
+  EXPECT(plan.rope == expected && plan.rope_offset == -2);
+  // Causal images: passes of 4 may split them, so the plan keeps no blocks.
+  EXPECT(plan.blocks.empty() && plan.reach == 0 && plan.pass_length(0, 4) == 4 && plan.last_key[3] == 13);
+
+  // A text-only prefill carries the offset through.
+  const InjectionPlan text = plan_injection(PromptInjection{}, 30, 3, 1, 4, InjectionRules{false, true, -2});
+  EXPECT(text.rope.empty() && text.rope_offset == -2);
+
+  auto fails = [&](PromptInjection bad, InjectionRules rules) {
+    return throws([&] { plan_injection(bad, 10, 20, 1, 4, rules); });
+  };
+  PromptInjection no_grids = injection;
+  no_grids.grids.clear();
+  PromptInjection short_grid = injection;
+  short_grid.grids[1] = {3, 2};
+  PromptInjection outside = injection;
+  outside.positions.push_back(18);
+  outside.rows.push_back(18.0f);
+  EXPECT(!fails(injection, mrope));
+  EXPECT(fails(no_grids, mrope) && fails(short_grid, mrope) && fails(outside, mrope));
+  EXPECT(fails(injection, InjectionRules{false, false, 0}));  // grids for a model without M-RoPE
+  EXPECT(fails(no_grids, InjectionRules{true, false, 0}));    // a bidirectional block must fit a chunk of 4
+  EXPECT(!throws([&] { plan_injection(no_grids, 10, 20, 1, 8, InjectionRules{true, false, 0}); }));
 }
 
 int main() {
@@ -907,6 +979,7 @@ int main() {
   test_glm_config();
   test_deepseek_configs();
   test_qwen3_5_configs();
+  test_mrope_injection_plan();
   if (g_failures) {
     std::fprintf(stderr, "%d expectation(s) failed\n", g_failures);
     return 1;

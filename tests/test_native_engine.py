@@ -1038,6 +1038,8 @@ def test_generation_that_stops_resumes_from_the_kept_tokens(native_cli, backend,
 
 
 _FULL_AT_3 = ["linear_attention"] * 3 + ["full_attention", "linear_attention"]
+_QWEN35_ROPE = {"rope_type": "default", "rope_theta": 1e7, "partial_rotary_factor": 0.25, "mrope_section": [3, 3, 2],
+                "mrope_interleaved": True}
 
 
 @pytest.mark.parametrize(
@@ -1051,6 +1053,13 @@ _FULL_AT_3 = ["linear_attention"] * 3 + ["full_attention", "linear_attention"]
         ("qwen3_5", {"rope_parameters": {"rope_type": "default", "partial_rotary_factor": 0.25}}, (), "rope_theta"),
         ("qwen3_5", {"rope_parameters": {"rope_type": "default", "rope_theta": 1e7, "partial_rotary_factor": 0.3}},
          (), "qwen3_5: partial_rotary_factor must rotate an even number of dimensions"),
+        # Transformers and MLX-VLM interleave the M-RoPE sections whatever the flag says.
+        ("qwen3_5", {"rope_parameters": {**_QWEN35_ROPE, "mrope_interleaved": False}}, (),
+         "qwen3_5: only interleaved M-RoPE is supported"),
+        ("qwen3_5", {"rope_parameters": {**_QWEN35_ROPE, "mrope_section": [4, 4]}}, (),
+         "qwen3_5: mrope_section must have 3 entries"),
+        ("qwen3_5", {"rope_parameters": {**_QWEN35_ROPE, "mrope_section": [4, -1, 4]}}, (),
+         "qwen3_5: mrope_section entries must not be negative"),
         # MLX-LM places full attention by full_attention_interval alone.
         ("qwen3_5", {"layer_types": ["full_attention"] + ["linear_attention"] * 4}, (),
          "qwen3_5: layer_types must place full attention every full_attention_interval layers"),

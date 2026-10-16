@@ -48,14 +48,29 @@ class Profiler {
 };
 
 // Rows that replace the scaled token embeddings at some prompt positions
-// (image features, hidden_size wide) and [begin, end) position ranges whose
-// tokens also attend to each other's later positions during prefill (one per
-// image, as Gemma 3's image blocks do). Positions are absolute.
+// (image features, hidden_size wide) and [begin, end) position ranges, one
+// per image. In models whose image blocks are bidirectional (Gemma 3's) a
+// block's tokens also attend to each other's later positions during prefill.
+// Positions are absolute.
+//
+// `grids` gives each block's (rows, columns), for models whose RoPE follows
+// an image's layout (Qwen3.5's M-RoPE): the block's tokens fill the grid row
+// by row. It is empty for every other model.
 struct PromptInjection {
   std::vector<int> positions;
   std::vector<float> rows;  // [positions.size(), hidden_size]
   std::vector<std::pair<int, int>> blocks;
+  std::vector<std::pair<int, int>> grids;
   bool empty() const { return positions.empty() && blocks.empty(); }
+};
+
+// How a decoder reads an injection.
+struct InjectionRules {
+  bool bidirectional_blocks = false;  // a block's tokens see each other, so no pass may split one
+  bool mrope = false;                 // blocks carry grids, and RoPE positions follow them
+  // M-RoPE: how far RoPE positions run ahead of the KV positions before this
+  // prefill (images so far have moved them).
+  int rope_offset = 0;
 };
 
 // A PromptInjection checked against a prefill of `n` tokens whose first sits
@@ -65,7 +80,12 @@ struct InjectionPlan {
   std::vector<int> row;       // [n] index into the injection's rows, or -1
   std::vector<int> last_key;  // [n] the last position each token attends to
   int reach = 0;              // the most any token looks ahead: max(last_key[t] - base - t)
-  std::vector<std::pair<int, int>> blocks;
+  std::vector<std::pair<int, int>> blocks;  // bidirectional blocks only
+  // M-RoPE: [n, 3] each token's (temporal, row, column) RoPE positions, and
+  // the offset of the tokens after the prefill (text positions continue
+  // past an image at its start plus max(rows, columns)).
+  std::vector<int32_t> rope;
+  int rope_offset = 0;
 
   bool empty() const { return row.empty(); }
   // How many of `count` tokens from offset `start` a pass should take so it
@@ -74,8 +94,11 @@ struct InjectionPlan {
 };
 
 // Fails closed unless every row and block lies inside the prefill, rows are
-// `width` wide, blocks do not overlap and each fits a pass of `chunk` tokens.
-InjectionPlan plan_injection(const PromptInjection& injection, int base, int n, int width, int chunk);
+// `width` wide, blocks do not overlap, each bidirectional block fits a pass
+// of `chunk` tokens, and grids are given exactly when the rules use them,
+// one per block, each covering its block.
+InjectionPlan plan_injection(const PromptInjection& injection, int base, int n, int width, int chunk,
+                             const InjectionRules& rules);
 
 class Model {
  public:

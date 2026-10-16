@@ -76,6 +76,14 @@ struct DecoderConfig {
   bool image_blocks_apply(bool sliding) const {
     return image_blocks == ImageBlocks::AllLayers || (image_blocks == ImageBlocks::SlidingLayers && sliding);
   }
+  // Multimodal RoPE (Qwen3.5's interleaved M-RoPE): each token has temporal,
+  // row and column positions, and rotary frequency i reads the position on
+  // axis rope_axes[i] (0, 1 or 2). Empty: one position per token. Text
+  // tokens' three positions coincide, so text alone sees plain RoPE.
+  std::vector<int> rope_axes;
+  InjectionRules injection_rules(int rope_offset) const {
+    return {image_blocks != ImageBlocks::None, !rope_axes.empty(), rope_offset};
+  }
   std::vector<int32_t> eos_token_ids;
   std::string weight_prefix;  // "" or "language_model."
 

@@ -100,7 +100,9 @@ std::unique_ptr<VisionEncoder> VisionEncoder::load(const std::string& directory,
 }
 
 PromptInjection place_images(const std::vector<int32_t>& tokens, int start, int image_token, int width,
-                             const std::vector<std::vector<float>>& features) {
+                             const std::vector<std::vector<float>>& features,
+                             const std::vector<std::pair<int, int>>& grids) {
+  LK_CHECK(grids.empty() || grids.size() == features.size(), "give one token grid per image");
   const size_t w = static_cast<size_t>(width);
   std::vector<int> runs;
   for (size_t i = 0; i < tokens.size(); ++i) {
@@ -125,6 +127,7 @@ PromptInjection place_images(const std::vector<int32_t>& tokens, int start, int 
     for (int j = 0; j < count; ++j) out.positions.push_back(start + first + j);
     out.rows.insert(out.rows.end(), image.begin(), image.end());
   }
+  out.grids = grids;
   return out;
 }
 
