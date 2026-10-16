@@ -150,12 +150,15 @@ def vlm(request, tmp_path_factory):
     return directory, Qwen3VLReference.load(directory), images, _image_files(directory, images)
 
 
+# 7 query rows per Metal attention pass divides none of the images' patch
+# counts, so the last pass of each is partial (a no-op on the CPU).
+@pytest.mark.parametrize("attention_rows", ["0", "7"])
 @pytest.mark.parametrize("backend", _backends())
-def test_image_and_deepstack_features_match_oracle(native_cli, vlm, backend, tmp_path):
+def test_image_and_deepstack_features_match_oracle(native_cli, vlm, backend, attention_rows, tmp_path):
     directory, oracle, images, files = vlm
     out = tmp_path / "features.bin"
     report = _run(native_cli, "image-features", "--model", str(directory), "--backend", backend,
-                  "--images", files, "--out", str(out))
+                  "--images", files, "--out", str(out), "--vision-attention-rows", attention_rows)
     width = oracle.language.config.hidden_size
     assert report == {"backend": backend, "tokens": TOKENS, "width": width, "deepstack": 2}
     got = np.fromfile(out, dtype=np.float32).reshape(3, sum(TOKENS), width)  # rows, then each deepstack layer

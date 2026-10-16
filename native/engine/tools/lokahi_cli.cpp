@@ -28,7 +28,8 @@
 // --images takes binary PPM (P6) files already resized to a size the model
 // takes (image-geometry reports the processor's choice), or for models with
 // one square size, raw RGB8 bytes of it; image i fills the prompt's i-th run
-// of image tokens.
+// of image tokens. --vision-attention-rows N bounds the Qwen towers' Metal
+// attention scores to N query rows at a time (by default, 128 MiB of them).
 #include <sys/resource.h>
 
 #include <algorithm>
@@ -218,11 +219,15 @@ EncodedImages encode_images(const Args& args, VisionEncoder& encoder) {
   return out;
 }
 
-// The vision encoder on the same backend as the decoder (--backend).
+// The vision encoder on the same backend as the decoder (--backend), with at
+// most --vision-attention-rows query rows per attention pass (0: a budget).
 std::unique_ptr<VisionEncoder> load_vision(const Args& args) {
   auto encoder = VisionEncoder::load(args.get("model"), args.get("backend", "auto"),
                                      static_cast<unsigned>(args.get_int("threads", 0)));
   LK_CHECK(encoder != nullptr, "this model has no vision tower");
+  const int rows = args.get_int("vision-attention-rows", 0);
+  LK_CHECK(rows >= 0, "--vision-attention-rows must not be negative");
+  encoder->set_attention_rows(rows);
   return encoder;
 }
 

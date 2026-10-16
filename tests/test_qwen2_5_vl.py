@@ -195,12 +195,15 @@ def vlm(request, tmp_path_factory):
     return directory, Qwen25VLReference.load(directory), images, _image_files(directory, images)
 
 
+# 7 query rows per Metal attention pass divides none of the images' patch
+# counts, so the last pass of each is partial (a no-op on the CPU).
+@pytest.mark.parametrize("attention_rows", ["0", "7"])
 @pytest.mark.parametrize("backend", _backends())
-def test_image_features_match_oracle(native_cli, vlm, backend, tmp_path):
+def test_image_features_match_oracle(native_cli, vlm, backend, attention_rows, tmp_path):
     directory, oracle, images, files = vlm
     out = tmp_path / "features.bin"
     report = _run(native_cli, "image-features", "--model", str(directory), "--backend", backend,
-                  "--images", files, "--out", str(out))
+                  "--images", files, "--out", str(out), "--vision-attention-rows", attention_rows)
     width = oracle.language.config.hidden_size
     assert report == {"backend": backend, "tokens": TOKENS, "width": width}
     got = np.fromfile(out, dtype=np.float32).reshape(sum(TOKENS), width)
@@ -323,3 +326,11 @@ def test_sliding_layers_fail_closed(native_cli, tmp_path):
     _edit(directory / "config.json", lambda data: data["text_config"]["layer_types"].__setitem__(2, "sliding_attention"))
     assert "qwen2_5_vl: sliding-window layers are not supported" in _fails(
         native_cli, "info", "--model", str(directory), "--backend", "cpu")
+
+
+def test_negative_attention_rows_fail_closed(native_cli, tmp_path):
+    directory = write_tiny_qwen2_5_vl(tmp_path / "model", SPEC)
+    files = _image_files(tmp_path, _images()[:1])
+    assert "--vision-attention-rows must not be negative" in _fails(
+        native_cli, "image-features", "--model", str(directory), "--images", files, "--out", str(tmp_path / "x.bin"),
+        "--vision-attention-rows", "-1")
