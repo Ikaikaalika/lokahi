@@ -15,6 +15,7 @@
 //                     [--backend cpu|metal]
 //   lokahi bench      --model DIR (--tokens ... | --tokens-file F) --max-new N
 //                     [--warmups W] [--repetitions R]
+//                     [--speculate N [--draft-reference FILE] [--drafter lookup|mtp|both]]
 //   lokahi profile    --model DIR (--tokens ... | --tokens-file F | --prompt TEXT)
 //                     [--max-new N] [--warmups W]
 //   lokahi tokenize   --model DIR (--text TEXT | --texts-file F.json) [--no-special]
@@ -133,6 +134,20 @@ LoadOptions load_options(const Args& args) {
   options.kv_cache = args.get("kv-cache", "auto");
   options.draft_model = args.get("draft-model", "");
   return options;
+}
+
+// --speculate N drafts up to N tokens per verify pass from the prompt and
+// the output so far, and from --draft-reference's tokens when given.
+// --drafter mtp drafts with the model's multi-token prediction head (in the
+// checkpoint, or --draft-model's qwen3_5_mtp drafter); both prefers a lookup
+// draft when there is one.
+SpeculationOptions speculation_options(const Args& args) {
+  SpeculationOptions speculation;
+  speculation.max_draft = args.get_int("speculate", 0);
+  LK_CHECK(speculation.max_draft >= 0, "--speculate must not be negative");
+  if (args.has("draft-reference")) speculation.reference = parse_tokens(read_text_file(args.get("draft-reference")));
+  speculation.drafter = parse_drafter(args.get("drafter", "lookup"));
+  return speculation;
 }
 
 SamplingParams sampling_options(const Args& args) {
@@ -335,17 +350,7 @@ int cmd_generate(const Args& args) {
   std::vector<int32_t> tokens = prompt_tokens(args);
   GenerationTiming timing;
   inject_images(args, *model, tokens);
-  // --speculate N drafts up to N tokens per verify pass from the prompt and
-  // the output so far, and from --draft-reference's tokens when given.
-  SpeculationOptions speculation;
-  speculation.max_draft = args.get_int("speculate", 0);
-  LK_CHECK(speculation.max_draft >= 0, "--speculate must not be negative");
-  if (args.has("draft-reference")) speculation.reference = parse_tokens(read_text_file(args.get("draft-reference")));
-  // --drafter mtp drafts with the model's multi-token prediction head (in
-  // the checkpoint, or --draft-model's qwen3_5_mtp drafter); both prefers a
-  // lookup draft when there is one.
-  speculation.drafter = parse_drafter(args.get("drafter", "lookup"));
-  model->set_speculation(std::move(speculation));
+  model->set_speculation(speculation_options(args));
   auto generated = model->generate(tokens, args.get_int("max-new", 16), sampling_options(args),
                                    !args.has("no-eos-stop"), &timing);
   std::string text;
@@ -585,6 +590,8 @@ int cmd_serve(const Args& args) {
   return 0;
 }
 
+// With --speculate, an untimed plain greedy run first gives the tokens every
+// repetition must reproduce: speculation may only change the speed.
 int cmd_bench(const Args& args) {
   LoadOptions options = load_options(args);
   const double load_start = now_seconds();
@@ -595,10 +602,22 @@ int cmd_bench(const Args& args) {
   const int warmups = args.get_int("warmups", 2);
   const int repetitions = args.get_int("repetitions", 5);
   LK_CHECK(max_new >= 2, "--max-new must be at least 2");
+  SpeculationOptions speculation = speculation_options(args);
+  const bool speculating = speculation.max_draft > 0;
+  LK_CHECK(!speculating || model->can_verify(), std::string(model->backend()) + ": cannot verify drafts");
+  std::vector<int32_t> plain;
+  if (speculating) {
+    model->reset();
+    plain = model->generate_greedy(prompt, max_new, false, nullptr);
+  }
+  const std::string drafter = args.get("drafter", "lookup");
+  const int max_draft = speculation.max_draft;
+  model->set_speculation(std::move(speculation));
 
   std::ostringstream reps;
   reps << "[";
   bool invariant = true;
+  bool matches_plain = true;
   std::vector<int32_t> reference;
   for (int run = 0; run < warmups + repetitions; ++run) {
     model->reset();
@@ -608,29 +627,43 @@ int cmd_bench(const Args& args) {
     if (run < warmups) continue;
     if (reference.empty()) reference = tokens;
     invariant = invariant && tokens == reference;
+    matches_plain = matches_plain && (!speculating || tokens == plain);
     std::vector<double> intervals;
     for (size_t i = 1; i < timing.token_times.size(); ++i) {
       intervals.push_back(1000.0 * (timing.token_times[i] - timing.token_times[i - 1]));
     }
+    // A verify pass emits its tokens together, so most intervals are zero;
+    // the mean is the time per token there.
+    const double inter_token_ms = speculating ? 1000.0 * timing.decode_seconds / (max_new - 1) : median(intervals);
     const double ttft_ms = 1000.0 * timing.prefill_seconds;
     const double total = timing.prefill_seconds + timing.decode_seconds;
+    const SpeculationStats& stats = model->speculation_stats();
     reps << (run > warmups ? "," : "") << "{\"ttft_ms\":" << ttft_ms
-         << ",\"inter_token_latency_ms\":" << median(intervals)
+         << ",\"inter_token_latency_ms\":" << inter_token_ms
          << ",\"prompt_tokens_per_second\":" << prompt.size() / timing.prefill_seconds
          << ",\"decode_tokens_per_second\":" << (max_new - 1) / timing.decode_seconds
          << ",\"aggregate_tokens_per_second_including_prefill\":" << max_new / total
-         << ",\"peak_memory_gb\":" << peak_rss_bytes() / 1e9
-         << ",\"token_ids\":" << json_tokens(tokens) << "}";
+         << ",\"peak_memory_gb\":" << peak_rss_bytes() / 1e9;
+    if (speculating) {
+      reps << ",\"speculation\":{\"passes\":" << stats.passes << ",\"drafted\":" << stats.drafted
+           << ",\"accepted\":" << stats.accepted << "}";
+    }
+    reps << ",\"token_ids\":" << json_tokens(tokens) << "}";
   }
   reps << "]";
+  const std::string speculated =
+      speculating ? "{\"max_draft\":" + std::to_string(max_draft) + ",\"drafter\":" + json_string(drafter) +
+                        ",\"inter_token_latency\":\"mean\",\"matches_plain_greedy\":" +
+                        (matches_plain ? "true" : "false") + "}"
+                  : "null";
   std::printf(
       "{\"runner\":\"lokahi-native-%s\",\"backend\":\"%s\",\"architecture\":\"%s\","
       "\"load_seconds\":%.6f,\"weight_bytes\":%zu,\"prompt_tokens\":%zu,\"output_tokens\":%d,"
-      "\"warmups\":%d,\"repetition_token_invariance\":%s,\"peak_memory_semantics\":"
+      "\"warmups\":%d,\"repetition_token_invariance\":%s,\"speculation\":%s,\"peak_memory_semantics\":"
       "\"process peak resident set size\",\"repetitions\":%s}\n",
       model->backend(), model->backend(), model->architecture(), load_seconds, model->weight_bytes(),
-      prompt.size(), max_new, warmups, invariant ? "true" : "false", reps.str().c_str());
-  return invariant ? 0 : 1;
+      prompt.size(), max_new, warmups, invariant ? "true" : "false", speculated.c_str(), reps.str().c_str());
+  return invariant && matches_plain ? 0 : 1;
 }
 
 std::string json_sections(const Profiler& profiler) {
