@@ -1,11 +1,12 @@
 // Lokahi Metal kernels for decoders (Gemma 3, Gemma 4, the Llama family and
 // DeepSeek).
 //
-// Activations are float32. Linear weights are MLX affine-quantized codes with
-// BF16 or F16 per-group scales and biases, or (in the matrix-vector kernels)
-// MXFP4: E2M1 codes with one E8M0 exponent per 32 values. Quantization
-// parameters are function constants so each pipeline is specialized at load
-// time.
+// Activations are float32. Linear weights are MLX affine-quantized codes (2,
+// 3, 4, 5, 6 or 8 bits) with BF16 or F16 per-group scales and biases, or (in
+// the matrix-vector kernels) MXFP4: E2M1 codes with one E8M0 exponent per 32
+// values. MLX packs each row as one little-endian bit stream, so 3-, 5- and
+// 6-bit codes straddle words. Quantization parameters are function constants
+// so each pipeline is specialized at load time.
 #include <metal_stdlib>
 #include <metal_simdgroup_matrix>
 using namespace metal;
@@ -35,10 +36,45 @@ inline float scale_at(const device ushort* values, int index) {
   return float(as_type<half>(bits));
 }
 
-// Dot product of 16 consecutive codes (starting at a 16-value boundary) with x.
-inline float dot16(const device uint* w, thread const float* x) {
+// Whether a QBITS-bit code never straddles words (2, 4 and 8 bits).
+inline bool whole_codes() { return 32 % QBITS == 0; }
+
+// The codes from `units` little-endian `unit`-bit integers (bytes or
+// halfwords) as one bit stream: count codes of QBITS bits, in order.
+template <typename Unit, int Count>
+inline void stream_codes(const device Unit* units, thread uint* codes) {
+  constexpr int kUnitBits = 8 * int(sizeof(Unit));
+  uint buffer = 0;
+  int have = 0;
+  int next = 0;
+  for (int j = 0; j < Count; ++j) {
+    if (have < QBITS) {
+      buffer |= uint(units[next++]) << have;
+      have += kUnitBits;
+    }
+    codes[j] = buffer & ((1u << QBITS) - 1u);
+    buffer >>= QBITS;
+    have -= QBITS;
+  }
+}
+
+// Code c of a row of packed codes.
+inline uint code_at(const device uint* row, int c) {
+  const int bit = c * QBITS;
+  uint value = row[bit >> 5] >> (bit & 31);
+  if ((bit & 31) + QBITS > 32) value |= row[(bit >> 5) + 1] << (32 - (bit & 31));
+  return value & ((1u << QBITS) - 1u);
+}
+
+// Dot product of a row's 16 codes from k0 (a multiple of 16) with x.
+inline float dot16(const device uint* row, int k0, thread const float* x) {
   float acc = 0.0f;
-  if (QBITS == 4) {
+  const device uint* w = row + k0 * QBITS / 32;
+  if (!whole_codes()) {  // 16 codes fill QBITS halfwords
+    uint codes[16];
+    stream_codes<ushort, 16>(reinterpret_cast<const device ushort*>(row) + k0 * QBITS / 16, codes);
+    for (int j = 0; j < 16; ++j) acc += float(codes[j]) * x[j];
+  } else if (QBITS == 4) {
     uint2 ww = *reinterpret_cast<const device uint2*>(w);
     for (int j = 0; j < 8; ++j) acc += float((ww.x >> (4 * j)) & 0xFu) * x[j];
     for (int j = 0; j < 8; ++j) acc += float((ww.y >> (4 * j)) & 0xFu) * x[8 + j];
@@ -104,12 +140,10 @@ kernel void embed_rows(const device uint* w [[buffer(0)]],
   const int c = int(gid.x);
   const int t = int(gid.y);
   if (c >= p.cols || t >= p.n) return;
-  const int per_word = 32 / QBITS;
-  const int words_per_row = p.cols / per_word;
+  const int words_per_row = p.cols * QBITS / 32;
   const int groups_per_row = p.cols / QGROUP;
   const int token = tokens[t];
-  const uint word = w[token * words_per_row + c / per_word];
-  const uint code = (word >> (QBITS * (c % per_word))) & ((1u << QBITS) - 1u);
+  const uint code = code_at(w + token * words_per_row, c);
   const int g = token * groups_per_row + c / QGROUP;
   out[t * p.cols + c] = (scale_at(scales, g) * float(code) + scale_at(biases, g)) * p.scale;
 }
@@ -275,9 +309,8 @@ inline void qmv_accumulate(const device uint* w, const device ushort* scales,
     for (int r = 0; r < QMV_ROWS; ++r) {
       const int row = row0 + r;
       if (row < rows) {
-        const device uint* wr = w + row * words_per_row + k0 * QBITS / 32;
         const int gi = row * groups_per_row + g;
-        acc[r] += scale_at(scales, gi) * dot16(wr, xv) + scale_at(biases, gi) * xsum;
+        acc[r] += scale_at(scales, gi) * dot16(w + row * words_per_row, k0, xv) + scale_at(biases, gi) * xsum;
       }
     }
   }
@@ -589,26 +622,35 @@ kernel void qmv_t_heads(const device uint* w [[buffer(0)]],
                         uint pair [[threadgroup_position_in_grid]],
                         uint tid [[thread_position_in_threadgroup]],
                         uint tpg [[threads_per_threadgroup]]) {
-  const int per_word = 32 / QBITS;
+  // A thread's unit is a word, or 16 codes (QBITS halfwords) when codes
+  // straddle words.
+  const int per_unit = whole_codes() ? 32 / QBITS : 16;
   const uint mask = (1u << QBITS) - 1u;
-  const int words_per_row = p.cols / per_word;
+  const int words_per_row = p.cols * QBITS / 32;
+  const int units = p.cols / per_unit;
   const int groups_per_row = p.cols / QGROUP;
   const int h = int(pair) % p.heads;
   const device float* xr = x + int(pair) * p.x_stride;
   device float* yr = y + int(pair) * p.y_stride;
-  for (int word = int(tid); word < words_per_row; word += int(tpg)) {
+  for (int unit = int(tid); unit < units; unit += int(tpg)) {
     float acc[16];
-    for (int j = 0; j < per_word; ++j) acc[j] = 0.0f;
-    const int g = word * per_word / QGROUP;
+    for (int j = 0; j < per_unit; ++j) acc[j] = 0.0f;
+    const int g = unit * per_unit / QGROUP;
     for (int d = 0; d < p.nope; ++d) {
       const int row = h * p.head_rows + d;
-      const uint codes = w[row * words_per_row + word];
+      uint codes[16];
+      if (whole_codes()) {
+        const uint word = w[row * words_per_row + unit];
+        for (int j = 0; j < per_unit; ++j) codes[j] = (word >> (QBITS * j)) & mask;
+      } else {
+        stream_codes<ushort, 16>(reinterpret_cast<const device ushort*>(w + row * words_per_row) + unit * QBITS, codes);
+      }
       const float scale = scale_at(scales, row * groups_per_row + g);
       const float bias = scale_at(biases, row * groups_per_row + g);
       const float xv = xr[d];
-      for (int j = 0; j < per_word; ++j) acc[j] += xv * (scale * float((codes >> (QBITS * j)) & mask) + bias);
+      for (int j = 0; j < per_unit; ++j) acc[j] += xv * (scale * float(codes[j]) + bias);
     }
-    for (int j = 0; j < per_word; ++j) yr[word * per_word + j] = acc[j];
+    for (int j = 0; j < per_unit; ++j) yr[unit * per_unit + j] = acc[j];
   }
 }
 
@@ -817,7 +859,11 @@ kernel void qmm(const device uint* w [[buffer(0)]],
         const float s = scale_at(scales, gi);
         const float b = scale_at(biases, gi);
         const device uint* wr = w + row * words_per_row;
-        if (QBITS == 4) {
+        if (!whole_codes()) {  // 8 codes fill QBITS bytes
+          uint codes[8];
+          stream_codes<uchar, 8>(reinterpret_cast<const device uchar*>(wr) + col * QBITS / 8, codes);
+          for (int j = 0; j < 8; ++j) vals[j] = s * float(codes[j]) + b;
+        } else if (QBITS == 4) {
           const uint word = wr[col / 8];
           for (int j = 0; j < 8; ++j) vals[j] = s * float((word >> (4 * j)) & 0xFu) + b;
         } else if (QBITS == 8) {
