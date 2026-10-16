@@ -1,11 +1,11 @@
 // Decoder-only transformers (Gemma 3, Gemma 4, Llama 3.x, Mistral, Qwen 2/2.5,
-// Qwen 3, Qwen 3 MoE, GPT-OSS, GLM-4.5): configuration, weight binding, and
-// the CPU backend.
+// Qwen 3, Qwen 3 MoE, GPT-OSS, GLM-4.5, DeepSeek V2 and V3): configuration,
+// weight binding, and the CPU backend.
 // One configuration describes how the families differ (norm style and
 // placement, activation, per-head Q/K norm, q/k/v biases, RoPE bases,
-// scaling and partial rotation, sliding windows, logit soft-capping, and
-// Gemma 4's per-layer geometry, KV sharing and per-layer inputs, and
-// mixture-of-experts layers), so a family
+// scaling and partial rotation, sliding windows, logit soft-capping,
+// Gemma 4's per-layer geometry, KV sharing and per-layer inputs, DeepSeek's
+// multi-head latent attention, and mixture-of-experts layers), so a family
 // is a config parser rather than a fork. Both backends implement every
 // option; the Metal backend refuses only matrix formats its kernels lack.
 #pragma once
@@ -112,7 +112,8 @@ struct DecoderConfig {
   int moe_intermediate = 0;
   bool norm_topk_prob = false;
   std::vector<bool> layer_moe;
-  // Softmax: softmax over all experts, then the top k (Qwen 3 MoE).
+  // Softmax: softmax over all experts, then the top k, weighted by their
+  // probabilities times routed_scaling (Qwen 3 MoE, DeepSeek V2).
   // TopKSoftmax: the top k router logits, then a softmax over them (GPT-OSS).
   // SigmoidGrouped: sigmoid scores plus a correction bias choose the top k
   // within the best topk_group of n_group groups; the raw scores of the
@@ -133,6 +134,28 @@ struct DecoderConfig {
   // through the usual post-feedforward norm. Each routing weight is also
   // multiplied by its expert's per_expert_scale.
   bool experts_beside_mlp = false;
+  // Experts of the groups SigmoidGrouped drops can never be chosen
+  // (DeepSeek V3, as Transformers and DeepSeek's reference code mask them to
+  // -inf) rather than competing with selection score 0 (GLM-4.5, MLX-LM).
+  // A Softmax router with n_group > 1 keeps the topk_group groups with the
+  // largest probabilities (DeepSeek V2's group_limited_greedy).
+  bool exclude_dropped_groups = false;
+
+  // Multi-head latent attention (DeepSeek V2 and V3), enabled by
+  // kv_lora_rank > 0. Each token caches one latent: kv_lora_rank RMS-normed
+  // dimensions every head shares plus a qk_rope_dim RoPE'd key. A head's
+  // query has qk_nope_dim + qk_rope_dim dimensions (head_dim); its unrotated
+  // part is absorbed into the latent space, so attention runs over the cache
+  // as one key head of latent_width() whose first kv_lora_rank dimensions
+  // are also the value, and each head's latent output is expanded to
+  // v_head_dim before o_proj. rotary_dim is qk_rope_dim.
+  int kv_lora_rank = 0;
+  int q_lora_rank = 0;  // the query's own low rank; 0 for a direct q_proj
+  int qk_nope_dim = 0, qk_rope_dim = 0, v_head_dim = 0;
+  bool rope_pairs = false;   // rotate interleaved pairs rather than halves (MLA only)
+  float rope_factor = 1.0f;  // YaRN's attention factor, on the RoPE'd dimensions only (MLA only)
+  bool mla() const { return kv_lora_rank > 0; }
+  int latent_width() const { return kv_lora_rank + qk_rope_dim; }
 
   static DecoderConfig from_json(const Json& raw);
   // RoPE inverse frequencies (half the layer kind's head size); rotations a
@@ -171,6 +194,17 @@ struct DecoderLayer {
   // weight scales, and the extra norms.
   std::vector<float> router_input_scale, per_expert_scale, mlp_post_norm_1, expert_norm, expert_post_norm;
   Linear shared_gate, shared_up, shared_down;    // the shared expert, with shared_intermediate
+  // Multi-head latent attention: q_proj is q_b_proj when there is a query
+  // rank, after q_a_proj and q_a_norm; kv_a_proj gives the latent and the
+  // RoPE key, and kv_a_norm normalizes the latent. Per head, embed_q
+  // [kv_lora_rank, qk_nope_dim] absorbs the query into the latent and
+  // unembed_out [v_head_dim, kv_lora_rank] expands the latent output: MLX's
+  // tensors of those names, or views of kv_b_proj (whose key rows are
+  // transposed into embed_q_storage, float32).
+  Linear q_a_proj, kv_a_proj;
+  std::vector<float> q_a_norm, kv_a_norm;
+  std::vector<Linear> embed_q, unembed_out;
+  std::vector<float> embed_q_storage;
   // Per-layer inputs (Gemma 4): gate [P, hidden], projection [hidden, P].
   Linear per_layer_gate, per_layer_proj;
   std::vector<float> per_layer_norm;

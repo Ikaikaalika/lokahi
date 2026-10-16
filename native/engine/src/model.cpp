@@ -109,9 +109,9 @@ std::unique_ptr<Model> load_model(const std::string& directory, const LoadOption
   auto weights = DecoderWeights::load(directory);
   std::string backend = options.backend;
 #if defined(LOKAHI_WITH_METAL)
-  // Metal reads MXFP4 only for experts so far.
+  // Metal reads MXFP4 only for experts so far, and has no latent attention.
   if (backend == "auto") {
-    const bool metal = !weights->dense_mxfp4();
+    const bool metal = !weights->dense_mxfp4() && !weights->config.mla();
     backend = metal && metal_available() ? "metal" : "cpu";
   }
   if (backend == "metal") return make_decoder_metal(std::move(weights), options);

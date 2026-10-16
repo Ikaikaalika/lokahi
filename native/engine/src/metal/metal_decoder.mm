@@ -333,6 +333,8 @@ class DecoderMetal final : public Model {
   // ---- setup --------------------------------------------------------------
 
   void validate() const {
+    LK_CHECK(!c_.mla(), "metal: multi-head latent attention (" + c_.architecture +
+                            ") is not implemented yet; use --backend cpu");
     // Experts run only through the matrix-vector kernels, which also read
     // MXFP4; other matrices must be affine.
     auto check_any = [&](const Linear& l) {

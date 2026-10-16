@@ -43,6 +43,12 @@ bool is_llama_family(const Json& raw) {
          type == "gpt_oss" || type == "glm4_moe";
 }
 
+// DeepSeek V2 and V3; Kimi K2 and Moonlight use V3's architecture.
+bool is_deepseek(const Json& raw) {
+  const std::string type = model_type(raw);
+  return type == "deepseek_v2" || type == "deepseek_v3" || type == "kimi_k2";
+}
+
 bool flag(const Json& cfg, const char* key) {
   const Json* value = cfg.find(key);
   return value != nullptr && value->is_bool() && value->as_bool();
@@ -238,6 +244,30 @@ DecoderConfig gemma4_config(const Json& raw) {
   return c;
 }
 
+double yarn_mscale(double scale, double m) { return scale <= 1.0 ? 1.0 : 0.1 * m * std::log(scale) + 1.0; }
+
+// YaRN from `rope_scaling` into `y`, as Transformers'
+// _compute_yarn_parameters reads it, including `truncate` (which GPT-OSS
+// sets false and MLX-LM ignores). Returns the attention factor the
+// references scale cos and sin by.
+double parse_yarn(const Json& cfg, const Json& scaling, RopeScaling& y) {
+  y.kind = RopeScaling::Kind::Yarn;
+  y.original_max_positions = scaling.at("original_max_position_embeddings").as_number();
+  const Json* factor = scaling.find("factor");
+  y.factor = factor != nullptr && factor->is_number()
+                 ? factor->as_number()
+                 : cfg.at("max_position_embeddings").as_number() / y.original_max_positions;
+  const double fast = scaling.number_or("beta_fast", 0.0), slow = scaling.number_or("beta_slow", 0.0);
+  y.beta_fast = fast != 0.0 ? fast : 32.0;
+  y.beta_slow = slow != 0.0 ? slow : 1.0;
+  const Json* truncate = scaling.find("truncate");
+  y.truncate = truncate == nullptr || !truncate->is_bool() || truncate->as_bool();
+  const double attention = scaling.number_or("attention_factor", 0.0);
+  if (attention != 0.0) return attention;
+  const double m = scaling.number_or("mscale", 0.0), all = scaling.number_or("mscale_all_dim", 0.0);
+  return m != 0.0 && all != 0.0 ? yarn_mscale(y.factor, m) / yarn_mscale(y.factor, all) : yarn_mscale(y.factor, 1.0);
+}
+
 // Llama 3.x, Mistral, Qwen 2/2.5, Qwen 3, Qwen 3 MoE and GPT-OSS: pre-norm
 // blocks with plain RMSNorm, gated MLPs and rotate-half RoPE. Qwen 3 adds
 // per-head Q/K norm, Qwen 2 adds q/k/v biases, Mistral may use a sliding
@@ -297,28 +327,10 @@ DecoderConfig llama_family_config(const Json& cfg) {
       c.rope_scaling.kind = RopeScaling::Kind::Linear;
       c.rope_scaling.factor = scaling->at("factor").as_number();
     } else if (kind == "yarn") {
-      // Transformers' _compute_yarn_parameters, including `truncate` (which
-      // GPT-OSS sets false and MLX-LM ignores).
-      RopeScaling& y = c.rope_scaling;
-      y.kind = RopeScaling::Kind::Yarn;
-      y.original_max_positions = scaling->at("original_max_position_embeddings").as_number();
-      const Json* factor = scaling->find("factor");
-      y.factor = factor != nullptr && factor->is_number()
-                     ? factor->as_number()
-                     : cfg.at("max_position_embeddings").as_number() / y.original_max_positions;
-      const double fast = scaling->number_or("beta_fast", 0.0), slow = scaling->number_or("beta_slow", 0.0);
-      y.beta_fast = fast != 0.0 ? fast : 32.0;
-      y.beta_slow = slow != 0.0 ? slow : 1.0;
-      const Json* truncate = scaling->find("truncate");
-      y.truncate = truncate == nullptr || !truncate->is_bool() || truncate->as_bool();
-      auto mscale = [](double scale, double m) { return scale <= 1.0 ? 1.0 : 0.1 * m * std::log(scale) + 1.0; };
-      double attention = scaling->number_or("attention_factor", 0.0);
-      if (attention == 0.0) {
-        const double m = scaling->number_or("mscale", 0.0), all = scaling->number_or("mscale_all_dim", 0.0);
-        attention = m != 0.0 && all != 0.0 ? mscale(y.factor, m) / mscale(y.factor, all) : mscale(y.factor, 1.0);
-      }
-      // The references scale cos and sin, so q and k, by `attention`; that is
-      // the same as scaling every attention logit by its square.
+      // The references scale cos and sin, so q and k, by the attention
+      // factor; that is the same as scaling every attention logit by its
+      // square.
+      const double attention = parse_yarn(cfg, *scaling, c.rope_scaling);
       c.attn_scale *= static_cast<float>(attention * attention);
     } else {
       LK_CHECK(kind == "default", arch + ": rope_scaling type '" + kind + "' is not supported");
@@ -404,17 +416,117 @@ DecoderConfig llama_family_config(const Json& cfg) {
   return c;
 }
 
+// DeepSeek V2 and V3 (Kimi K2 and Moonlight are V3): multi-head latent
+// attention with RoPE, and YaRN, on its rope dimensions only; pre-norm
+// blocks with dense MLPs before first_k_dense_replace and routed experts plus
+// always-on shared experts after. V3 routes as GLM-4.5 does, except that the
+// dropped groups' experts are excluded outright; V2 takes the top softmax
+// probabilities (within the topk_group groups with the largest maxima under
+// group_limited_greedy) and scales them by routed_scaling_factor. The
+// routing fields are read without defaults, which Transformers and MLX-LM
+// disagree on; options these checkpoints do not use fail closed.
+DecoderConfig deepseek_config(const Json& raw) {
+  const Json& cfg = text_config(raw);
+  DecoderConfig c;
+  const bool v3 = model_type(raw) != "deepseek_v2";
+  c.architecture = v3 ? "deepseek_v3" : "deepseek_v2";
+  const std::string& arch = c.architecture;
+  c.vocab_size = static_cast<int>(cfg.at("vocab_size").as_int());
+  c.hidden_size = static_cast<int>(cfg.at("hidden_size").as_int());
+  c.intermediate_size = static_cast<int>(cfg.at("intermediate_size").as_int());
+  c.num_layers = static_cast<int>(cfg.at("num_hidden_layers").as_int());
+  c.num_heads = static_cast<int>(cfg.at("num_attention_heads").as_int());
+  c.num_kv_heads = c.num_heads;  // unused: the latent cache is one key head
+  c.kv_lora_rank = static_cast<int>(cfg.at("kv_lora_rank").as_int());
+  const Json* q_rank = cfg.find("q_lora_rank");
+  c.q_lora_rank = q_rank != nullptr && q_rank->is_number() ? static_cast<int>(q_rank->as_int()) : 0;
+  c.qk_nope_dim = static_cast<int>(cfg.at("qk_nope_head_dim").as_int());
+  c.qk_rope_dim = static_cast<int>(cfg.at("qk_rope_head_dim").as_int());
+  c.v_head_dim = static_cast<int>(cfg.at("v_head_dim").as_int());
+  LK_CHECK(c.kv_lora_rank > 0 && c.q_lora_rank >= 0 && c.qk_nope_dim > 0 && c.qk_rope_dim > 0 &&
+               c.qk_rope_dim % 2 == 0 && c.v_head_dim > 0,
+           arch + ": invalid latent attention sizes");
+  c.head_dim = c.qk_nope_dim + c.qk_rope_dim;
+  c.rotary_dim = c.qk_rope_dim;
+  c.rms_norm_eps = static_cast<float>(cfg.number_or("rms_norm_eps", 1e-6));
+  c.rope_theta = static_cast<float>(cfg.number_or("rope_theta", 1e4));
+  // V2 rotates interleaved pairs; V3 too unless rope_interleave is false.
+  const Json* interleave = cfg.find("rope_interleave");
+  c.rope_pairs = !v3 || interleave == nullptr || !interleave->is_bool() || interleave->as_bool();
+  const std::string activation = cfg.string_or("hidden_act", "silu");
+  LK_CHECK(activation == "silu", arch + ": unsupported activation " + activation);
+  LK_CHECK(!flag(cfg, "attention_bias"), arch + ": attention_bias is not supported");
+  LK_CHECK(!flag(cfg, "mlp_bias"), arch + ": mlp_bias is not supported");
+  c.attn_scale = 1.0f / std::sqrt(static_cast<float>(c.head_dim));
+  if (const Json* scaling = cfg.find("rope_scaling"); scaling != nullptr && scaling->is_object()) {
+    const std::string kind = scaling->string_or("rope_type", scaling->string_or("type", "default"));
+    if (kind == "yarn") {
+      c.rope_factor = static_cast<float>(parse_yarn(cfg, *scaling, c.rope_scaling));
+      // yarn_apply_mscale: the softmax scale also takes mscale(factor,
+      // mscale_all_dim) squared.
+      const double all = scaling->number_or("mscale_all_dim", 0.0);
+      if (all != 0.0) {
+        const double m = yarn_mscale(scaling->number_or("factor", c.rope_scaling.factor), all);
+        c.attn_scale *= static_cast<float>(m * m);
+      }
+    } else {
+      LK_CHECK(kind == "default", arch + ": rope_scaling type '" + kind + "' is not supported");
+    }
+  }
+  c.layer_is_sliding.assign(static_cast<size_t>(c.num_layers), false);
+  c.eos_token_ids = eos_ids(raw, cfg);
+
+  const Json* routed = cfg.find("n_routed_experts");
+  if (routed == nullptr || !routed->is_number() || routed->as_int() == 0) return c;  // every layer dense
+  LK_CHECK(cfg.int_or("moe_layer_freq", 1) == 1, arch + ": moe_layer_freq other than 1 is not supported");
+  c.num_experts = static_cast<int>(routed->as_int());
+  c.experts_per_token = static_cast<int>(cfg.at("num_experts_per_tok").as_int());
+  c.moe_intermediate = static_cast<int>(cfg.at("moe_intermediate_size").as_int());
+  c.shared_intermediate = c.moe_intermediate * static_cast<int>(cfg.at("n_shared_experts").as_int());
+  c.routed_scaling = static_cast<float>(cfg.at("routed_scaling_factor").as_number());
+  c.norm_topk_prob = cfg.at("norm_topk_prob").as_bool();
+  const std::string method = cfg.at("topk_method").as_string();
+  if (v3) {
+    LK_CHECK(cfg.string_or("scoring_func", "sigmoid") == "sigmoid", arch + ": only sigmoid routing is supported");
+    LK_CHECK(method == "noaux_tc", arch + ": topk_method '" + method + "' is not supported");
+    c.router = DecoderConfig::Router::SigmoidGrouped;
+    c.exclude_dropped_groups = true;
+  } else {
+    LK_CHECK(cfg.string_or("scoring_func", "softmax") == "softmax", arch + ": only softmax routing is supported");
+    LK_CHECK(method == "greedy" || method == "group_limited_greedy",
+             arch + ": topk_method '" + method + "' is not supported");
+    // Transformers ignores norm_topk_prob here; DeepSeek's code renormalizes.
+    LK_CHECK(!c.norm_topk_prob, arch + ": norm_topk_prob is not supported");
+  }
+  if (method != "greedy") {
+    c.n_group = static_cast<int>(cfg.at("n_group").as_int());
+    c.topk_group = static_cast<int>(cfg.at("topk_group").as_int());
+  }
+  LK_CHECK(c.num_experts > 0 && c.experts_per_token > 0 && c.experts_per_token <= c.num_experts &&
+               c.moe_intermediate > 0 && c.shared_intermediate >= 0 && c.n_group > 0 &&
+               c.num_experts % c.n_group == 0 && c.topk_group > 0 && c.topk_group <= c.n_group &&
+               c.experts_per_token <= c.topk_group * (c.num_experts / c.n_group),
+           arch + ": invalid expert configuration");
+  const int dense = static_cast<int>(cfg.at("first_k_dense_replace").as_int());
+  for (int i = 0; i < c.num_layers; ++i) c.layer_moe.push_back(i >= dense);
+  return c;
+}
+
 }  // namespace
 
-bool is_supported_decoder(const Json& raw) { return is_gemma3(raw) || is_gemma4(raw) || is_llama_family(raw); }
+bool is_supported_decoder(const Json& raw) {
+  return is_gemma3(raw) || is_gemma4(raw) || is_llama_family(raw) || is_deepseek(raw);
+}
 
 DecoderConfig DecoderConfig::from_json(const Json& raw) {
   LK_CHECK(is_supported_decoder(raw),
            "unsupported architecture '" + model_type(raw) +
-               "'; this build supports gemma3, gemma4, llama, mistral, qwen2 and qwen3 text models");
-  DecoderConfig c = is_gemma3(raw)   ? gemma3_config(raw)
-                    : is_gemma4(raw) ? gemma4_config(raw)
-                                     : llama_family_config(raw);
+               "'; this build supports gemma3, gemma4, llama, mistral, qwen2, qwen3, qwen3_moe, gpt_oss, glm4_moe, "
+               "deepseek_v2 and deepseek_v3 text models");
+  DecoderConfig c = is_gemma3(raw)     ? gemma3_config(raw)
+                    : is_gemma4(raw)   ? gemma4_config(raw)
+                    : is_deepseek(raw) ? deepseek_config(raw)
+                                       : llama_family_config(raw);
   LK_CHECK(static_cast<int>(c.layer_is_sliding.size()) == c.num_layers,
            c.architecture + ": layer_types length mismatch");
   for (int l = 0; l < c.num_layers; ++l) {
@@ -572,6 +684,75 @@ void bind_experts(const DecoderWeights& w, DecoderLayer& layer, const std::strin
   }
 }
 
+// Multi-head latent attention's weights. MLX's absorbed conversions store
+// embed_q [heads, rank, nope] and unembed_out [heads, v, rank]; others store
+// kv_b_proj [heads * (nope + v), rank], whose value rows are unembed_out's
+// views and whose key rows, transposed, become embed_q (owned float32, so a
+// float checkpoint's are exact). No projection takes a bias.
+void bind_latent_attention(const DecoderWeights& w, DecoderLayer& layer, const std::string& base) {
+  const DecoderConfig& c = w.config;
+  const Checkpoint& ck = *w.checkpoint;
+  const std::string attn = c.weight_prefix + base + ".self_attn.";
+  auto linear = [&](const char* name) { return bind_linear(ck, w.raw_config, attn + name, attn + name); };
+  auto vector = [&](const char* name, int64_t size) {
+    std::vector<float> out(static_cast<size_t>(size));
+    load_vector(ck, attn + name + ".weight", size, out.data());
+    return out;
+  };
+  for (const char* name : {"q_proj", "q_a_proj", "q_b_proj", "kv_a_proj_with_mqa", "kv_b_proj", "o_proj"}) {
+    LK_CHECK(!ck.contains(attn + name + ".bias"), base + ".self_attn." + name + ": unexpected bias for " + c.architecture);
+  }
+  const int64_t H = c.num_heads, nope = c.qk_nope_dim, v = c.v_head_dim, rank = c.kv_lora_rank;
+  const int64_t q_out = H * c.head_dim;
+  if (c.q_lora_rank > 0) {
+    layer.q_a_proj = linear("q_a_proj");
+    layer.q_a_norm = vector("q_a_layernorm", c.q_lora_rank);
+    layer.q_proj = linear("q_b_proj");
+    LK_CHECK(layer.q_a_proj.rows == c.q_lora_rank && layer.q_a_proj.cols == c.hidden_size &&
+                 layer.q_proj.rows == q_out && layer.q_proj.cols == c.q_lora_rank,
+             base + ": q_a_proj/q_b_proj shape");
+  } else {
+    layer.q_proj = linear("q_proj");
+    LK_CHECK(layer.q_proj.rows == q_out && layer.q_proj.cols == c.hidden_size, base + ": q_proj shape");
+  }
+  layer.kv_a_proj = linear("kv_a_proj_with_mqa");
+  LK_CHECK(layer.kv_a_proj.rows == c.latent_width() && layer.kv_a_proj.cols == c.hidden_size,
+           base + ": kv_a_proj_with_mqa shape");
+  layer.kv_a_norm = vector("kv_a_layernorm", rank);
+  if (ck.contains(attn + "embed_q.weight")) {
+    layer.embed_q = bind_expert_linears(ck, w.raw_config, attn + "embed_q", attn + "embed_q");
+    layer.unembed_out = bind_expert_linears(ck, w.raw_config, attn + "unembed_out", attn + "unembed_out");
+  } else {
+    const Linear kv_b = linear("kv_b_proj");
+    LK_CHECK(kv_b.rows == H * (nope + v) && kv_b.cols == rank, base + ": kv_b_proj shape");
+    layer.embed_q_storage.resize(static_cast<size_t>(H * rank * nope));
+    std::vector<float> row(static_cast<size_t>(rank));
+    for (int64_t h = 0; h < H; ++h) {
+      float* keys = layer.embed_q_storage.data() + h * rank * nope;
+      for (int64_t d = 0; d < nope; ++d) {
+        dequantize_row(kv_b, h * (nope + v) + d, row.data());
+        for (int64_t r = 0; r < rank; ++r) keys[r * nope + d] = row[static_cast<size_t>(r)];
+      }
+      Linear embed;
+      embed.name = attn + "kv_b_proj (head " + std::to_string(h) + " keys, transposed)";
+      embed.rows = rank;
+      embed.cols = nope;
+      embed.dense = keys;
+      layer.embed_q.push_back(embed);
+      layer.unembed_out.push_back(row_slice(kv_b, h * (nope + v) + nope, v));
+    }
+  }
+  LK_CHECK(static_cast<int64_t>(layer.embed_q.size()) == H && static_cast<int64_t>(layer.unembed_out.size()) == H,
+           base + ": expected " + std::to_string(H) + " heads of embed_q and unembed_out");
+  for (int64_t h = 0; h < H; ++h) {
+    const Linear& e = layer.embed_q[static_cast<size_t>(h)];
+    const Linear& u = layer.unembed_out[static_cast<size_t>(h)];
+    LK_CHECK(e.rows == rank && e.cols == nope && u.rows == v && u.cols == rank, base + ": embed_q/unembed_out shape");
+  }
+  layer.o_proj = linear("o_proj");
+  LK_CHECK(layer.o_proj.rows == c.hidden_size && layer.o_proj.cols == H * v, base + ": o_proj shape");
+}
+
 }  // namespace
 
 std::shared_ptr<DecoderWeights> DecoderWeights::load(const std::string& directory) {
@@ -579,6 +760,13 @@ std::shared_ptr<DecoderWeights> DecoderWeights::load(const std::string& director
   w->raw_config = Json::parse(read_text_file(directory + "/config.json"));
   DecoderConfig& c = w->config;
   c = DecoderConfig::from_json(w->raw_config);
+  // FP8 block-quantized originals (DeepSeek V3, Kimi K2) store tensors the
+  // engine does not read; MLX-LM converts them.
+  if (const Json* hf = w->raw_config.find("quantization_config"); hf != nullptr && hf->is_object()) {
+    const std::string method = hf->string_or("quant_method", "");
+    LK_CHECK(method != "fp8", c.architecture + ": " + method +
+                                  " checkpoints are not supported; convert to MLX (or BF16) first");
+  }
   w->checkpoint = std::make_shared<Checkpoint>(Checkpoint::open_directory(directory));
   const Checkpoint& ck = *w->checkpoint;
   if (ck.contains("language_model.model.embed_tokens.weight")) c.weight_prefix = "language_model.";
@@ -626,6 +814,8 @@ std::shared_ptr<DecoderWeights> DecoderWeights::load(const std::string& director
     LK_CHECK(w->per_layer_model_proj.rows == width && w->per_layer_model_proj.cols == c.hidden_size,
              arch + ": per_layer_model_projection shape mismatch");
   }
+  // MLA layers point into their own storage, which moving keeps in place.
+  w->layers.reserve(static_cast<size_t>(c.num_layers));
   for (int i = 0; i < c.num_layers; ++i) {
     const std::string base = "model.layers." + std::to_string(i);
     const int64_t dim = c.head_dim_of(i);
@@ -645,7 +835,9 @@ std::shared_ptr<DecoderWeights> DecoderWeights::load(const std::string& director
       // Pre-norm families name the norm before the MLP post_attention_layernorm.
       layer.mlp_norm = vec(base + ".post_attention_layernorm", c.hidden_size);
     }
-    if (c.qk_norm) {
+    if (c.mla()) {
+      bind_latent_attention(*w, layer, base);
+    } else if (c.qk_norm) {
       layer.q_norm = vec(base + ".self_attn.q_norm", dim);
       if (own_kv) layer.k_norm = vec(base + ".self_attn.k_norm", dim);
     }
@@ -669,17 +861,19 @@ std::shared_ptr<DecoderWeights> DecoderWeights::load(const std::string& director
       layer.sinks.resize(static_cast<size_t>(c.num_heads));
       load_vector(ck, p + base + ".self_attn.sinks", c.num_heads, layer.sinks.data());
     }
-    layer.q_proj = linear(base + ".self_attn.q_proj");
-    if (own_kv) {
-      layer.k_proj = linear(base + ".self_attn.k_proj");
-      if (!c.k_eq_v(i)) layer.v_proj = linear(base + ".self_attn.v_proj");
-      LK_CHECK(layer.k_proj.rows == kv_out && layer.k_proj.cols == c.hidden_size &&
-                   (c.k_eq_v(i) || (layer.v_proj.rows == kv_out && layer.v_proj.cols == c.hidden_size)),
-               base + ": k/v shape");
+    if (!c.mla()) {
+      layer.q_proj = linear(base + ".self_attn.q_proj");
+      if (own_kv) {
+        layer.k_proj = linear(base + ".self_attn.k_proj");
+        if (!c.k_eq_v(i)) layer.v_proj = linear(base + ".self_attn.v_proj");
+        LK_CHECK(layer.k_proj.rows == kv_out && layer.k_proj.cols == c.hidden_size &&
+                     (c.k_eq_v(i) || (layer.v_proj.rows == kv_out && layer.v_proj.cols == c.hidden_size)),
+                 base + ": k/v shape");
+      }
+      layer.o_proj = linear(base + ".self_attn.o_proj");
+      LK_CHECK(layer.q_proj.rows == q_out && layer.q_proj.cols == c.hidden_size, base + ": q_proj shape");
+      LK_CHECK(layer.o_proj.rows == c.hidden_size && layer.o_proj.cols == q_out, base + ": o_proj shape");
     }
-    layer.o_proj = linear(base + ".self_attn.o_proj");
-    LK_CHECK(layer.q_proj.rows == q_out && layer.q_proj.cols == c.hidden_size, base + ": q_proj shape");
-    LK_CHECK(layer.o_proj.rows == c.hidden_size && layer.o_proj.cols == q_out, base + ": o_proj shape");
     if (c.is_moe(i)) bind_experts(*w, layer, base);
     if (c.is_moe(i) && c.experts_beside_mlp) {
       layer.mlp_post_norm_1 = vec(base + ".post_feedforward_layernorm_1", c.hidden_size);
@@ -723,8 +917,8 @@ size_t DecoderWeights::matrix_bytes() const {
              l.o_proj.weight_bytes() + l.gate_proj.weight_bytes() + l.up_proj.weight_bytes() +
              l.down_proj.weight_bytes() + l.per_layer_gate.weight_bytes() + l.per_layer_proj.weight_bytes() +
              l.router.weight_bytes() + l.shared_gate.weight_bytes() + l.shared_up.weight_bytes() +
-             l.shared_down.weight_bytes();
-    for (const auto* experts : {&l.expert_gate, &l.expert_up, &l.expert_down}) {
+             l.shared_down.weight_bytes() + l.q_a_proj.weight_bytes() + l.kv_a_proj.weight_bytes();
+    for (const auto* experts : {&l.expert_gate, &l.expert_up, &l.expert_down, &l.embed_q, &l.unembed_out}) {
       for (const Linear& expert : *experts) total += expert.weight_bytes();
     }
   }
@@ -739,8 +933,13 @@ bool DecoderWeights::dense_mxfp4() const {
   for (const auto& l : layers) {
     for (const Linear* m : {&l.q_proj, &l.k_proj, &l.v_proj, &l.o_proj, &l.gate_proj, &l.up_proj, &l.down_proj,
                             &l.per_layer_gate, &l.per_layer_proj, &l.router, &l.shared_gate, &l.shared_up,
-                            &l.shared_down}) {
+                            &l.shared_down, &l.q_a_proj, &l.kv_a_proj}) {
       if (m->quant.mxfp4()) return true;
+    }
+    for (const auto* heads : {&l.embed_q, &l.unembed_out}) {
+      for (const Linear& m : *heads) {
+        if (m.quant.mxfp4()) return true;
+      }
     }
   }
   return false;
@@ -767,6 +966,12 @@ double attention(const DecoderConfig& c, int layer, int start, int n) {
   for (int t = 0; t < n; ++t) {
     const int pos = start + t;
     keys += sliding ? std::min(pos + 1, c.sliding_window) : pos + 1;
+  }
+  if (c.mla()) {
+    // Absorbed queries and latent outputs, and each visible latent once (its
+    // prefix is also the value).
+    const double width = c.latent_width();
+    return 4.0 * (static_cast<double>(n) * c.num_heads * (width + c.kv_lora_rank) + keys * width);
   }
   const double head_bytes = 4.0 * c.head_dim_of(layer);
   return head_bytes * (2.0 * n * c.num_heads + 2.0 * keys * c.kv_heads_of(layer));
@@ -797,6 +1002,10 @@ float gelu_tanh(float x) {
 }
 
 float silu(float x) { return x / (1.0f + std::exp(-x)); }
+
+// The query and latent norms of multi-head latent attention, whatever
+// rms_norm_eps is (Transformers and MLX-LM construct them with 1e-6).
+constexpr float kLatentNormEps = 1e-6f;
 
 // Times the enclosing block into `profiler` as `name` (no-op without one).
 class Section {
@@ -830,6 +1039,14 @@ class DecoderCpu final : public Model {
       max_q_ = std::max<size_t>(max_q_, static_cast<size_t>(c_.num_heads) * c_.head_dim_of(l));
       max_kv_ = std::max<size_t>(max_kv_, static_cast<size_t>(c_.kv_heads_of(l)) * c_.head_dim_of(l));
       max_inter_ = std::max<size_t>(max_inter_, static_cast<size_t>(c_.intermediate_of(l)));
+      if (c_.mla()) {
+        // One latent per position; the values are its prefix.
+        max_q_ = std::max<size_t>(max_q_, static_cast<size_t>(c_.num_heads) * c_.v_head_dim);
+        max_kv_ = std::max<size_t>(max_kv_, static_cast<size_t>(c_.latent_width()));
+        capacity_[static_cast<size_t>(l)] = max_context_;
+        kv_k_[static_cast<size_t>(l)].assign(static_cast<size_t>(max_context_) * c_.latent_width(), 0.0f);
+        continue;
+      }
       if (c_.shares_kv(l)) continue;
       // Each pass writes its keys and values before attending, so a sliding
       // ring also holds the window behind the pass's first token: KV-shared
@@ -1039,62 +1256,66 @@ class DecoderCpu final : public Model {
         Section section(profiler_, "norm", norm_bytes);
         for (int t = 0; t < n; ++t) norm(x_.data() + t * hidden, L.attn_norm, hidden, h_.data() + t * hidden);
       }
-      {
-        Section section(profiler_, "qkv",
-                        profiling ? traffic::linear(L.q_proj, n) +
-                                        (own_kv ? traffic::linear(L.k_proj, n) : 0.0) +
-                                        (own_kv && !c_.k_eq_v(l) ? traffic::linear(L.v_proj, n) : 0.0)
-                                  : 0.0);
-        matmul(L.q_proj, h_.data(), n, q_.data(), pool_);
-        if (own_kv) {
-          matmul(L.k_proj, h_.data(), n, k_.data(), pool_);
-          if (c_.k_eq_v(l)) {
-            std::copy_n(k_.data(), sn * KV * D, v_.data());  // values are the raw key projection
-          } else {
-            matmul(L.v_proj, h_.data(), n, v_.data(), pool_);
-          }
-        }
-      }
-      {
-        Section section(profiler_, "rope_kv", profiling ? traffic::rows(D, n, 2 * H + (own_kv ? (c_.v_norm ? 6 : 4) * KV : 0)) : 0.0);
-        if (c_.qkv_bias) {
-          for (int t = 0; t < n; ++t) {
-            add_bias(q_.data() + static_cast<size_t>(t) * H * D, L.q_bias);
-            add_bias(k_.data() + static_cast<size_t>(t) * KV * D, L.k_bias);
-            add_bias(v_.data() + static_cast<size_t>(t) * KV * D, L.v_bias);
-          }
-        }
-        const auto& inv_freq = sliding ? inv_freq_local_ : inv_freq_global_;
-        const int rotated = c_.rotary_dim > 0 ? c_.rotary_dim : D;
-        for (int t = 0; t < n; ++t) {
-          for (int hh = 0; hh < H; ++hh) {
-            float* qv = q_.data() + (static_cast<size_t>(t) * H + hh) * D;
-            if (c_.qk_norm) norm(qv, L.q_norm, D, qv);
-            apply_rope(qv, rotated, start + t, inv_freq);
-          }
-          if (!own_kv) continue;
-          for (int kv = 0; kv < KV; ++kv) {
-            float* kvec = k_.data() + (static_cast<size_t>(t) * KV + kv) * D;
-            if (c_.qk_norm) norm(kvec, L.k_norm, D, kvec);
-            apply_rope(kvec, rotated, start + t, inv_freq);
-            if (c_.v_norm) {
-              float* vvec = v_.data() + (static_cast<size_t>(t) * KV + kv) * D;
-              rms_norm(vvec, nullptr, D, c_.rms_norm_eps, 0.0f, vvec);
+      if (c_.mla()) {
+        latent_attention(L, l, start, n);
+      } else {
+        {
+          Section section(profiler_, "qkv",
+                          profiling ? traffic::linear(L.q_proj, n) +
+                                          (own_kv ? traffic::linear(L.k_proj, n) : 0.0) +
+                                          (own_kv && !c_.k_eq_v(l) ? traffic::linear(L.v_proj, n) : 0.0)
+                                    : 0.0);
+          matmul(L.q_proj, h_.data(), n, q_.data(), pool_);
+          if (own_kv) {
+            matmul(L.k_proj, h_.data(), n, k_.data(), pool_);
+            if (c_.k_eq_v(l)) {
+              std::copy_n(k_.data(), sn * KV * D, v_.data());  // values are the raw key projection
+            } else {
+              matmul(L.v_proj, h_.data(), n, v_.data(), pool_);
             }
           }
-          store_kv(l, start + t, k_.data() + static_cast<size_t>(t) * KV * D,
-                   v_.data() + static_cast<size_t>(t) * KV * D);
         }
-      }
-      {
-        Section section(profiler_, "attention", profiling ? traffic::attention(c_, l, start, n) : 0.0);
-        attend(l, start, n, sliding, c_.attention_sinks ? L.sinks.data() : nullptr);
-      }
-      {
-        Section section(profiler_, "o_proj", profiling ? traffic::linear(L.o_proj, n) : 0.0);
-        matmul(L.o_proj, attn_.data(), n, r_.data(), pool_);
-        if (c_.o_bias) {
-          for (int t = 0; t < n; ++t) add_bias(r_.data() + static_cast<size_t>(t) * hidden, L.o_bias);
+        {
+          Section section(profiler_, "rope_kv", profiling ? traffic::rows(D, n, 2 * H + (own_kv ? (c_.v_norm ? 6 : 4) * KV : 0)) : 0.0);
+          if (c_.qkv_bias) {
+            for (int t = 0; t < n; ++t) {
+              add_bias(q_.data() + static_cast<size_t>(t) * H * D, L.q_bias);
+              add_bias(k_.data() + static_cast<size_t>(t) * KV * D, L.k_bias);
+              add_bias(v_.data() + static_cast<size_t>(t) * KV * D, L.v_bias);
+            }
+          }
+          const auto& inv_freq = sliding ? inv_freq_local_ : inv_freq_global_;
+          const int rotated = c_.rotary_dim > 0 ? c_.rotary_dim : D;
+          for (int t = 0; t < n; ++t) {
+            for (int hh = 0; hh < H; ++hh) {
+              float* qv = q_.data() + (static_cast<size_t>(t) * H + hh) * D;
+              if (c_.qk_norm) norm(qv, L.q_norm, D, qv);
+              apply_rope(qv, rotated, start + t, inv_freq);
+            }
+            if (!own_kv) continue;
+            for (int kv = 0; kv < KV; ++kv) {
+              float* kvec = k_.data() + (static_cast<size_t>(t) * KV + kv) * D;
+              if (c_.qk_norm) norm(kvec, L.k_norm, D, kvec);
+              apply_rope(kvec, rotated, start + t, inv_freq);
+              if (c_.v_norm) {
+                float* vvec = v_.data() + (static_cast<size_t>(t) * KV + kv) * D;
+                rms_norm(vvec, nullptr, D, c_.rms_norm_eps, 0.0f, vvec);
+              }
+            }
+            store_kv(l, start + t, k_.data() + static_cast<size_t>(t) * KV * D,
+                     v_.data() + static_cast<size_t>(t) * KV * D);
+          }
+        }
+        {
+          Section section(profiler_, "attention", profiling ? traffic::attention(c_, l, start, n) : 0.0);
+          attend(l, start, n, sliding, c_.attention_sinks ? L.sinks.data() : nullptr);
+        }
+        {
+          Section section(profiler_, "o_proj", profiling ? traffic::linear(L.o_proj, n) : 0.0);
+          matmul(L.o_proj, attn_.data(), n, r_.data(), pool_);
+          if (c_.o_bias) {
+            for (int t = 0; t < n; ++t) add_bias(r_.data() + static_cast<size_t>(t) * hidden, L.o_bias);
+          }
         }
       }
       {
@@ -1145,6 +1366,145 @@ class DecoderCpu final : public Model {
     }
   }
 
+  // RoPE on an MLA rope vector at `pos`: interleaved pairs or halves, then
+  // YaRN's attention factor, which the references fold into cos and sin.
+  void rope_latent(float* vec, int pos) const {
+    const int dims = c_.qk_rope_dim;
+    if (c_.rope_pairs) {
+      for (int i = 0; i < dims / 2; ++i) {
+        const double angle = static_cast<double>(pos) * inv_freq_global_[static_cast<size_t>(i)];
+        const float cs = static_cast<float>(std::cos(angle));
+        const float sn = static_cast<float>(std::sin(angle));
+        const float a = vec[2 * i], b = vec[2 * i + 1];
+        vec[2 * i] = a * cs - b * sn;
+        vec[2 * i + 1] = b * cs + a * sn;
+      }
+    } else {
+      apply_rope(vec, dims, pos, inv_freq_global_);
+    }
+    if (c_.rope_factor != 1.0f) {
+      for (int i = 0; i < dims; ++i) vec[i] *= c_.rope_factor;
+    }
+  }
+
+  // Multi-head latent attention over the normed rows in h_, into r_. Each
+  // head's unrotated query is absorbed into the latent space (embed_q), so
+  // the pass attends over the cached latents as one key head whose first
+  // kv_lora_rank dimensions are also the value; each head's latent output is
+  // then expanded (unembed_out) before o_proj. Each per-head matrix runs
+  // over all of the pass's tokens at once.
+  void latent_attention(const DecoderLayer& L, int l, int start, int n) {
+    const int H = c_.num_heads, nope = c_.qk_nope_dim, rank = c_.kv_lora_rank, V = c_.v_head_dim;
+    const int Dq = c_.head_dim, W = c_.latent_width();
+    const size_t sn = static_cast<size_t>(n);
+    const bool profiling = profiler_ != nullptr;
+    latent_q_.resize(sn * H * W);
+    latent_out_.resize(sn * H * rank);
+    head_in_.resize(sn * std::max(nope, rank));
+    head_out_.resize(sn * std::max(rank, V));
+    // Gathers head h's `width` values at `offset` of each of the pass's rows
+    // of `stride` into head_in_, and scatters head_out_ back likewise.
+    auto gather = [&](const float* rows, size_t stride, size_t offset, int width) {
+      for (int t = 0; t < n; ++t) std::copy_n(rows + t * stride + offset, width, head_in_.data() + static_cast<size_t>(t) * width);
+    };
+    auto scatter = [&](float* rows, size_t stride, size_t offset, int width) {
+      for (int t = 0; t < n; ++t) std::copy_n(head_out_.data() + static_cast<size_t>(t) * width, width, rows + t * stride + offset);
+    };
+    {
+      double bytes = 0.0;
+      if (profiling) {
+        bytes = traffic::linear(L.q_proj, n) + traffic::linear(L.kv_a_proj, n) +
+                (c_.q_lora_rank > 0 ? traffic::linear(L.q_a_proj, n) : 0.0);
+        for (const Linear& e : L.embed_q) bytes += traffic::linear(e, n);
+      }
+      Section section(profiler_, "qkv", bytes);
+      if (c_.q_lora_rank > 0) {
+        const int64_t Q = c_.q_lora_rank;
+        q_latent_.resize(sn * Q);
+        matmul(L.q_a_proj, h_.data(), n, q_latent_.data(), pool_);
+        for (int t = 0; t < n; ++t) {
+          float* row = q_latent_.data() + static_cast<size_t>(t) * Q;
+          rms_norm(row, L.q_a_norm.data(), Q, kLatentNormEps, 0.0f, row);
+        }
+        matmul(L.q_proj, q_latent_.data(), n, q_.data(), pool_);
+      } else {
+        matmul(L.q_proj, h_.data(), n, q_.data(), pool_);
+      }
+      matmul(L.kv_a_proj, h_.data(), n, k_.data(), pool_);
+      for (int hh = 0; hh < H; ++hh) {
+        gather(q_.data(), static_cast<size_t>(H) * Dq, static_cast<size_t>(hh) * Dq, nope);
+        matmul(L.embed_q[static_cast<size_t>(hh)], head_in_.data(), n, head_out_.data(), pool_);
+        scatter(latent_q_.data(), static_cast<size_t>(H) * W, static_cast<size_t>(hh) * W, rank);
+      }
+    }
+    {
+      Section section(profiler_, "rope_kv", profiling ? traffic::rows(W, n, 2 * H + 3) : 0.0);
+      for (int t = 0; t < n; ++t) {
+        float* latent = k_.data() + static_cast<size_t>(t) * W;
+        rms_norm(latent, L.kv_a_norm.data(), rank, kLatentNormEps, 0.0f, latent);
+        rope_latent(latent + rank, start + t);
+        std::copy_n(latent, W, kv_k_[static_cast<size_t>(l)].data() + static_cast<size_t>(start + t) * W);
+        for (int hh = 0; hh < H; ++hh) {
+          float* q_rope = latent_q_.data() + (static_cast<size_t>(t) * H + hh) * W + rank;
+          std::copy_n(q_.data() + (static_cast<size_t>(t) * H + hh) * Dq + nope, c_.qk_rope_dim, q_rope);
+          rope_latent(q_rope, start + t);
+        }
+      }
+    }
+    {
+      Section section(profiler_, "attention", profiling ? traffic::attention(c_, l, start, n) : 0.0);
+      attend_latent(l, start, n);
+    }
+    double bytes = 0.0;
+    if (profiling) {
+      bytes = traffic::linear(L.o_proj, n);
+      for (const Linear& u : L.unembed_out) bytes += traffic::linear(u, n);
+    }
+    Section section(profiler_, "o_proj", bytes);
+    for (int hh = 0; hh < H; ++hh) {
+      gather(latent_out_.data(), static_cast<size_t>(H) * rank, static_cast<size_t>(hh) * rank, rank);
+      matmul(L.unembed_out[static_cast<size_t>(hh)], head_in_.data(), n, head_out_.data(), pool_);
+      scatter(attn_.data(), static_cast<size_t>(H) * V, static_cast<size_t>(hh) * V, V);
+    }
+    matmul(L.o_proj, attn_.data(), n, r_.data(), pool_);
+  }
+
+  // Causal attention of the pass's absorbed queries (latent_q_) over layer
+  // l's cached latents, into latent_out_.
+  void attend_latent(int l, int start, int n) {
+    const int H = c_.num_heads, W = c_.latent_width(), rank = c_.kv_lora_rank;
+    const float* cache = kv_k_[static_cast<size_t>(l)].data();
+    pool_.parallel_for(static_cast<size_t>(n) * H, [&](size_t begin, size_t end) {
+      std::vector<float> scores;
+      for (size_t item = begin; item < end; ++item) {
+        const int pos = start + static_cast<int>(item / H);
+        const float* qv = latent_q_.data() + item * W;
+        scores.resize(static_cast<size_t>(pos + 1));
+        float max_score = -std::numeric_limits<float>::infinity();
+        for (int j = 0; j <= pos; ++j) {
+          const float* key = cache + static_cast<size_t>(j) * W;
+          float dot = 0.0f;
+          for (int d = 0; d < W; ++d) dot += qv[d] * key[d];
+          dot *= c_.attn_scale;
+          scores[static_cast<size_t>(j)] = dot;
+          max_score = std::max(max_score, dot);
+        }
+        float denom = 0.0f;
+        for (float& s : scores) {
+          s = std::exp(s - max_score);
+          denom += s;
+        }
+        float* out = latent_out_.data() + item * rank;
+        std::fill(out, out + rank, 0.0f);
+        for (int j = 0; j <= pos; ++j) {
+          const float p = scores[static_cast<size_t>(j)] / denom;
+          const float* value = cache + static_cast<size_t>(j) * W;
+          for (int d = 0; d < rank; ++d) out[d] += p * value[d];
+        }
+      }
+    });
+  }
+
   // gate[i] = act(gate[i]) * up[i]
   void gated_activation(float* gate, const float* up, size_t count) const {
     if (c_.activation == Activation::GeluTanh) {
@@ -1180,12 +1540,14 @@ class DecoderCpu final : public Model {
         std::partial_sort(member.begin(), member.begin() + std::min(2, per_group), member.end(), std::greater<>());
         group_scores.push_back({member[0] + (per_group > 1 ? member[1] : 0.0), g});
       }
-      // The references zero the n_group - topk_group lowest groups.
+      // The references zero (GLM-4.5) or exclude (DeepSeek V3) the
+      // n_group - topk_group lowest groups.
       std::stable_sort(group_scores.begin(), group_scores.end(),
                        [](const auto& a, const auto& b) { return a.first < b.first; });
+      const double dropped = c_.exclude_dropped_groups ? -std::numeric_limits<double>::infinity() : 0.0;
       for (int j = 0; j < groups - c_.topk_group; ++j) {
         const int g = group_scores[static_cast<size_t>(j)].second;
-        std::fill(selection.begin() + g * per_group, selection.begin() + (g + 1) * per_group, 0.0);
+        std::fill(selection.begin() + g * per_group, selection.begin() + (g + 1) * per_group, dropped);
       }
     }
     std::vector<int> order(static_cast<size_t>(E));
@@ -1200,6 +1562,24 @@ class DecoderCpu final : public Model {
     for (int j = 0; j < K; ++j) {
       chosen[j] = order[static_cast<size_t>(j)];
       weights[j] = static_cast<float>(scores[static_cast<size_t>(chosen[j])] * scale);
+    }
+  }
+
+  // DeepSeek V2's group_limited_greedy: only the topk_group groups with the
+  // largest probabilities compete; the others' experts are excluded (-1, as
+  // probabilities are never negative). Ties drop the lower group.
+  void drop_softmax_groups(std::vector<double>& probs) const {
+    const int groups = c_.n_group, per_group = c_.num_experts / groups;
+    std::vector<std::pair<double, int>> group_scores;
+    for (int g = 0; g < groups; ++g) {
+      const auto first = probs.begin() + g * per_group;
+      group_scores.push_back({*std::max_element(first, first + per_group), g});
+    }
+    std::stable_sort(group_scores.begin(), group_scores.end(),
+                     [](const auto& a, const auto& b) { return a.first < b.first; });
+    for (int j = 0; j < groups - c_.topk_group; ++j) {
+      const int g = group_scores[static_cast<size_t>(j)].second;
+      std::fill(probs.begin() + g * per_group, probs.begin() + (g + 1) * per_group, -1.0);
     }
   }
 
@@ -1258,7 +1638,7 @@ class DecoderCpu final : public Model {
       Section section(profiler_, "router", profiler_ ? traffic::linear(L.router, n) : 0.0);
       matmul(L.router, router_in, n, route_.data(), pool_);
       std::vector<int> order(static_cast<size_t>(E));
-      std::vector<double> probs(static_cast<size_t>(E));
+      std::vector<double> probs(static_cast<size_t>(E)), selection;
       for (int t = 0; t < n; ++t) {
         float* logits = route_.data() + static_cast<size_t>(t) * E;
         if (c_.router == DecoderConfig::Router::SigmoidGrouped) {
@@ -1270,9 +1650,11 @@ class DecoderCpu final : public Model {
         const float top = *std::max_element(logits, logits + E);
         double total = 0.0;
         for (int e = 0; e < E; ++e) total += probs[static_cast<size_t>(e)] = std::exp(static_cast<double>(logits[e]) - top);
+        selection.assign(probs.begin(), probs.end());
+        if (c_.n_group > 1) drop_softmax_groups(selection);
         for (int e = 0; e < E; ++e) order[static_cast<size_t>(e)] = e;
         std::partial_sort(order.begin(), order.begin() + K, order.end(), [&](int a, int b) {
-          const double pa = probs[static_cast<size_t>(a)], pb = probs[static_cast<size_t>(b)];
+          const double pa = selection[static_cast<size_t>(a)], pb = selection[static_cast<size_t>(b)];
           return pa > pb || (pa == pb && a < b);
         });
         double kept = 0.0;
@@ -1280,7 +1662,7 @@ class DecoderCpu final : public Model {
         // Over the chosen experts, a softmax of their logits is their
         // probabilities renormalized.
         const bool renormalize = c_.norm_topk_prob || c_.router == DecoderConfig::Router::TopKSoftmax;
-        const double scale = renormalize ? 1.0 / kept : 1.0 / total;
+        const double scale = (renormalize ? 1.0 / kept : 1.0 / total) * c_.routed_scaling;
         for (int j = 0; j < K; ++j) {
           const int e = order[static_cast<size_t>(j)];
           chosen_[static_cast<size_t>(t) * K + j] = e;
@@ -1446,6 +1828,9 @@ class DecoderCpu final : public Model {
   // weights [n, K], and one expert's gathered inputs and activations.
   std::vector<float> route_, weight_, expert_in_, expert_gate_, expert_up_, expert_out_;
   std::vector<float> dense_out_, router_in_;  // Gemma 4: the dense branch's output, the router's input
+  // MLA: the query latent [n, q_lora_rank], absorbed queries [n, H, latent
+  // width], latent outputs [n, H, rank], and one head's gathered rows.
+  std::vector<float> q_latent_, latent_q_, latent_out_, head_in_, head_out_;
   std::vector<int> chosen_;
 };
 

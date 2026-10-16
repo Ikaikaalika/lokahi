@@ -631,6 +631,123 @@ void test_glm_config() {
   EXPECT(inv.size() == 32 && inv[0] == 1.0 && std::fabs(inv[1] / std::pow(1e6, -2.0 / 64) - 1.0) < 1e-12);
 }
 
+// deepseek-ai/DeepSeek-V3's config.json, as published (FP8 weights; the
+// config alone parses).
+static const char* kDeepseekV3Config = R"({
+  "architectures": ["DeepseekV3ForCausalLM"], "attention_bias": false, "attention_dropout": 0.0, "bos_token_id": 0,
+  "eos_token_id": 1, "ep_size": 1, "first_k_dense_replace": 3, "hidden_act": "silu", "hidden_size": 7168,
+  "initializer_range": 0.02, "intermediate_size": 18432, "kv_lora_rank": 512, "max_position_embeddings": 163840,
+  "model_type": "deepseek_v3", "moe_intermediate_size": 2048, "moe_layer_freq": 1, "n_group": 8,
+  "n_routed_experts": 256, "n_shared_experts": 1, "norm_topk_prob": true, "num_attention_heads": 128,
+  "num_experts_per_tok": 8, "num_hidden_layers": 61, "num_key_value_heads": 128, "num_nextn_predict_layers": 1,
+  "q_lora_rank": 1536, "qk_nope_head_dim": 128, "qk_rope_head_dim": 64,
+  "quantization_config": {"activation_scheme": "dynamic", "fmt": "e4m3", "quant_method": "fp8",
+                          "weight_block_size": [128, 128]},
+  "rms_norm_eps": 1e-06, "rope_scaling": {"beta_fast": 32, "beta_slow": 1, "factor": 40, "mscale": 1.0,
+  "mscale_all_dim": 1.0, "original_max_position_embeddings": 4096, "type": "yarn"}, "rope_theta": 10000,
+  "routed_scaling_factor": 2.5, "scoring_func": "sigmoid", "tie_word_embeddings": false, "topk_group": 4,
+  "topk_method": "noaux_tc", "torch_dtype": "bfloat16", "transformers_version": "4.33.1", "use_cache": true,
+  "v_head_dim": 128, "vocab_size": 129280
+})";
+
+// mlx-community/DeepSeek-V2-Lite-Chat-4bit-mlx's config.json, as published.
+static const char* kDeepseekV2LiteConfig = R"({
+  "architectures": ["DeepseekV2ForCausalLM"], "attention_bias": false, "attention_dropout": 0.0,
+  "aux_loss_alpha": 0.001, "bos_token_id": 100000, "eos_token_id": 100001, "first_k_dense_replace": 1,
+  "hidden_act": "silu", "hidden_size": 2048, "initializer_range": 0.02, "intermediate_size": 10944,
+  "kv_lora_rank": 512, "max_position_embeddings": 163840, "model_type": "deepseek_v2",
+  "moe_intermediate_size": 1408, "moe_layer_freq": 1, "n_group": 1, "n_routed_experts": 64, "n_shared_experts": 2,
+  "norm_topk_prob": false, "num_attention_heads": 16, "num_experts_per_tok": 6, "num_hidden_layers": 27,
+  "num_key_value_heads": 16, "pretraining_tp": 1, "q_lora_rank": null, "qk_nope_head_dim": 128,
+  "qk_rope_head_dim": 64, "quantization": {"group_size": 64, "bits": 4}, "rms_norm_eps": 1e-06,
+  "rope_scaling": {"beta_fast": 32, "beta_slow": 1, "factor": 40, "mscale": 0.707, "mscale_all_dim": 0.707,
+                   "original_max_position_embeddings": 4096, "type": "yarn"},
+  "rope_theta": 10000, "routed_scaling_factor": 1.0, "scoring_func": "softmax", "seq_aux": true,
+  "tie_word_embeddings": false, "topk_group": 1, "topk_method": "greedy", "torch_dtype": "bfloat16",
+  "transformers_version": "4.33.1", "use_cache": true, "v_head_dim": 128, "vocab_size": 102400
+})";
+
+// moonshotai/Moonlight-16B-A3B-Instruct's config.json, as published.
+static const char* kMoonlightConfig = R"({
+  "architectures": ["DeepseekV3ForCausalLM"], "attention_bias": false, "attention_dropout": 0.0,
+  "aux_loss_alpha": 0.001, "bos_token_id": 163584, "eos_token_id": 163586, "ep_size": 1, "first_k_dense_replace": 1,
+  "hidden_act": "silu", "hidden_size": 2048, "initializer_range": 0.02, "intermediate_size": 11264,
+  "kv_lora_rank": 512, "max_position_embeddings": 8192, "model_type": "deepseek_v3", "moe_intermediate_size": 1408,
+  "moe_layer_freq": 1, "n_group": 1, "n_routed_experts": 64, "n_shared_experts": 2, "norm_topk_prob": true,
+  "num_attention_heads": 16, "num_experts_per_tok": 6, "num_hidden_layers": 27, "num_key_value_heads": 16,
+  "num_nextn_predict_layers": 0, "pretraining_tp": 1, "q_lora_rank": null, "qk_nope_head_dim": 128,
+  "qk_rope_head_dim": 64, "rms_norm_eps": 1e-05, "rope_theta": 50000.0, "routed_scaling_factor": 2.446,
+  "scoring_func": "sigmoid", "seq_aux": true, "tie_word_embeddings": false, "topk_group": 1,
+  "topk_method": "noaux_tc", "torch_dtype": "bfloat16", "transformers_version": "4.46.3", "use_cache": true,
+  "v_head_dim": 128, "vocab_size": 163840
+})";
+
+// moonshotai/Kimi-K2-Instruct's config.json, as published.
+static const char* kKimiK2Config = R"({
+  "architectures": ["DeepseekV3ForCausalLM"], "attention_bias": false, "attention_dropout": 0.0,
+  "aux_loss_alpha": 0.001, "bos_token_id": 163584, "eos_token_id": 163585, "first_k_dense_replace": 1,
+  "hidden_act": "silu", "hidden_size": 7168, "initializer_range": 0.02, "intermediate_size": 18432,
+  "kv_lora_rank": 512, "max_position_embeddings": 131072, "model_type": "kimi_k2", "moe_intermediate_size": 2048,
+  "moe_layer_freq": 1, "n_group": 1, "n_routed_experts": 384, "n_shared_experts": 1, "norm_topk_prob": true,
+  "num_attention_heads": 64, "num_experts_per_tok": 8, "num_hidden_layers": 61, "num_key_value_heads": 64,
+  "num_nextn_predict_layers": 0, "pretraining_tp": 1, "q_lora_rank": 1536, "qk_nope_head_dim": 128,
+  "qk_rope_head_dim": 64, "quantization_config": {"activation_scheme": "dynamic", "fmt": "e4m3",
+  "quant_method": "fp8", "weight_block_size": [128, 128]}, "rms_norm_eps": 1e-06, "rope_theta": 50000.0,
+  "routed_scaling_factor": 2.827, "rope_scaling": {"beta_fast": 1.0, "beta_slow": 1.0, "factor": 32.0,
+  "mscale": 1.0, "mscale_all_dim": 1.0, "original_max_position_embeddings": 4096, "type": "yarn"},
+  "scoring_func": "sigmoid", "seq_aux": true, "tie_word_embeddings": false, "topk_group": 1,
+  "topk_method": "noaux_tc", "torch_dtype": "bfloat16", "transformers_version": "4.48.3", "use_cache": true,
+  "v_head_dim": 128, "vocab_size": 163840
+})";
+
+void test_deepseek_configs() {
+  const double pi = 3.14159265358979323846;
+  auto mscale = [](double factor, double m) { return 0.1 * m * std::log(factor) + 1.0; };
+  auto plain = [](double base, int i) { return std::pow(base, -2.0 * i / 64); };
+
+  const DecoderConfig v3 = DecoderConfig::from_json(Json::parse(kDeepseekV3Config));
+  EXPECT(v3.architecture == "deepseek_v3" && v3.mla() && v3.num_layers == 61 && v3.num_heads == 128);
+  EXPECT(v3.kv_lora_rank == 512 && v3.q_lora_rank == 1536 && v3.latent_width() == 576 && v3.head_dim == 192);
+  EXPECT(v3.qk_nope_dim == 128 && v3.qk_rope_dim == 64 && v3.v_head_dim == 128 && v3.rotary_dim == 64);
+  EXPECT(v3.rope_pairs && v3.rope_factor == 1.0f);
+  // The softmax scale takes mscale(40, 1) squared; the attention factor is 1.
+  EXPECT(std::fabs(v3.attn_scale / (std::pow(mscale(40, 1.0), 2) / std::sqrt(192.0)) - 1.0) < 1e-6);
+  EXPECT(v3.router == DecoderConfig::Router::SigmoidGrouped && v3.exclude_dropped_groups);
+  EXPECT(v3.num_experts == 256 && v3.experts_per_token == 8 && v3.n_group == 8 && v3.topk_group == 4);
+  EXPECT(v3.moe_intermediate == 2048 && v3.shared_intermediate == 2048 && v3.routed_scaling == 2.5f && v3.norm_topk_prob);
+  EXPECT(!v3.is_moe(2) && v3.is_moe(3) && v3.is_moe(60));
+  // YaRN over the 64 rope dimensions: the ramp runs from floor(10.5) to
+  // ceil(22.5); below it frequencies extrapolate, above it they interpolate.
+  const std::vector<double> inv = v3.rope_inv_freq(false);
+  EXPECT(inv.size() == 32 && inv[0] == 1.0 && std::fabs(inv[9] / plain(1e4, 9) - 1.0) < 1e-12);
+  EXPECT(std::fabs(inv[23] / (plain(1e4, 23) / 40) - 1.0) < 1e-12 && std::fabs(inv[31] / (plain(1e4, 31) / 40) - 1.0) < 1e-12);
+  const double low = std::floor(64 * std::log(4096 / (32 * 2 * pi)) / (2 * std::log(1e4)));
+  const double high = std::ceil(64 * std::log(4096 / (2 * pi)) / (2 * std::log(1e4)));
+  EXPECT(low == 10.0 && high == 23.0);
+  const double ramp = (16 - low) / (high - low);
+  EXPECT(std::fabs(inv[16] / (plain(1e4, 16) / 40 * ramp + plain(1e4, 16) * (1 - ramp)) - 1.0) < 1e-12);
+
+  const DecoderConfig v2 = DecoderConfig::from_json(Json::parse(kDeepseekV2LiteConfig));
+  EXPECT(v2.architecture == "deepseek_v2" && v2.mla() && v2.q_lora_rank == 0 && v2.num_heads == 16 && v2.rope_pairs);
+  EXPECT(v2.router == DecoderConfig::Router::Softmax && v2.n_group == 1 && !v2.exclude_dropped_groups);
+  EXPECT(v2.num_experts == 64 && v2.experts_per_token == 6 && v2.shared_intermediate == 2816 && !v2.norm_topk_prob);
+  EXPECT(v2.routed_scaling == 1.0f && v2.rope_factor == 1.0f && !v2.is_moe(0) && v2.is_moe(1));
+  EXPECT(std::fabs(v2.attn_scale / (std::pow(mscale(40, 0.707), 2) / std::sqrt(192.0)) - 1.0) < 1e-6);
+
+  const DecoderConfig moon = DecoderConfig::from_json(Json::parse(kMoonlightConfig));
+  EXPECT(moon.architecture == "deepseek_v3" && moon.q_lora_rank == 0 && moon.rms_norm_eps == 1e-5f);
+  EXPECT(moon.rope_scaling.kind == RopeScaling::Kind::None && std::fabs(moon.attn_scale * std::sqrt(192.0) - 1.0) < 1e-6);
+  EXPECT(moon.routed_scaling == 2.446f && moon.shared_intermediate == 2816 && moon.n_group == 1);
+  EXPECT(moon.eos_token_ids == std::vector<int32_t>({163586}));
+
+  const DecoderConfig kimi = DecoderConfig::from_json(Json::parse(kKimiK2Config));
+  EXPECT(kimi.architecture == "deepseek_v3" && kimi.num_experts == 384 && kimi.num_heads == 64);
+  EXPECT(std::fabs(kimi.attn_scale / (std::pow(mscale(32, 1.0), 2) / std::sqrt(192.0)) - 1.0) < 1e-6);
+  // beta_fast = beta_slow = 1: the ramp spans the one dimension around 19.2.
+  const std::vector<double> k_inv = kimi.rope_inv_freq(false);
+  EXPECT(std::fabs(k_inv[18] / plain(5e4, 18) - 1.0) < 1e-12 && std::fabs(k_inv[20] / (plain(5e4, 20) / 32) - 1.0) < 1e-12);
+}
+
 int main() {
   test_json();
   test_half();
@@ -648,6 +765,7 @@ int main() {
   test_gemma4_config();
   test_gpt_oss_config();
   test_glm_config();
+  test_deepseek_configs();
   if (g_failures) {
     std::fprintf(stderr, "%d expectation(s) failed\n", g_failures);
     return 1;
