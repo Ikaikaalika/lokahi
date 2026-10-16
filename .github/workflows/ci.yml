@@ -68,7 +68,7 @@ jobs:
         run: |
           python3 -m venv .venv
           .venv/bin/pip install numpy pytest tokenizers==0.23.3
-          PYTHONPATH=src .venv/bin/python -m pytest -q tests/test_native_engine.py tests/test_gemma3_vision.py tests/test_gemma4_vision.py tests/test_tokenizer.py tests/test_tokenizer_bytelevel.py tests/test_c_abi.py tests/test_sampling.py
+          PYTHONPATH=src .venv/bin/python -m pytest -q tests/test_native_engine.py tests/test_mtp.py tests/test_gemma3_vision.py tests/test_gemma4_vision.py tests/test_tokenizer.py tests/test_tokenizer_bytelevel.py tests/test_c_abi.py tests/test_sampling.py
       - name: Metal backend vs oracles (when the runner exposes a Metal device)
         env:
           LOKAHI_NATIVE_BUILD_DIR: build/engine
@@ -86,7 +86,7 @@ jobs:
             exit 1
           fi
           system_profiler SPDisplaysDataType | sed -n '1,20p'
-          LOKAHI_TEST_BACKENDS=metal PYTHONPATH=src .venv/bin/python -m pytest -q tests/test_native_engine.py tests/test_gemma3_vision.py tests/test_gemma4_vision.py \
+          LOKAHI_TEST_BACKENDS=metal PYTHONPATH=src .venv/bin/python -m pytest -q tests/test_native_engine.py tests/test_mtp.py tests/test_gemma3_vision.py tests/test_gemma4_vision.py \
             tests/test_qwen35_vision.py tests/test_qwen3_vl.py tests/test_qwen2_5_vl.py tests/test_sampling.py
       - name: Oracles vs MLX, MLX-LM, MLX-VLM and Transformers (independent implementations)
         run: |
@@ -101,6 +101,11 @@ jobs:
           .venv-mlx/bin/pip install --no-deps mlx-vlm==0.4.4
           .venv-mlx/bin/python -c 'import mlx.core, mlx_lm, mlx_vlm.utils'  # the tests skip without them; here they must run
           PYTHONPATH=src .venv-mlx/bin/python -m pytest -q -rs tests/test_mlx_crosscheck.py tests/test_mlx_vlm_crosscheck.py
+          # Qwen3.5's MTP head against MLX-VLM's qwen3_5_mtp drafter, which
+          # 0.4.4 predates; the newer release replaces it for this test only.
+          .venv-mlx/bin/pip install --no-deps mlx-vlm==0.7.8
+          .venv-mlx/bin/python -c 'import mlx_vlm.speculative.drafters.qwen3_5_mtp'
+          PYTHONPATH=src .venv-mlx/bin/python -m pytest -q -rs tests/test_mlx_vlm_mtp_crosscheck.py
       - name: Wire v1 service across a real XPC boundary (gate B, CPU backend)
         run: |
           PYTHONPATH=src .venv/bin/python -c 'import sys; from lokahi.fixtures import write_tiny_chat_model; write_tiny_chat_model(sys.argv[1])' build/xpc-model

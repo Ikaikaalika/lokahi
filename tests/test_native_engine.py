@@ -1140,10 +1140,10 @@ def test_qwen35_fixtures_route_far_from_ties(tmp_path):
         gaps: list[float] = []
         used: set[int] = set()
 
-        def traced(index, x):
+        def traced(index, x, prefix=None, w=None):
             ordered = -np.sort(-(x @ oracle.w[f"model.layers.{index}.mlp.gate"].T), axis=-1)
             gaps.append(float((ordered[:, k - 1] - ordered[:, k]).min()))
-            chosen, weights = route(index, x)
+            chosen, weights = route(index, x, prefix, w)
             used.update(chosen.ravel().tolist())
             return chosen, weights
 

@@ -189,18 +189,23 @@ class Qwen35Reference:
     def _norm(self, name: str, x: np.ndarray) -> np.ndarray:
         return _rms(x, self.config.rms_norm_eps) * (self.norm_offset + self.w[name])
 
-    def _attention(self, index: int, x: np.ndarray, positions: np.ndarray) -> np.ndarray:
-        """``positions`` [3, tokens]: each token's temporal, height and width RoPE positions."""
+    def _attention(self, index: int, x: np.ndarray, positions: np.ndarray, prefix: str | None = None,
+                   head: "Qwen35Mtp | None" = None) -> np.ndarray:
+        """``positions`` [3, tokens]: each token's temporal, height and width RoPE positions.
+
+        ``head``: the weights and norms are an MTP head's, under ``prefix``.
+        """
 
         cfg = self.config
-        prefix = f"model.layers.{index}.self_attn"
+        w, norm = (self.w, self._norm) if head is None else (head.w, head.norm)
+        prefix = prefix or f"model.layers.{index}.self_attn"
         tokens, heads, kv_heads, dim = x.shape[0], cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
-        q_and_gate = (x @ self.w[f"{prefix}.q_proj"].T).reshape(tokens, heads, 2 * dim)
+        q_and_gate = (x @ w[f"{prefix}.q_proj"].T).reshape(tokens, heads, 2 * dim)
         q, gate = q_and_gate[..., :dim], q_and_gate[..., dim:].reshape(tokens, heads * dim)
-        k = (x @ self.w[f"{prefix}.k_proj"].T).reshape(tokens, kv_heads, dim)
-        v = (x @ self.w[f"{prefix}.v_proj"].T).reshape(tokens, kv_heads, dim)
-        q = self._norm(f"{prefix}.q_norm", q)
-        k = self._norm(f"{prefix}.k_norm", k)
+        k = (x @ w[f"{prefix}.k_proj"].T).reshape(tokens, kv_heads, dim)
+        v = (x @ w[f"{prefix}.v_proj"].T).reshape(tokens, kv_heads, dim)
+        q = norm(f"{prefix}.q_norm", q)
+        k = norm(f"{prefix}.k_norm", k)
         rot = cfg.rotary_dim
         angles = positions[cfg.rope_axes()].T.astype(np.float64) * cfg.inv_freq()[None, :]
         cos = np.cos(angles).astype(np.float32)[:, None, :]
@@ -224,7 +229,7 @@ class Qwen35Reference:
             probs /= probs.sum(axis=-1, keepdims=True)
             out[:, head] = (probs @ v[:, head // group]).astype(np.float32)
         out = out.reshape(tokens, heads * dim) * (1.0 / (1.0 + np.exp(-gate)))
-        return out @ self.w[f"{prefix}.o_proj"].T
+        return out @ w[f"{prefix}.o_proj"].T
 
     def _linear_projections(self, prefix: str, x: np.ndarray) -> tuple[np.ndarray, ...]:
         """``[q | k | v]`` channels, z [tokens, Hv * dv], b and a [tokens, Hv]."""
@@ -281,14 +286,17 @@ class Qwen35Reference:
         gated = _rms(out, cfg.rms_norm_eps) * self.w[f"{prefix}.norm"] * _silu(z.reshape(tokens, hv, dv))
         return gated.reshape(tokens, hv * dv) @ self.w[f"{prefix}.out_proj"].T
 
-    def _dense_mlp(self, prefix: str, x: np.ndarray) -> np.ndarray:
-        return (_silu(x @ self.w[f"{prefix}.gate_proj"].T) * (x @ self.w[f"{prefix}.up_proj"].T)) @ (
-            self.w[f"{prefix}.down_proj"].T)
+    def _dense_mlp(self, prefix: str, x: np.ndarray, w: Mapping[str, np.ndarray] | None = None) -> np.ndarray:
+        w = self.w if w is None else w
+        return (_silu(x @ w[f"{prefix}.gate_proj"].T) * (x @ w[f"{prefix}.up_proj"].T)) @ w[f"{prefix}.down_proj"].T
 
-    def route(self, index: int, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Expert indices ``[tokens, k]`` and their weights for layer ``index``."""
+    def route(self, index: int, x: np.ndarray, prefix: str | None = None,
+              w: Mapping[str, np.ndarray] | None = None) -> tuple[np.ndarray, np.ndarray]:
+        """Expert indices ``[tokens, k]`` and their weights for layer ``index`` (or the MLP under ``prefix``)."""
 
-        logits = (x @ self.w[f"model.layers.{index}.mlp.gate"].T).astype(np.float64)
+        w = self.w if w is None else w
+        prefix = prefix or f"model.layers.{index}.mlp"
+        logits = (x @ w[f"{prefix}.gate"].T).astype(np.float64)
         probs = np.exp(logits - logits.max(axis=-1, keepdims=True))
         probs /= probs.sum(axis=-1, keepdims=True)
         chosen = np.argsort(-probs, axis=-1, kind="stable")[:, : self.config.num_experts_per_tok]
@@ -297,18 +305,20 @@ class Qwen35Reference:
             weights /= weights.sum(axis=-1, keepdims=True)
         return chosen, weights
 
-    def _experts(self, index: int, x: np.ndarray) -> np.ndarray:
-        prefix = f"model.layers.{index}.mlp"
-        chosen, weights = self.route(index, x)
+    def _experts(self, index: int, x: np.ndarray, prefix: str | None = None,
+                 w: Mapping[str, np.ndarray] | None = None) -> np.ndarray:
+        w = self.w if w is None else w
+        prefix = prefix or f"model.layers.{index}.mlp"
+        chosen, weights = self.route(index, x, prefix, w)
 
         def stack(name: str) -> np.ndarray:
-            if f"{prefix}.switch_mlp.{name}" in self.w:
-                return self.w[f"{prefix}.switch_mlp.{name}"]
-            return np.stack([self.w[f"{prefix}.experts.{e}.{name}"] for e in range(self.config.num_experts)])
+            if f"{prefix}.switch_mlp.{name}" in w:
+                return w[f"{prefix}.switch_mlp.{name}"]
+            return np.stack([w[f"{prefix}.experts.{e}.{name}"] for e in range(self.config.num_experts)])
 
-        if f"{prefix}.experts.gate_up_proj" in self.w:  # Transformers' fused [E, 2I, H], gate first
-            gate, up = np.split(self.w[f"{prefix}.experts.gate_up_proj"], 2, axis=1)
-            down = self.w[f"{prefix}.experts.down_proj"]
+        if f"{prefix}.experts.gate_up_proj" in w:  # Transformers' fused [E, 2I, H], gate first
+            gate, up = np.split(w[f"{prefix}.experts.gate_up_proj"], 2, axis=1)
+            down = w[f"{prefix}.experts.down_proj"]
         else:
             gate, up, down = stack("gate_proj"), stack("up_proj"), stack("down_proj")
         out = np.zeros_like(x, dtype=np.float32)
@@ -316,8 +326,8 @@ class Qwen35Reference:
             for e, p in zip(chosen[t], weights[t]):
                 out[t] += np.float32(p) * (down[e] @ (_silu(gate[e] @ x[t]) * (up[e] @ x[t])))
         if self.config.shared_expert_intermediate_size:
-            shared = self._dense_mlp(f"{prefix}.shared_expert", x)
-            gate_logit = x @ self.w[f"{prefix}.shared_expert_gate"].T  # [tokens, 1]
+            shared = self._dense_mlp(f"{prefix}.shared_expert", x, w)
+            gate_logit = x @ w[f"{prefix}.shared_expert_gate"].T  # [tokens, 1]
             out = out + shared * (1.0 / (1.0 + np.exp(-gate_logit)))
         return out
 
@@ -329,6 +339,12 @@ class Qwen35Reference:
         features); ``positions`` [3, tokens] gives the M-RoPE positions
         (default: each token's index on all three axes).
         """
+
+        return (self.hidden_states(token_ids, injected, positions) @ self.w["lm_head"].T).astype(np.float32)
+
+    def hidden_states(self, token_ids: Sequence[int], injected: Mapping[int, np.ndarray] | None = None,
+                      positions: np.ndarray | None = None) -> np.ndarray:
+        """The final-normed hidden states ``[len(token_ids), hidden]`` that ``logits`` projects."""
 
         cfg = self.config
         tokens = np.asarray(token_ids, dtype=np.int64)
@@ -346,8 +362,7 @@ class Qwen35Reference:
                 x = x + self._attention(index, h, positions)
             h = self._norm(f"{prefix}.post_attention_layernorm", x)
             x = x + (self._experts(index, h) if cfg.sparse(index) else self._dense_mlp(f"{prefix}.mlp", h))
-        x = self._norm("model.norm", x)
-        return (x @ self.w["lm_head"].T).astype(np.float32)
+        return self._norm("model.norm", x)
 
     def greedy(self, prompt: Sequence[int], steps: int) -> list[int]:
         """Greedy continuation by full recomputation (no cache)."""
@@ -359,3 +374,79 @@ class Qwen35Reference:
             generated.append(next_token)
             tokens.append(next_token)
         return generated
+
+
+class Qwen35Mtp:
+    """Qwen3.5's multi-token prediction head, as vLLM's
+    ``Qwen3NextMultiTokenPredictor`` and MLX-VLM's ``qwen3_5_mtp`` drafter run it.
+
+    The head's row at position t pairs the target's final-normed hidden state
+    h_t with token t + 1: ``x = fc([norm_e(embed(token)) | norm_h(h_t)])``,
+    one decoder layer (gated full attention over the head's earlier rows at
+    position t, then the target's kind of MLP), then ``norm``. The target's
+    ``lm_head`` turns the output into logits for token t + 2, and the output
+    stands in for h at the next position when the head drafts again. Every
+    row of the context comes from the target's hidden states (vLLM rewrites
+    the rows of accepted drafts), so the head's state after any run of
+    speculative decoding is this full recomputation's.
+
+    Qwen stores the head's zero-centered norms as w; MLX-VLM's drafter
+    directories (and MLX conversions) as 1 + w.
+    """
+
+    def __init__(self, target: Qwen35Reference, weights: Mapping[str, np.ndarray], norm_offset: float):
+        self.target, self.w, self.norm_offset = target, dict(weights), norm_offset
+        self.sparse = "layers.0.mlp.gate" in self.w
+
+    @classmethod
+    def from_checkpoint(cls, target: Qwen35Reference) -> "Qwen35Mtp":
+        """The ``mtp.*`` head beside the target's decoder."""
+
+        weights = {name[len("mtp."):]: value for name, value in target.w.items() if name.startswith("mtp.")}
+        return cls(target, weights, target.norm_offset)
+
+    @classmethod
+    def load(cls, target: Qwen35Reference, drafter_dir: Path) -> "Qwen35Mtp":
+        """A ``qwen3_5_mtp`` drafter directory's head."""
+
+        raw, weights = load_dense_weights(drafter_dir)
+        if raw.get("model_type") != "qwen3_5_mtp":
+            raise ValueError(f"{drafter_dir}: expected a qwen3_5_mtp drafter")
+        return cls(target, weights, 0.0)
+
+    def norm(self, name: str, x: np.ndarray) -> np.ndarray:
+        return _rms(x, self.target.config.rms_norm_eps) * (self.norm_offset + self.w[name])
+
+    def outputs(self, tokens: Sequence[int], hidden: np.ndarray) -> np.ndarray:
+        """The head's outputs for rows at positions 0, 1, ...: ``tokens[t]`` after ``hidden[t]``."""
+
+        t = self.target
+        count = len(tokens)
+        embed = t.w["model.embed_tokens"][np.asarray(tokens, dtype=np.int64)]
+        x = np.concatenate([self.norm("pre_fc_norm_embedding", embed), self.norm("pre_fc_norm_hidden", hidden)],
+                           axis=-1) @ self.w["fc"].T
+        positions = np.broadcast_to(np.arange(count), (3, count))
+        h = self.norm("layers.0.input_layernorm", x)
+        x = x + t._attention(0, h, positions, prefix="layers.0.self_attn", head=self)
+        h = self.norm("layers.0.post_attention_layernorm", x)
+        mlp = (t._experts(0, h, prefix="layers.0.mlp", w=self.w) if self.sparse
+               else t._dense_mlp("layers.0.mlp", h, self.w))
+        return self.norm("norm", x + mlp)
+
+    def drafts(self, context: Sequence[int], steps: int) -> tuple[list[int], np.ndarray]:
+        """The head's ``steps`` greedy drafts after ``context`` (whose last
+        token the target has not read yet), and their logits ``[steps, vocab]``."""
+
+        context = list(context)
+        hidden = list(self.target.hidden_states(context[:-1]))
+        tokens = context[1:]
+        drafts: list[int] = []
+        logits = []
+        for _ in range(steps):
+            out = self.outputs(tokens, np.stack(hidden))[-1]
+            row = (out @ self.target.w["lm_head"].T).astype(np.float32)
+            drafts.append(int(np.argmax(row)))
+            logits.append(row)
+            tokens.append(drafts[-1])
+            hidden.append(out)
+        return drafts, np.stack(logits)

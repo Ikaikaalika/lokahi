@@ -3,7 +3,16 @@
 #include <algorithm>
 #include <utility>
 
+#include "common.h"
+
 namespace lokahi {
+
+Drafter parse_drafter(const std::string& name) {
+  if (name == "lookup") return Drafter::Lookup;
+  if (name == "mtp") return Drafter::Mtp;
+  LK_CHECK(name == "both", "the drafter must be lookup, mtp or both, not '" + name + "'");
+  return Drafter::Both;
+}
 
 PromptLookupDrafter::PromptLookupDrafter(std::vector<int32_t> reference) : reference_(std::move(reference)) {}
 

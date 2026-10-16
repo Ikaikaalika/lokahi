@@ -1120,9 +1120,195 @@ void bind_linear_attention(const DecoderWeights& w, DecoderLayer& layer, const s
   LK_CHECK(layer.out_proj.rows == hidden && layer.out_proj.cols == values, base + ": out_proj shape");
 }
 
+// Layer i's weights under `base` (e.g. "model.layers.3"), from w's
+// checkpoint and prefix; w.config must describe layer i.
+DecoderLayer bind_layer(const DecoderWeights& w, const std::string& base, int i, bool mlx_layout) {
+  const DecoderConfig& c = w.config;
+  const Checkpoint& ck = *w.checkpoint;
+  const std::string& p = c.weight_prefix;
+  const std::string& arch = c.architecture;
+  auto linear = [&](const std::string& module) { return bind_linear(ck, w.raw_config, p + module, p + module); };
+  auto vec = [&](const std::string& name, int64_t size) {
+    std::vector<float> out(static_cast<size_t>(size));
+    load_vector(ck, p + name + ".weight", size, out.data());
+    return out;
+  };
+  auto bias = [&](const std::string& module, int64_t size) {
+    std::vector<float> out(static_cast<size_t>(size));
+    load_vector(ck, p + module + ".bias", size, out.data());
+    return out;
+  };
+  const int64_t dim = c.head_dim_of(i);
+  const int64_t q_out = static_cast<int64_t>(c.num_heads) * dim;
+  const int64_t kv_out = static_cast<int64_t>(c.kv_heads_of(i)) * dim;
+  const int64_t inter = c.intermediate_of(i);
+  // KV-shared layers attend over another layer's keys and values, so their
+  // own k/v weights (absent from converted checkpoints) are never bound.
+  const bool own_kv = !c.shares_kv(i);
+  DecoderLayer layer;
+  layer.attn_norm = vec(base + ".input_layernorm", c.hidden_size);
+  if (c.sandwich_norms) {
+    layer.attn_post_norm = vec(base + ".post_attention_layernorm", c.hidden_size);
+    layer.mlp_norm = vec(base + ".pre_feedforward_layernorm", c.hidden_size);
+    layer.mlp_post_norm = vec(base + ".post_feedforward_layernorm", c.hidden_size);
+  } else {
+    // Pre-norm families name the norm before the MLP post_attention_layernorm.
+    layer.mlp_norm = vec(base + ".post_attention_layernorm", c.hidden_size);
+  }
+  if (c.is_linear(i)) {
+    bind_linear_attention(w, layer, base, mlx_layout);
+  } else if (c.mla()) {
+    bind_latent_attention(w, layer, base);
+  } else if (c.qk_norm) {
+    layer.q_norm = vec(base + ".self_attn.q_norm", dim);
+    if (own_kv) layer.k_norm = vec(base + ".self_attn.k_norm", dim);
+  }
+  if (c.qkv_bias) {
+    layer.q_bias = bias(base + ".self_attn.q_proj", q_out);
+    layer.k_bias = bias(base + ".self_attn.k_proj", kv_out);
+    layer.v_bias = bias(base + ".self_attn.v_proj", kv_out);
+  }
+  // A bias the family does not define means a different model: refuse it
+  // rather than silently ignoring it.
+  for (const char* module : {".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj"}) {
+    LK_CHECK(c.qkv_bias || !ck.contains(p + base + module + ".bias"), base + module + ": unexpected bias for " + arch);
+  }
+  LK_CHECK(c.o_bias || !ck.contains(p + base + ".self_attn.o_proj.bias"),
+           base + ".self_attn.o_proj: unexpected bias for " + arch);
+  for (const char* module : {".mlp.gate_proj", ".mlp.up_proj", ".mlp.down_proj"}) {
+    LK_CHECK(!ck.contains(p + base + module + ".bias"), base + module + ": unexpected bias for " + arch);
+  }
+  if (c.o_bias) layer.o_bias = bias(base + ".self_attn.o_proj", c.hidden_size);
+  if (c.attention_sinks) {
+    layer.sinks.resize(static_cast<size_t>(c.num_heads));
+    load_vector(ck, p + base + ".self_attn.sinks", c.num_heads, layer.sinks.data());
+  }
+  if (!c.mla() && !c.is_linear(i)) {
+    layer.q_proj = linear(base + ".self_attn.q_proj");
+    if (own_kv) {
+      layer.k_proj = linear(base + ".self_attn.k_proj");
+      if (!c.k_eq_v(i)) layer.v_proj = linear(base + ".self_attn.v_proj");
+      LK_CHECK(layer.k_proj.rows == kv_out && layer.k_proj.cols == c.hidden_size &&
+                   (c.k_eq_v(i) || (layer.v_proj.rows == kv_out && layer.v_proj.cols == c.hidden_size)),
+               base + ": k/v shape");
+    }
+    layer.o_proj = linear(base + ".self_attn.o_proj");
+    // With an output gate, each head's query rows are followed by its gate's.
+    const int64_t q_rows = c.attn_output_gate ? 2 * q_out : q_out;
+    LK_CHECK(layer.q_proj.rows == q_rows && layer.q_proj.cols == c.hidden_size, base + ": q_proj shape");
+    LK_CHECK(layer.o_proj.rows == c.hidden_size && layer.o_proj.cols == q_out, base + ": o_proj shape");
+  }
+  if (c.is_moe(i)) bind_experts(w, layer, base);
+  if (c.is_moe(i) && c.experts_beside_mlp) {
+    layer.mlp_post_norm_1 = vec(base + ".post_feedforward_layernorm_1", c.hidden_size);
+    layer.expert_norm = vec(base + ".pre_feedforward_layernorm_2", c.hidden_size);
+    layer.expert_post_norm = vec(base + ".post_feedforward_layernorm_2", c.hidden_size);
+    layer.router_input_scale.resize(static_cast<size_t>(c.hidden_size));
+    load_vector(ck, p + base + ".router.scale", c.hidden_size, layer.router_input_scale.data());
+    const float root = 1.0f / std::sqrt(static_cast<float>(c.hidden_size));
+    for (float& scale : layer.router_input_scale) scale *= root;
+    layer.per_expert_scale.resize(static_cast<size_t>(c.num_experts));
+    load_vector(ck, p + base + ".router.per_expert_scale", c.num_experts, layer.per_expert_scale.data());
+  }
+  if (!c.is_moe(i) || c.experts_beside_mlp) {
+    layer.gate_proj = linear(base + ".mlp.gate_proj");
+    layer.up_proj = linear(base + ".mlp.up_proj");
+    layer.down_proj = linear(base + ".mlp.down_proj");
+    LK_CHECK(layer.gate_proj.rows == inter && layer.up_proj.rows == inter && layer.down_proj.cols == inter &&
+                 layer.gate_proj.cols == c.hidden_size && layer.up_proj.cols == c.hidden_size &&
+                 layer.down_proj.rows == c.hidden_size,
+             base + ": mlp shape");
+  }
+  if (c.per_layer_input > 0) {
+    layer.per_layer_gate = linear(base + ".per_layer_input_gate");
+    layer.per_layer_proj = linear(base + ".per_layer_projection");
+    layer.per_layer_norm = vec(base + ".post_per_layer_input_norm", c.hidden_size);
+    LK_CHECK(layer.per_layer_gate.rows == c.per_layer_input && layer.per_layer_gate.cols == c.hidden_size &&
+                 layer.per_layer_proj.rows == c.hidden_size && layer.per_layer_proj.cols == c.per_layer_input,
+             base + ": per-layer input shape");
+  }
+  if (c.layer_scalars) load_vector(ck, p + base + ".layer_scalar", 1, &layer.layer_scalar);
+  return layer;
+}
+
+// Qwen3.5's multi-token prediction head, if the model has one: mtp.* at the
+// top level of the checkpoint (Qwen's), or the qwen3_5_mtp drafter directory
+// `draft_model` (MLX-VLM's split of it). Its one layer becomes config layer
+// num_layers, a full-attention layer, dense or with experts as the
+// checkpoint has it. Qwen stores the head's zero-centered norms as w, MLX
+// conversions and drafters as 1 + w; they are read in the decoder's
+// convention.
+void bind_mtp(DecoderWeights& w, const std::string& draft_model, bool mlx_layout) {
+  DecoderConfig& c = w.config;
+  const std::string& arch = c.architecture;
+  DecoderWeights scope;  // the checkpoint and prefix the head's tensors are under
+  scope.raw_config = w.raw_config;
+  scope.checkpoint = w.checkpoint;
+  std::string base = "mtp.";
+  bool shifted = mlx_layout;  // the head's norms are stored as 1 + w
+  if (!draft_model.empty()) {
+    const Json config = Json::parse(read_text_file(draft_model + "/config.json"));
+    const std::string type = config.string_or("model_type", "");
+    LK_CHECK(type == "qwen3_5_mtp", draft_model + ": expected a qwen3_5_mtp drafter, not '" + type + "'");
+    // A drafter carries its target's text config; the head must fit the decoder.
+    const Json& target = text_config(w.raw_config);
+    const Json& drafter = text_config(config);
+    for (const char* key : {"hidden_size", "vocab_size", "num_attention_heads", "num_key_value_heads", "head_dim",
+                            "intermediate_size", "num_experts", "moe_intermediate_size"}) {
+      LK_CHECK(drafter.int_or(key, -1) == target.int_or(key, -1),
+               draft_model + ": the drafter's " + key + " does not match the model's");
+    }
+    scope.raw_config = config;
+    scope.checkpoint = std::make_shared<Checkpoint>(Checkpoint::open_directory(draft_model));
+    base.clear();
+    shifted = true;
+  } else if (!w.checkpoint->contains("mtp.fc.weight")) {
+    return;  // no head (Qwen's checkpoints keep it at the top level)
+  }
+  LK_CHECK(arch == "qwen3_5" || arch == "qwen3_5_moe" || arch == "qwen3_next",
+           arch + ": multi-token prediction heads are read for Qwen3.5 and Qwen3-Next only");
+  const Json& cfg = text_config(w.raw_config);
+  LK_CHECK(cfg.int_or("mtp_num_hidden_layers", 1) == 1, arch + ": only a one-layer MTP head is supported");
+  LK_CHECK(!flag(cfg, "mtp_use_dedicated_embeddings"), arch + ": an MTP head's own embeddings are not supported");
+  const Checkpoint& ck = *scope.checkpoint;
+  const std::string& head = base;
+  LK_CHECK(!ck.contains(head + "layers.1.input_layernorm.weight"), arch + ": only a one-layer MTP head is supported");
+  const bool moe = ck.contains(head + "layers.0.mlp.gate.weight");
+  LK_CHECK(moe == !c.layer_moe.empty(), arch + ": the MTP head's MLP must match the decoder's layers");
+  LK_CHECK(c.layer_head_dim.empty() && c.layer_kv_heads.empty() && c.layer_intermediate.empty() &&
+               c.layer_kv_source.empty() && c.layer_k_eq_v.empty(),
+           arch + ": per-layer geometry is not supported with an MTP head");
+  c.layer_linear.push_back(false);
+  c.layer_is_sliding.push_back(false);
+  if (moe) c.layer_moe.push_back(true);
+  c.mtp_layers = 1;
+  scope.config = c;
+  scope.config.weight_prefix.clear();
+  DecoderWeights::Mtp mtp;
+  mtp.layer = bind_layer(scope, base + "layers.0", c.num_layers, mlx_layout);
+  mtp.fc = bind_linear(ck, scope.raw_config, head + "fc", head + "fc");
+  LK_CHECK(mtp.fc.rows == c.hidden_size && mtp.fc.cols == 2 * c.hidden_size, arch + ": mtp fc shape");
+  for (auto [name, out] : {std::pair{"pre_fc_norm_embedding", &mtp.embedding_norm},
+                           std::pair{"pre_fc_norm_hidden", &mtp.hidden_norm}, std::pair{"norm", &mtp.final_norm}}) {
+    out->resize(static_cast<size_t>(c.hidden_size));
+    load_vector(ck, head + name + ".weight", c.hidden_size, out->data());
+  }
+  if (shifted != (c.norm_offset == 0.0f)) {
+    const float by = shifted ? -1.0f : 1.0f;
+    DecoderLayer& layer = mtp.layer;
+    for (std::vector<float>* norm : {&layer.attn_norm, &layer.mlp_norm, &layer.q_norm, &layer.k_norm,
+                                     &mtp.embedding_norm, &mtp.hidden_norm, &mtp.final_norm}) {
+      for (float& value : *norm) value += by;
+    }
+  }
+  mtp.source = draft_model.empty() ? "checkpoint" : draft_model;
+  mtp.checkpoint = scope.checkpoint;
+  w.mtp = std::move(mtp);
+}
+
 }  // namespace
 
-std::shared_ptr<DecoderWeights> DecoderWeights::load(const std::string& directory) {
+std::shared_ptr<DecoderWeights> DecoderWeights::load(const std::string& directory, const std::string& draft_model) {
   auto w = std::make_shared<DecoderWeights>();
   w->raw_config = Json::parse(read_text_file(directory + "/config.json"));
   DecoderConfig& c = w->config;
@@ -1170,12 +1356,6 @@ std::shared_ptr<DecoderWeights> DecoderWeights::load(const std::string& director
     load_vector(ck, p + name + ".weight", size, out.data());
     return out;
   };
-  auto bias = [&](const std::string& module, int64_t size) {
-    std::vector<float> out(static_cast<size_t>(size));
-    load_vector(ck, p + module + ".bias", size, out.data());
-    return out;
-  };
-
   w->embed = linear(stem + "embed_tokens");
   LK_CHECK(w->embed.rows == c.vocab_size && w->embed.cols == c.hidden_size, arch + ": embed_tokens shape mismatch");
   if (ck.contains(p + "lm_head.weight")) {
@@ -1204,99 +1384,9 @@ std::shared_ptr<DecoderWeights> DecoderWeights::load(const std::string& director
              arch + ": per_layer_model_projection shape mismatch");
   }
   for (int i = 0; i < c.num_layers; ++i) {
-    const std::string base = stem + "layers." + std::to_string(i);
-    const int64_t dim = c.head_dim_of(i);
-    const int64_t q_out = static_cast<int64_t>(c.num_heads) * dim;
-    const int64_t kv_out = static_cast<int64_t>(c.kv_heads_of(i)) * dim;
-    const int64_t inter = c.intermediate_of(i);
-    // KV-shared layers attend over another layer's keys and values, so their
-    // own k/v weights (absent from converted checkpoints) are never bound.
-    const bool own_kv = !c.shares_kv(i);
-    DecoderLayer layer;
-    layer.attn_norm = vec(base + ".input_layernorm", c.hidden_size);
-    if (c.sandwich_norms) {
-      layer.attn_post_norm = vec(base + ".post_attention_layernorm", c.hidden_size);
-      layer.mlp_norm = vec(base + ".pre_feedforward_layernorm", c.hidden_size);
-      layer.mlp_post_norm = vec(base + ".post_feedforward_layernorm", c.hidden_size);
-    } else {
-      // Pre-norm families name the norm before the MLP post_attention_layernorm.
-      layer.mlp_norm = vec(base + ".post_attention_layernorm", c.hidden_size);
-    }
-    if (c.is_linear(i)) {
-      bind_linear_attention(*w, layer, base, mlx_layout);
-    } else if (c.mla()) {
-      bind_latent_attention(*w, layer, base);
-    } else if (c.qk_norm) {
-      layer.q_norm = vec(base + ".self_attn.q_norm", dim);
-      if (own_kv) layer.k_norm = vec(base + ".self_attn.k_norm", dim);
-    }
-    if (c.qkv_bias) {
-      layer.q_bias = bias(base + ".self_attn.q_proj", q_out);
-      layer.k_bias = bias(base + ".self_attn.k_proj", kv_out);
-      layer.v_bias = bias(base + ".self_attn.v_proj", kv_out);
-    }
-    // A bias the family does not define means a different model: refuse it
-    // rather than silently ignoring it.
-    for (const char* module : {".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj"}) {
-      LK_CHECK(c.qkv_bias || !ck.contains(p + base + module + ".bias"), base + module + ": unexpected bias for " + arch);
-    }
-    LK_CHECK(c.o_bias || !ck.contains(p + base + ".self_attn.o_proj.bias"),
-             base + ".self_attn.o_proj: unexpected bias for " + arch);
-    for (const char* module : {".mlp.gate_proj", ".mlp.up_proj", ".mlp.down_proj"}) {
-      LK_CHECK(!ck.contains(p + base + module + ".bias"), base + module + ": unexpected bias for " + arch);
-    }
-    if (c.o_bias) layer.o_bias = bias(base + ".self_attn.o_proj", c.hidden_size);
-    if (c.attention_sinks) {
-      layer.sinks.resize(static_cast<size_t>(c.num_heads));
-      load_vector(ck, p + base + ".self_attn.sinks", c.num_heads, layer.sinks.data());
-    }
-    if (!c.mla() && !c.is_linear(i)) {
-      layer.q_proj = linear(base + ".self_attn.q_proj");
-      if (own_kv) {
-        layer.k_proj = linear(base + ".self_attn.k_proj");
-        if (!c.k_eq_v(i)) layer.v_proj = linear(base + ".self_attn.v_proj");
-        LK_CHECK(layer.k_proj.rows == kv_out && layer.k_proj.cols == c.hidden_size &&
-                     (c.k_eq_v(i) || (layer.v_proj.rows == kv_out && layer.v_proj.cols == c.hidden_size)),
-                 base + ": k/v shape");
-      }
-      layer.o_proj = linear(base + ".self_attn.o_proj");
-      // With an output gate, each head's query rows are followed by its gate's.
-      const int64_t q_rows = c.attn_output_gate ? 2 * q_out : q_out;
-      LK_CHECK(layer.q_proj.rows == q_rows && layer.q_proj.cols == c.hidden_size, base + ": q_proj shape");
-      LK_CHECK(layer.o_proj.rows == c.hidden_size && layer.o_proj.cols == q_out, base + ": o_proj shape");
-    }
-    if (c.is_moe(i)) bind_experts(*w, layer, base);
-    if (c.is_moe(i) && c.experts_beside_mlp) {
-      layer.mlp_post_norm_1 = vec(base + ".post_feedforward_layernorm_1", c.hidden_size);
-      layer.expert_norm = vec(base + ".pre_feedforward_layernorm_2", c.hidden_size);
-      layer.expert_post_norm = vec(base + ".post_feedforward_layernorm_2", c.hidden_size);
-      layer.router_input_scale.resize(static_cast<size_t>(c.hidden_size));
-      load_vector(ck, p + base + ".router.scale", c.hidden_size, layer.router_input_scale.data());
-      const float root = 1.0f / std::sqrt(static_cast<float>(c.hidden_size));
-      for (float& scale : layer.router_input_scale) scale *= root;
-      layer.per_expert_scale.resize(static_cast<size_t>(c.num_experts));
-      load_vector(ck, p + base + ".router.per_expert_scale", c.num_experts, layer.per_expert_scale.data());
-    }
-    if (!c.is_moe(i) || c.experts_beside_mlp) {
-      layer.gate_proj = linear(base + ".mlp.gate_proj");
-      layer.up_proj = linear(base + ".mlp.up_proj");
-      layer.down_proj = linear(base + ".mlp.down_proj");
-      LK_CHECK(layer.gate_proj.rows == inter && layer.up_proj.rows == inter && layer.down_proj.cols == inter &&
-                   layer.gate_proj.cols == c.hidden_size && layer.up_proj.cols == c.hidden_size &&
-                   layer.down_proj.rows == c.hidden_size,
-               base + ": mlp shape");
-    }
-    if (c.per_layer_input > 0) {
-      layer.per_layer_gate = linear(base + ".per_layer_input_gate");
-      layer.per_layer_proj = linear(base + ".per_layer_projection");
-      layer.per_layer_norm = vec(base + ".post_per_layer_input_norm", c.hidden_size);
-      LK_CHECK(layer.per_layer_gate.rows == c.per_layer_input && layer.per_layer_gate.cols == c.hidden_size &&
-                   layer.per_layer_proj.rows == c.hidden_size && layer.per_layer_proj.cols == c.per_layer_input,
-               base + ": per-layer input shape");
-    }
-    if (c.layer_scalars) load_vector(ck, p + base + ".layer_scalar", 1, &layer.layer_scalar);
-    w->layers.push_back(std::move(layer));
+    w->layers.push_back(bind_layer(*w, stem + "layers." + std::to_string(i), i, mlx_layout));
   }
+  bind_mtp(*w, draft_model, mlx_layout);
   return w;
 }
 
@@ -1476,13 +1566,14 @@ class DecoderCpu final : public Model {
         max_context_(options.max_context), chunk_(std::max(1, options.prefill_chunk)),
         kv_f16_(kv_cache_f16(options, c_, false)) {
     LK_CHECK(max_context_ > 0, "max_context must be positive");
-    const size_t layers = static_cast<size_t>(c_.num_layers);
+    // The MTP head's layer, when there is one, follows the decoder's.
+    const size_t layers = static_cast<size_t>(c_.num_layers + c_.mtp_layers);
     kv_k_.resize(layers);
     kv_v_.resize(layers);
     capacity_.resize(layers);
     conv_state_.resize(layers);
     delta_state_.resize(layers);
-    for (int l = 0; l < c_.num_layers; ++l) {
+    for (int l = 0; l < static_cast<int>(layers); ++l) {
       max_q_ = std::max<size_t>(max_q_, static_cast<size_t>(c_.num_heads) * c_.head_dim_of(l));
       max_kv_ = std::max<size_t>(max_kv_, static_cast<size_t>(c_.kv_heads_of(l)) * c_.head_dim_of(l));
       max_inter_ = std::max<size_t>(max_inter_, static_cast<size_t>(c_.intermediate_of(l)));
@@ -1592,7 +1683,54 @@ class DecoderCpu final : public Model {
         if (c_.is_linear(l)) replay_linear(l, kept);
       }
     }
+    // The head's rows past the kept tokens are rewritten before a draft
+    // reads them; the last kept row's hidden state is pending.
+    if (mtp_on_) {
+      const auto row = normed_.begin() + static_cast<std::ptrdiff_t>(kept - 1) * c_.hidden_size;
+      mtp_pending_.assign(row, row + c_.hidden_size);
+    }
     verify_n_ = 0;
+  }
+
+  bool has_mtp() const override { return w_->mtp.has_value(); }
+
+  void follow_mtp(bool on) override {
+    if (on == mtp_on_) return;
+    LK_CHECK(!on || has_mtp(), c_.architecture + ": this checkpoint has no multi-token prediction head");
+    LK_CHECK(!on || position_ == 0, "the MTP head must follow the model from an empty context");
+    mtp_on_ = on;
+  }
+
+  // Each draft runs the head's whole layer on one row at the next position
+  // (the first pairs `token` with the pending hidden state), then its norm
+  // and lm_head; its output is the hidden state of the draft after.
+  std::vector<int32_t> mtp_draft(int32_t token, int count, std::vector<float>* logits) override {
+    LK_CHECK(mtp_on_ && position_ > 0, "the MTP head drafts once it has followed a pass");
+    LK_CHECK(token >= 0 && token < c_.vocab_size, "token id out of range");
+    LK_CHECK(count >= 0 && position_ - 1 + count <= max_context_, "context length exceeded");
+    const DecoderWeights::Mtp& M = *w_->mtp;
+    const int64_t hidden = c_.hidden_size;
+    const float cap = c_.final_logit_softcapping;
+    std::vector<float> before = mtp_pending_;
+    std::vector<int32_t> drafts;
+    if (logits != nullptr) logits->clear();
+    mtp_in_.resize(static_cast<size_t>(2 * hidden));
+    mtp_logits_.resize(static_cast<size_t>(c_.vocab_size));
+    for (int step = 0; step < count; ++step) {
+      mtp_input(token, before.data(), mtp_in_.data());
+      matmul(M.fc, mtp_in_.data(), 1, x_.data(), pool_);
+      run_layer(M.layer, c_.num_layers, position_ - 1 + step, 1);
+      norm(x_.data(), M.final_norm, hidden, before.data());
+      Section section(profiler_, "lm_head", profiler_ != nullptr ? traffic::linear(w_->lm_head, 1) : 0.0);
+      matvec(w_->lm_head, before.data(), mtp_logits_.data(), pool_);
+      if (cap > 0.0f) {
+        for (float& v : mtp_logits_) v = std::tanh(v / cap) * cap;
+      }
+      token = argmax(mtp_logits_.data(), c_.vocab_size);
+      drafts.push_back(token);
+      if (logits != nullptr) logits->insert(logits->end(), mtp_logits_.begin(), mtp_logits_.end());
+    }
+    return drafts;
   }
 
  protected:
@@ -1603,6 +1741,7 @@ class DecoderCpu final : public Model {
   void begin_injection(int n) {
     active_ = std::move(injection_);
     injection_ = {};
+    LK_CHECK(!mtp_on_ || active_.empty(), "the MTP head does not take image features yet");
     plan_ = plan_injection(active_, position_, n, c_.hidden_size, chunk_, c_.injection_rules(rope_offset_));
     rope_offset_ = plan_.rope_offset;  // for the tokens after this prefill
   }
@@ -1748,7 +1887,6 @@ class DecoderCpu final : public Model {
   void forward(const int32_t* tokens, int n, bool want_logits) {
     LK_CHECK(position_ + n <= max_context_, "context length exceeded");
     LK_CHECK(n <= chunk_, "a forward pass is longer than the prefill chunk");
-    const int H = c_.num_heads;
     const int64_t hidden = c_.hidden_size;
     const size_t sn = static_cast<size_t>(n);
     x_.resize(sn * hidden);
@@ -1782,164 +1920,29 @@ class DecoderCpu final : public Model {
     if (c_.per_layer_input > 0) per_layer_inputs(tokens, n);
 
     const int start = position_;
-    // Section traffic is computed only while profiling.
+    for (int l = 0; l < c_.num_layers; ++l) run_layer(w_->layers[static_cast<size_t>(l)], l, start, n);
+    position_ += n;
     const bool profiling = profiler_ != nullptr;
-    const double norm_bytes = profiling ? traffic::rows(hidden, n, 2) + 4.0 * hidden : 0.0;
-    const double residual_bytes = profiling ? traffic::rows(hidden, n, 3) + (c_.sandwich_norms ? 4.0 * hidden : 0.0) : 0.0;
-    for (int l = 0; l < c_.num_layers; ++l) {
-      const DecoderLayer& L = w_->layers[static_cast<size_t>(l)];
-      const bool sliding = c_.layer_is_sliding[static_cast<size_t>(l)];
-      const bool own_kv = !c_.shares_kv(l);
-      const int D = c_.head_dim_of(l), KV = c_.kv_heads_of(l);
-      const int64_t inter = c_.intermediate_of(l);
-      {
-        Section section(profiler_, "norm", norm_bytes);
-        for (int t = 0; t < n; ++t) norm(x_.data() + t * hidden, L.attn_norm, hidden, h_.data() + t * hidden);
-      }
-      if (c_.is_linear(l)) {
-        gated_delta_net(L, l, n);
-      } else if (c_.mla()) {
-        latent_attention(L, l, start, n);
-      } else {
-        {
-          Section section(profiler_, "qkv",
-                          profiling ? traffic::linear(L.q_proj, n) +
-                                          (own_kv ? traffic::linear(L.k_proj, n) : 0.0) +
-                                          (own_kv && !c_.k_eq_v(l) ? traffic::linear(L.v_proj, n) : 0.0)
-                                    : 0.0);
-          if (c_.attn_output_gate) {
-            // Each head's query, then its output gate.
-            const size_t width = static_cast<size_t>(H) * D;
-            q_gate_.resize(sn * 2 * width);
-            out_gate_.resize(sn * width);
-            matmul(L.q_proj, h_.data(), n, q_gate_.data(), pool_);
-            for (size_t row = 0; row < sn * H; ++row) {
-              const float* both = q_gate_.data() + row * 2 * D;
-              std::copy_n(both, D, q_.data() + row * D);
-              std::copy_n(both + D, D, out_gate_.data() + row * D);
-            }
-          } else {
-            matmul(L.q_proj, h_.data(), n, q_.data(), pool_);
-          }
-          if (own_kv) {
-            matmul(L.k_proj, h_.data(), n, k_.data(), pool_);
-            if (c_.k_eq_v(l)) {
-              std::copy_n(k_.data(), sn * KV * D, v_.data());  // values are the raw key projection
-            } else {
-              matmul(L.v_proj, h_.data(), n, v_.data(), pool_);
-            }
-          }
-        }
-        {
-          Section section(profiler_, "rope_kv", profiling ? traffic::rows(D, n, 2 * H + (own_kv ? (c_.v_norm ? 6 : 4) * KV : 0)) : 0.0);
-          if (c_.qkv_bias) {
-            for (int t = 0; t < n; ++t) {
-              add_bias(q_.data() + static_cast<size_t>(t) * H * D, L.q_bias);
-              add_bias(k_.data() + static_cast<size_t>(t) * KV * D, L.k_bias);
-              add_bias(v_.data() + static_cast<size_t>(t) * KV * D, L.v_bias);
-            }
-          }
-          const auto& inv_freq = sliding ? inv_freq_local_ : inv_freq_global_;
-          const int rotated = c_.rotary_dim > 0 ? c_.rotary_dim : D;
-          for (int t = 0; t < n; ++t) {
-            const std::array<int, 3> pos = rope_position(start + t);
-            for (int hh = 0; hh < H; ++hh) {
-              float* qv = q_.data() + (static_cast<size_t>(t) * H + hh) * D;
-              if (c_.qk_norm) norm(qv, L.q_norm, D, qv);
-              apply_rope(qv, rotated, pos, inv_freq);
-            }
-            if (!own_kv) continue;
-            for (int kv = 0; kv < KV; ++kv) {
-              float* kvec = k_.data() + (static_cast<size_t>(t) * KV + kv) * D;
-              if (c_.qk_norm) norm(kvec, L.k_norm, D, kvec);
-              apply_rope(kvec, rotated, pos, inv_freq);
-              if (c_.v_norm) {
-                float* vvec = v_.data() + (static_cast<size_t>(t) * KV + kv) * D;
-                rms_norm(vvec, nullptr, D, c_.rms_norm_eps, 0.0f, vvec);
-              }
-            }
-            store_kv(l, start + t, k_.data() + static_cast<size_t>(t) * KV * D,
-                     v_.data() + static_cast<size_t>(t) * KV * D);
-          }
-        }
-        {
-          Section section(profiler_, "attention", profiling ? traffic::attention(c_, l, start, n) : 0.0);
-          attend(l, start, n, sliding, c_.attention_sinks ? L.sinks.data() : nullptr);
-        }
-        {
-          Section section(profiler_, "o_proj",
-                          profiling ? traffic::linear(L.o_proj, n) +
-                                          (c_.attn_output_gate ? traffic::rows(static_cast<int64_t>(H) * D, n, 3) : 0.0)
-                                    : 0.0);
-          if (c_.attn_output_gate) {
-            for (size_t i = 0; i < sn * H * D; ++i) attn_[i] *= sigmoid(out_gate_[i]);
-          }
-          matmul(L.o_proj, attn_.data(), n, r_.data(), pool_);
-          if (c_.o_bias) {
-            for (int t = 0; t < n; ++t) add_bias(r_.data() + static_cast<size_t>(t) * hidden, L.o_bias);
-          }
-        }
-      }
-      {
-        Section section(profiler_, "residual", residual_bytes);
-        add_residual(n, L.attn_post_norm);
-      }
-      {
-        Section section(profiler_, "norm", norm_bytes);
-        for (int t = 0; t < n; ++t) norm(x_.data() + t * hidden, L.mlp_norm, hidden, h_.data() + t * hidden);
-      }
-      if (c_.is_moe(l) && !c_.experts_beside_mlp) {
-        experts(L, n, h_.data(), h_.data());
-      } else {
-        {
-          Section section(profiler_, "mlp_up",
-                          profiling ? traffic::linear(L.gate_proj, n) + traffic::linear(L.up_proj, n) +
-                                          traffic::rows(inter, n, 1)
-                                    : 0.0);
-          matmul(L.gate_proj, h_.data(), n, gate_.data(), pool_);
-          matmul(L.up_proj, h_.data(), n, up_.data(), pool_);
-          gated_activation(gate_.data(), up_.data(), sn * inter);
-        }
-        Section section(profiler_, "down_proj", profiling ? traffic::linear(L.down_proj, n) : 0.0);
-        matmul(L.down_proj, gate_.data(), n, r_.data(), pool_);
-      }
-      if (c_.is_moe(l) && c_.experts_beside_mlp) experts_beside_mlp(L, n);
-      {
-        Section section(profiler_, "residual", residual_bytes);
-        add_residual(n, L.mlp_post_norm);
-      }
-      if (c_.per_layer_input > 0) gate_per_layer_input(L, l, n);
-      if (L.layer_scalar != 1.0f) {
-        Section section(profiler_, "residual", profiling ? traffic::rows(hidden, n, 2) : 0.0);
-        for (size_t i = 0; i < sn * hidden; ++i) x_[i] *= L.layer_scalar;
-      }
-      if (static_cast<size_t>(l) < active_.layer_rows.size()) {
-        // Deepstack: this layer's rows add onto the injected positions.
-        Section section(profiler_, "residual", profiling ? traffic::rows(hidden, n, 3) : 0.0);
-        const std::vector<float>& rows = active_.layer_rows[static_cast<size_t>(l)];
-        for (int t = 0; t < n; ++t) {
-          const int injected = injected_row(position_ + t);
-          if (injected < 0) continue;
-          const float* add = rows.data() + static_cast<size_t>(injected) * hidden;
-          float* row = x_.data() + static_cast<size_t>(t) * hidden;
-          for (int64_t i = 0; i < hidden; ++i) row[i] += add[i];
-        }
+    // Every row's final-normed hidden state, when the pass verifies drafts or
+    // the MTP head follows the model.
+    const bool all_rows = verifying_ || mtp_on_;
+    if (all_rows) {
+      Section section(profiler_, "norm", profiling ? traffic::rows(hidden, n, 2) + 4.0 * hidden : 0.0);
+      normed_.resize(sn * hidden);
+      for (int t = 0; t < n; ++t) {
+        norm(x_.data() + static_cast<size_t>(t) * hidden, w_->final_norm, hidden, normed_.data() + t * hidden);
       }
     }
-    position_ += n;
+    if (mtp_on_) mtp_follow(tokens, n, start);
     if (!want_logits) return;
     const float cap = c_.final_logit_softcapping;
     if (verifying_) {  // every row's logits
-      Section section(profiler_, "lm_head", profiling ? traffic::linear(w_->lm_head, n) + 4.0 * hidden * n : 0.0);
-      std::vector<float> normed(sn * static_cast<size_t>(hidden));
-      for (int t = 0; t < n; ++t) {
-        norm(x_.data() + static_cast<size_t>(t) * hidden, w_->final_norm, hidden, normed.data() + t * hidden);
-      }
+      Section section(profiler_, "lm_head", profiling ? traffic::linear(w_->lm_head, n) : 0.0);
       all_logits_.resize(sn * static_cast<size_t>(c_.vocab_size));
       if (n == 1) {
-        matvec(w_->lm_head, normed.data(), all_logits_.data(), pool_);
+        matvec(w_->lm_head, normed_.data(), all_logits_.data(), pool_);
       } else {
-        matmul(w_->lm_head, normed.data(), n, all_logits_.data(), pool_);
+        matmul(w_->lm_head, normed_.data(), n, all_logits_.data(), pool_);
       }
       if (cap > 0.0f) {
         for (float& v : all_logits_) v = std::tanh(v / cap) * cap;
@@ -1948,12 +1951,226 @@ class DecoderCpu final : public Model {
     }
     // Only the last row's logits are needed: skip the vocabulary projection
     // for every other prompt token.
-    Section section(profiler_, "lm_head", profiling ? traffic::linear(w_->lm_head, 1) + 4.0 * hidden : 0.0);
-    std::vector<float> last(static_cast<size_t>(hidden));
-    norm(x_.data() + static_cast<size_t>(n - 1) * hidden, w_->final_norm, hidden, last.data());
-    matvec(w_->lm_head, last.data(), logits_.data(), pool_);
+    Section section(profiler_, "lm_head",
+                    profiling ? traffic::linear(w_->lm_head, 1) + (all_rows ? 0.0 : 4.0 * hidden) : 0.0);
+    std::vector<float> row;
+    const float* last = normed_.data() + static_cast<size_t>(n - 1) * hidden;
+    if (!all_rows) {
+      row.resize(static_cast<size_t>(hidden));
+      norm(x_.data() + static_cast<size_t>(n - 1) * hidden, w_->final_norm, hidden, row.data());
+      last = row.data();
+    }
+    matvec(w_->lm_head, last, logits_.data(), pool_);
     if (cap > 0.0f) {
       for (float& v : logits_) v = std::tanh(v / cap) * cap;
+    }
+  }
+
+  // ---- multi-token prediction ---------------------------------------------
+
+  // The head's input for `token` after the final-normed hidden state
+  // `before`: [norm_e(embedding) | norm_h(before)], 2 * hidden values.
+  void mtp_input(int32_t token, const float* before, float* out) {
+    const DecoderWeights::Mtp& M = *w_->mtp;
+    const int64_t hidden = c_.hidden_size;
+    dequantize_row(w_->embed, token, out);
+    if (c_.embed_scale != 1.0f) {
+      for (int64_t i = 0; i < hidden; ++i) out[i] *= c_.embed_scale;
+    }
+    norm(out, M.embedding_norm, hidden, out);
+    norm(before, M.hidden_norm, hidden, out + hidden);
+  }
+
+  // The head follows the model: its row at position p pairs the final-normed
+  // hidden state at p with the token at p + 1. A pass over tokens at [start,
+  // start + n) fills the rows for [start - 1, start + n - 1), the first from
+  // the hidden state the previous pass left pending, and leaves its own last
+  // one pending. Until a draft reads them, only the rows' keys and values
+  // matter, so this computes no further.
+  void mtp_follow(const int32_t* tokens, int n, int start) {
+    const DecoderWeights::Mtp& M = *w_->mtp;
+    const DecoderLayer& L = M.layer;
+    const int l = c_.num_layers, D = c_.head_dim_of(l), KV = c_.kv_heads_of(l);
+    const int64_t hidden = c_.hidden_size;
+    const int first = start == 0 ? 1 : 0;  // position 0's token follows no hidden state
+    const int rows = n - first;
+    if (rows > 0) {
+      const bool profiling = profiler_ != nullptr;
+      Section section(profiler_, "mtp",
+                      profiling ? traffic::linear(M.fc, rows) + traffic::linear(L.k_proj, rows) +
+                                      traffic::linear(L.v_proj, rows) + traffic::embed(w_->embed, rows)
+                                : 0.0);
+      mtp_in_.resize(static_cast<size_t>(rows) * 2 * hidden);
+      for (int r = 0; r < rows; ++r) {
+        const int i = first + r;
+        const float* before = i == 0 ? mtp_pending_.data() : normed_.data() + static_cast<size_t>(i - 1) * hidden;
+        mtp_input(tokens[i], before, mtp_in_.data() + static_cast<size_t>(r) * 2 * hidden);
+      }
+      matmul(M.fc, mtp_in_.data(), rows, x_.data(), pool_);
+      for (int r = 0; r < rows; ++r) norm(x_.data() + r * hidden, L.attn_norm, hidden, h_.data() + r * hidden);
+      matmul(L.k_proj, h_.data(), rows, k_.data(), pool_);
+      matmul(L.v_proj, h_.data(), rows, v_.data(), pool_);
+      const int rotated = c_.rotary_dim > 0 ? c_.rotary_dim : D;
+      for (int r = 0; r < rows; ++r) {
+        const int pos = start - 1 + first + r;
+        for (int kv = 0; kv < KV; ++kv) {
+          float* kvec = k_.data() + (static_cast<size_t>(r) * KV + kv) * D;
+          if (c_.qk_norm) norm(kvec, L.k_norm, D, kvec);
+          apply_rope(kvec, rotated, rope_position(pos), inv_freq_global_);
+        }
+        store_kv(l, pos, k_.data() + static_cast<size_t>(r) * KV * D, v_.data() + static_cast<size_t>(r) * KV * D);
+      }
+    }
+    mtp_pending_.assign(normed_.begin() + static_cast<std::ptrdiff_t>((n - 1) * hidden),
+                        normed_.begin() + static_cast<std::ptrdiff_t>(n * hidden));
+  }
+
+  // Layer l (weights L) over the pass's n rows of x_ at positions [start,
+  // start + n).
+  void run_layer(const DecoderLayer& L, int l, int start, int n) {
+    const int H = c_.num_heads;
+    const int64_t hidden = c_.hidden_size;
+    const size_t sn = static_cast<size_t>(n);
+    // Section traffic is computed only while profiling.
+    const bool profiling = profiler_ != nullptr;
+    const double norm_bytes = profiling ? traffic::rows(hidden, n, 2) + 4.0 * hidden : 0.0;
+    const double residual_bytes = profiling ? traffic::rows(hidden, n, 3) + (c_.sandwich_norms ? 4.0 * hidden : 0.0) : 0.0;
+    const bool sliding = c_.layer_is_sliding[static_cast<size_t>(l)];
+    const bool own_kv = !c_.shares_kv(l);
+    const int D = c_.head_dim_of(l), KV = c_.kv_heads_of(l);
+    const int64_t inter = c_.intermediate_of(l);
+    {
+      Section section(profiler_, "norm", norm_bytes);
+      for (int t = 0; t < n; ++t) norm(x_.data() + t * hidden, L.attn_norm, hidden, h_.data() + t * hidden);
+    }
+    if (c_.is_linear(l)) {
+      gated_delta_net(L, l, n);
+    } else if (c_.mla()) {
+      latent_attention(L, l, start, n);
+    } else {
+      {
+        Section section(profiler_, "qkv",
+                        profiling ? traffic::linear(L.q_proj, n) +
+                                        (own_kv ? traffic::linear(L.k_proj, n) : 0.0) +
+                                        (own_kv && !c_.k_eq_v(l) ? traffic::linear(L.v_proj, n) : 0.0)
+                                  : 0.0);
+        if (c_.attn_output_gate) {
+          // Each head's query, then its output gate.
+          const size_t width = static_cast<size_t>(H) * D;
+          q_gate_.resize(sn * 2 * width);
+          out_gate_.resize(sn * width);
+          matmul(L.q_proj, h_.data(), n, q_gate_.data(), pool_);
+          for (size_t row = 0; row < sn * H; ++row) {
+            const float* both = q_gate_.data() + row * 2 * D;
+            std::copy_n(both, D, q_.data() + row * D);
+            std::copy_n(both + D, D, out_gate_.data() + row * D);
+          }
+        } else {
+          matmul(L.q_proj, h_.data(), n, q_.data(), pool_);
+        }
+        if (own_kv) {
+          matmul(L.k_proj, h_.data(), n, k_.data(), pool_);
+          if (c_.k_eq_v(l)) {
+            std::copy_n(k_.data(), sn * KV * D, v_.data());  // values are the raw key projection
+          } else {
+            matmul(L.v_proj, h_.data(), n, v_.data(), pool_);
+          }
+        }
+      }
+      {
+        Section section(profiler_, "rope_kv", profiling ? traffic::rows(D, n, 2 * H + (own_kv ? (c_.v_norm ? 6 : 4) * KV : 0)) : 0.0);
+        if (c_.qkv_bias) {
+          for (int t = 0; t < n; ++t) {
+            add_bias(q_.data() + static_cast<size_t>(t) * H * D, L.q_bias);
+            add_bias(k_.data() + static_cast<size_t>(t) * KV * D, L.k_bias);
+            add_bias(v_.data() + static_cast<size_t>(t) * KV * D, L.v_bias);
+          }
+        }
+        const auto& inv_freq = sliding ? inv_freq_local_ : inv_freq_global_;
+        const int rotated = c_.rotary_dim > 0 ? c_.rotary_dim : D;
+        for (int t = 0; t < n; ++t) {
+          const std::array<int, 3> pos = rope_position(start + t);
+          for (int hh = 0; hh < H; ++hh) {
+            float* qv = q_.data() + (static_cast<size_t>(t) * H + hh) * D;
+            if (c_.qk_norm) norm(qv, L.q_norm, D, qv);
+            apply_rope(qv, rotated, pos, inv_freq);
+          }
+          if (!own_kv) continue;
+          for (int kv = 0; kv < KV; ++kv) {
+            float* kvec = k_.data() + (static_cast<size_t>(t) * KV + kv) * D;
+            if (c_.qk_norm) norm(kvec, L.k_norm, D, kvec);
+            apply_rope(kvec, rotated, pos, inv_freq);
+            if (c_.v_norm) {
+              float* vvec = v_.data() + (static_cast<size_t>(t) * KV + kv) * D;
+              rms_norm(vvec, nullptr, D, c_.rms_norm_eps, 0.0f, vvec);
+            }
+          }
+          store_kv(l, start + t, k_.data() + static_cast<size_t>(t) * KV * D,
+                   v_.data() + static_cast<size_t>(t) * KV * D);
+        }
+      }
+      {
+        Section section(profiler_, "attention", profiling ? traffic::attention(c_, l, start, n) : 0.0);
+        attend(l, start, n, sliding, c_.attention_sinks ? L.sinks.data() : nullptr);
+      }
+      {
+        Section section(profiler_, "o_proj",
+                        profiling ? traffic::linear(L.o_proj, n) +
+                                        (c_.attn_output_gate ? traffic::rows(static_cast<int64_t>(H) * D, n, 3) : 0.0)
+                                  : 0.0);
+        if (c_.attn_output_gate) {
+          for (size_t i = 0; i < sn * H * D; ++i) attn_[i] *= sigmoid(out_gate_[i]);
+        }
+        matmul(L.o_proj, attn_.data(), n, r_.data(), pool_);
+        if (c_.o_bias) {
+          for (int t = 0; t < n; ++t) add_bias(r_.data() + static_cast<size_t>(t) * hidden, L.o_bias);
+        }
+      }
+    }
+    {
+      Section section(profiler_, "residual", residual_bytes);
+      add_residual(n, L.attn_post_norm);
+    }
+    {
+      Section section(profiler_, "norm", norm_bytes);
+      for (int t = 0; t < n; ++t) norm(x_.data() + t * hidden, L.mlp_norm, hidden, h_.data() + t * hidden);
+    }
+    if (c_.is_moe(l) && !c_.experts_beside_mlp) {
+      experts(L, n, h_.data(), h_.data());
+    } else {
+      {
+        Section section(profiler_, "mlp_up",
+                        profiling ? traffic::linear(L.gate_proj, n) + traffic::linear(L.up_proj, n) +
+                                        traffic::rows(inter, n, 1)
+                                  : 0.0);
+        matmul(L.gate_proj, h_.data(), n, gate_.data(), pool_);
+        matmul(L.up_proj, h_.data(), n, up_.data(), pool_);
+        gated_activation(gate_.data(), up_.data(), sn * inter);
+      }
+      Section section(profiler_, "down_proj", profiling ? traffic::linear(L.down_proj, n) : 0.0);
+      matmul(L.down_proj, gate_.data(), n, r_.data(), pool_);
+    }
+    if (c_.is_moe(l) && c_.experts_beside_mlp) experts_beside_mlp(L, n);
+    {
+      Section section(profiler_, "residual", residual_bytes);
+      add_residual(n, L.mlp_post_norm);
+    }
+    if (c_.per_layer_input > 0) gate_per_layer_input(L, l, n);
+    if (L.layer_scalar != 1.0f) {
+      Section section(profiler_, "residual", profiling ? traffic::rows(hidden, n, 2) : 0.0);
+      for (size_t i = 0; i < sn * hidden; ++i) x_[i] *= L.layer_scalar;
+    }
+    if (static_cast<size_t>(l) < active_.layer_rows.size()) {
+      // Deepstack: this layer's rows add onto the injected positions.
+      Section section(profiler_, "residual", profiling ? traffic::rows(hidden, n, 3) : 0.0);
+      const std::vector<float>& rows = active_.layer_rows[static_cast<size_t>(l)];
+      for (int t = 0; t < n; ++t) {
+        const int injected = injected_row(start + t);
+        if (injected < 0) continue;
+        const float* add = rows.data() + static_cast<size_t>(injected) * hidden;
+        float* row = x_.data() + static_cast<size_t>(t) * hidden;
+        for (int64_t i = 0; i < hidden; ++i) row[i] += add[i];
+      }
     }
   }
 
@@ -2642,6 +2859,14 @@ class DecoderCpu final : public Model {
   std::vector<std::vector<float>> conv_snapshot_, delta_snapshot_;
   std::vector<LinearInputs> verify_inputs_;
   std::vector<float> all_logits_;
+  // The pass's final-normed hidden states [n, hidden], when it verifies or
+  // the MTP head follows the model.
+  std::vector<float> normed_;
+  // Multi-token prediction: whether the head follows the model, the hidden
+  // state its next row starts from, its inputs [rows, 2 * hidden], and a
+  // draft's logits.
+  bool mtp_on_ = false;
+  std::vector<float> mtp_pending_, mtp_in_, mtp_logits_;
   std::vector<float> mixed_, z_, beta_, decay_, conv_in_, grouped_, grouped_ba_, linear_out_;
 };
 

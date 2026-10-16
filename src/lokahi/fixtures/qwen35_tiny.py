@@ -65,6 +65,7 @@ class TinyQwen35Spec:
     tie_word_embeddings: bool = False
     qk_scale: float = 1.0  # scales the q and k channels' conv taps; small q and k make the L2 norm's epsilon matter
     mlx: bool = True  # False: Transformers' BF16 layout
+    mtp: bool = False  # a multi-token prediction head (mtp.*) beside the decoder
     bits: int = 4
     group_size: int = 32
     seed: int = 0
@@ -118,6 +119,8 @@ class TinyQwen35Spec:
             "tie_word_embeddings": self.tie_word_embeddings,
             "eos_token_id": 2,
         }
+        if self.mtp:
+            text.update(mtp_num_hidden_layers=1, mtp_use_dedicated_embeddings=False)
         rope = {"rope_type": "default", "rope_theta": self.rope_theta,
                 "partial_rotary_factor": self.partial_rotary_factor}
         if self.model_type == "qwen3_next":
@@ -164,47 +167,49 @@ class TinyQwen35Spec:
         return config
 
 
-def write_tiny_qwen35(directory: Path, spec: TinyQwen35Spec = TinyQwen35Spec()) -> Path:
-    """Write ``config.json`` and ``model.safetensors`` into ``directory``."""
+class _Writer:
+    """Random tensors in a spec's layout: MLX's quantized one (``quant`` is the
+    config's quantization) or Transformers' BF16 one (``quant`` None)."""
 
-    directory = Path(directory)
-    directory.mkdir(parents=True, exist_ok=True)
-    config = spec.config()
-    rng = np.random.default_rng(spec.seed)
-    tensors: dict[str, tuple[str, np.ndarray]] = {}
-    p, stem = spec.prefix, spec.stem
+    def __init__(self, spec: TinyQwen35Spec, rng: np.random.Generator, quant: dict | None):
+        self.spec, self.rng, self.quant = spec, rng, quant
+        self.tensors: dict[str, tuple[str, np.ndarray]] = {}
 
-    def linear(module: str, rows: int, cols: int, std: float, stack: int = 0) -> None:
-        if not spec.mlx:
+    def linear(self, module: str, rows: int, cols: int, std: float, stack: int = 0) -> None:
+        rng, tensors = self.rng, self.tensors
+        if self.quant is None:
             shape = (stack, rows, cols) if stack else (rows, cols)
             tensors[f"{module}.weight"] = ("BF16", f32_to_bf16(rng.normal(0.0, std, shape).astype(np.float32)))
             return
-        override = config["quantization"].get(module)
-        source = override if isinstance(override, dict) else config["quantization"]
+        override = self.quant.get(module)
+        source = override if isinstance(override, dict) else self.quant
         qspec = QuantSpec(group_size=source["group_size"], bits=source["bits"])
         if not stack:
             weight, scales, biases = _quantized(rng, rows, cols, qspec, std)
         else:
-            weight, scales, biases = map(np.stack, zip(*(_quantized(rng, rows, cols, qspec, std) for _ in range(stack))))
+            weight, scales, biases = map(np.stack,
+                                         zip(*(_quantized(rng, rows, cols, qspec, std) for _ in range(stack))))
         tensors[f"{module}.weight"] = ("U32", weight)
         tensors[f"{module}.scales"] = ("BF16", scales)
         tensors[f"{module}.biases"] = ("BF16", biases)
 
-    def vector(name: str, size: int, mean: float, std: float, dtype: str = "BF16") -> None:
-        values = rng.normal(mean, std, size).astype(np.float32)
-        tensors[name] = (dtype, f32_to_bf16(values) if dtype == "BF16" else values)
+    def vector(self, name: str, size: int, mean: float, std: float, dtype: str = "BF16") -> None:
+        values = self.rng.normal(mean, std, size).astype(np.float32)
+        self.tensors[name] = (dtype, f32_to_bf16(values) if dtype == "BF16" else values)
 
-    def norm(name: str, size: int) -> None:
+    def norm(self, name: str, size: int) -> None:
         # Zero-centered: the model scales by 1 + w; MLX stores 1 + w.
-        vector(name, size, 1.0 if spec.mlx else 0.0, 0.2)
+        self.vector(name, size, 1.0 if self.quant is not None else 0.0, 0.2)
 
-    hidden, heads, kv_heads, dim = spec.hidden_size, spec.num_attention_heads, spec.num_key_value_heads, spec.head_dim
-    hk, hv, dk, dv = (spec.linear_num_key_heads, spec.linear_num_value_heads, spec.linear_key_head_dim,
-                      spec.linear_value_head_dim)
-    conv_dim, kernel = 2 * hk * dk + hv * dv, spec.linear_conv_kernel_dim
-    linear(f"{p}{stem}embed_tokens", spec.vocab_size, hidden, 0.6)
-    for layer, kind in enumerate(spec.layer_types()):
-        base = f"{p}{stem}layers.{layer}"
+    def layer(self, base: str, kind: str, sparse: bool) -> None:
+        spec, rng, tensors = self.spec, self.rng, self.tensors
+        linear, vector, norm = self.linear, self.vector, self.norm
+        mlx = self.quant is not None
+        hidden, heads, kv_heads, dim = (spec.hidden_size, spec.num_attention_heads, spec.num_key_value_heads,
+                                        spec.head_dim)
+        hk, hv, dk, dv = (spec.linear_num_key_heads, spec.linear_num_value_heads, spec.linear_key_head_dim,
+                          spec.linear_value_head_dim)
+        conv_dim, kernel = 2 * hk * dk + hv * dv, spec.linear_conv_kernel_dim
         norm(f"{base}.input_layernorm.weight", hidden)
         norm(f"{base}.post_attention_layernorm.weight", hidden)
         if kind == "full_attention":
@@ -228,7 +233,7 @@ def write_tiny_qwen35(directory: Path, spec: TinyQwen35Spec = TinyQwen35Spec()) 
                 linear(f"{lin}.in_proj_a", hv, hidden, hidden**-0.5 * 2.0)
             conv = rng.normal(0.0, 0.5, (conv_dim, kernel)).astype(np.float32)
             conv[: 2 * hk * dk] *= np.float32(spec.qk_scale)
-            conv = conv[:, :, None] if spec.mlx else conv[:, None, :]
+            conv = conv[:, :, None] if mlx else conv[:, None, :]
             tensors[f"{lin}.conv1d.weight"] = ("BF16", f32_to_bf16(conv))
             # Decays between about 0.4 and 0.95 per token so the state keeps
             # several tokens' worth of history.
@@ -237,15 +242,15 @@ def write_tiny_qwen35(directory: Path, spec: TinyQwen35Spec = TinyQwen35Spec()) 
             vector(f"{lin}.norm.weight", dv, 1.0, 0.2)
             linear(f"{lin}.out_proj", hidden, hv * dv, (hv * dv) ** -0.5)
         mlp = f"{base}.mlp"
-        if not spec.sparse(layer):
+        if not sparse:
             linear(f"{mlp}.gate_proj", spec.intermediate_size, hidden, hidden**-0.5)
             linear(f"{mlp}.up_proj", spec.intermediate_size, hidden, hidden**-0.5)
             linear(f"{mlp}.down_proj", hidden, spec.intermediate_size, spec.intermediate_size**-0.5)
-            continue
+            return
         experts, moe = spec.num_experts, spec.moe_intermediate_size
         # A wide router keeps the top-k choice far from ties.
         linear(f"{mlp}.gate", experts, hidden, hidden**-0.5 * 4.0)
-        if spec.mlx:
+        if mlx:
             linear(f"{mlp}.switch_mlp.gate_proj", moe, hidden, hidden**-0.5, experts)
             linear(f"{mlp}.switch_mlp.up_proj", moe, hidden, hidden**-0.5, experts)
             linear(f"{mlp}.switch_mlp.down_proj", hidden, moe, moe**-0.5, experts)
@@ -264,9 +269,55 @@ def write_tiny_qwen35(directory: Path, spec: TinyQwen35Spec = TinyQwen35Spec()) 
         linear(f"{mlp}.shared_expert.up_proj", shared, hidden, hidden**-0.5)
         linear(f"{mlp}.shared_expert.down_proj", hidden, shared, shared**-0.5)
         linear(f"{mlp}.shared_expert_gate", 1, hidden, hidden**-0.5 * 2.0)
-    norm(f"{p}{stem}norm.weight", hidden)
+
+    def mtp(self, head: str) -> None:
+        """A multi-token prediction head under ``head`` (``"mtp."`` or ``""``)."""
+
+        hidden = self.spec.hidden_size
+        self.linear(f"{head}fc", hidden, 2 * hidden, (2 * hidden) ** -0.5)
+        for name in ("pre_fc_norm_embedding", "pre_fc_norm_hidden", "norm"):
+            self.norm(f"{head}{name}.weight", hidden)
+        self.layer(f"{head}layers.0", "full_attention", self.spec.moe)
+
+
+def _mtp_quantization(spec: TinyQwen35Spec, head: str) -> dict:
+    """An MTP head's 8-bit router and shared-expert gate overrides, as the decoder's."""
+
+    if not spec.moe:
+        return {}
+    base = f"{head}layers.0.mlp"
+    return {f"{base}.gate": {"group_size": 64, "bits": 8}, f"{base}.shared_expert_gate": {"group_size": 64, "bits": 8}}
+
+
+def _mtp_seed(spec: TinyQwen35Spec) -> int:
+    # The head's own stream, so the decoder's tensors match the spec without it.
+    return spec.seed + 7919
+
+
+def write_tiny_qwen35(directory: Path, spec: TinyQwen35Spec = TinyQwen35Spec()) -> Path:
+    """Write ``config.json`` and ``model.safetensors`` into ``directory``."""
+
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    config = spec.config()
+    if spec.mtp and spec.mlx:
+        quant = {**config["quantization"], **_mtp_quantization(spec, "mtp.")}
+        config["quantization"] = config["quantization_config"] = quant
+    writer = _Writer(spec, np.random.default_rng(spec.seed), config.get("quantization") if spec.mlx else None)
+    p, stem = spec.prefix, spec.stem
+    hidden = spec.hidden_size
+    writer.linear(f"{p}{stem}embed_tokens", spec.vocab_size, hidden, 0.6)
+    for layer, kind in enumerate(spec.layer_types()):
+        writer.layer(f"{p}{stem}layers.{layer}", kind, spec.sparse(layer))
+    writer.norm(f"{p}{stem}norm.weight", hidden)
     if not spec.tie_word_embeddings:
-        linear(f"{p}lm_head", spec.vocab_size, hidden, hidden**-0.5 * 4.0)
+        writer.linear(f"{p}lm_head", spec.vocab_size, hidden, hidden**-0.5 * 4.0)
+    tensors = writer.tensors
+    if spec.mtp:
+        # Qwen's checkpoints keep the head at the top level, beside the decoder.
+        head = _Writer(spec, np.random.default_rng(_mtp_seed(spec)), writer.quant)
+        head.mtp("mtp.")
+        tensors = {**tensors, **head.tensors}
 
     (directory / "config.json").write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
     write_safetensors(
@@ -274,4 +325,34 @@ def write_tiny_qwen35(directory: Path, spec: TinyQwen35Spec = TinyQwen35Spec()) 
         tensors,
         metadata={"format": "mlx" if spec.mlx else "pt", "lokahi_fixture": json.dumps(asdict(spec), sort_keys=True)},
     )
+    return directory
+
+
+def write_tiny_qwen35_mtp_drafter(directory: Path, spec: TinyQwen35Spec) -> Path:
+    """Write the MTP head of ``spec`` (an MLX spec with ``mtp``) as MLX-VLM's
+    ``qwen3_5_mtp`` drafter: the head's tensors without the ``mtp.`` prefix,
+    quantized like the decoder, norms as ``1 + w``, and the target's text
+    config. Its tensors equal the ones ``write_tiny_qwen35`` puts beside the
+    decoder."""
+
+    if not (spec.mtp and spec.mlx):
+        raise ValueError("a qwen3_5_mtp drafter is split from an MLX spec with mtp")
+    directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
+    base = {"group_size": spec.group_size, "bits": spec.bits, "mode": "affine"}
+    quant = {**base, **_mtp_quantization(spec, "")}
+    head = _Writer(spec, np.random.default_rng(_mtp_seed(spec)), quant)
+    head.mtp("")
+    config = {
+        "model_type": "qwen3_5_mtp",
+        "block_size": 3,
+        "quantization": quant,
+        "quantization_config": quant,
+        "text_config": spec.text_config(),
+        "tie_word_embeddings": spec.tie_word_embeddings,
+        "vision_config": {},
+    }
+    (directory / "config.json").write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    write_safetensors(directory / "model.safetensors", head.tensors,
+                      metadata={"format": "mlx", "lokahi_fixture": json.dumps(asdict(spec), sort_keys=True)})
     return directory
