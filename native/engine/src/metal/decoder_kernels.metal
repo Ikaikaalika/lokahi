@@ -2157,3 +2157,65 @@ kernel void gelu_erf_inplace(device float* x [[buffer(0)]],
                              uint gid [[thread_position_in_grid]]) {
   if (int(gid) < p.count) x[gid] = 0.5f * x[gid] * (1.0f + erf_approx(x[gid] * 0.70710678f));
 }
+
+// ---------------------------------------------------------------------------
+// Qwen2.5-VL's windowed attention. Patches arrive window by window, so each
+// window's keys are consecutive rows. Threadgroup (head, t) attends patch
+// t's query over rows window[2t] to window[2t + 1] of qkv (each row
+// [q | k | v], `stride` floats) and writes out[t, head * dim ...]. A window
+// holds at most kMaxWindowKeys patches (the host checks).
+// ---------------------------------------------------------------------------
+
+struct WindowAttentionParams {
+  int dim;     // head size
+  int stride;  // floats per qkv row
+  int hidden;  // q's, k's and v's width, and out's
+  float scale;
+};
+
+constant constexpr int kMaxWindowKeys = 1024;
+
+kernel void window_attention(const device float* qkv [[buffer(0)]],
+                             const device int* window [[buffer(1)]],
+                             device float* out [[buffer(2)]],
+                             constant WindowAttentionParams& p [[buffer(3)]],
+                             uint2 tgp [[threadgroup_position_in_grid]],
+                             uint2 tid2 [[thread_position_in_threadgroup]],
+                             uint2 tpg2 [[threads_per_threadgroup]],
+                             uint sg [[simdgroup_index_in_threadgroup]],
+                             uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float scratch[32];
+  threadgroup float scores[kMaxWindowKeys];
+  const int head = int(tgp.x);
+  const int t = int(tgp.y);
+  const int tid = int(tid2.x);
+  const int tpg = int(tpg2.x);
+  const uint simdgroups = (uint(tpg) + 31) / 32;
+  const int begin = window[2 * t];
+  const int count = window[2 * t + 1] - begin;
+  const device float* q = qkv + t * p.stride + head * p.dim;
+  float m = -INFINITY;
+  for (int j = tid; j < count; j += tpg) {
+    const device float* k = qkv + (begin + j) * p.stride + p.hidden + head * p.dim;
+    float dot = 0.0f;
+    for (int d = 0; d < p.dim; ++d) dot += q[d] * k[d];
+    scores[j] = dot * p.scale;
+    m = max(m, scores[j]);
+  }
+  m = threadgroup_max(m, scratch, sg, lane, simdgroups);
+  float sum = 0.0f;
+  for (int j = tid; j < count; j += tpg) {
+    const float e = precise::exp(scores[j] - m);
+    scores[j] = e;
+    sum += e;
+  }
+  // threadgroup_sum's barriers also publish every thread's scores.
+  const float inv = 1.0f / threadgroup_sum(sum, scratch, sg, lane, simdgroups);
+  const device float* v = qkv + begin * p.stride + 2 * p.hidden + head * p.dim;
+  device float* o = out + t * p.hidden + head * p.dim;
+  for (int d = tid; d < p.dim; d += tpg) {
+    float acc = 0.0f;
+    for (int j = 0; j < count; ++j) acc += scores[j] * v[j * p.stride + d];
+    o[d] = acc * inv;
+  }
+}

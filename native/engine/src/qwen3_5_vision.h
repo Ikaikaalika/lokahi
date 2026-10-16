@@ -131,6 +131,11 @@ class Qwen35VisionEncoder : public VisionEncoder {
   // Qwen2.5-VL: the patches of each window of a rows x cols patch grid, in
   // merge-block order.
   std::vector<std::vector<int>> windows(int rows, int cols) const;
+  // The order the Metal tower runs patches in: merge-block order, or
+  // (Qwen2.5-VL) window by window as Transformers orders them, each merged
+  // token's patches still together. `bounds`, when given, receives each run
+  // slot's window as [begin, end) pairs (the whole image outside Qwen2.5-VL).
+  std::vector<int> run_order(int rows, int cols, std::vector<int32_t>* bounds = nullptr) const;
   // Adds patch `index`'s position embedding, the table bilinearly
   // interpolated to a rows x cols patch grid (linspace sample points), to x.
   void add_position(float* x, int index, int rows, int cols) const;

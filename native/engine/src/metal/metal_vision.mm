@@ -32,6 +32,9 @@ struct LayerNormParams { int cols; float eps; };
 struct NormParams { int cols; float eps; float offset; };
 struct ElementwiseParams { int count; };
 struct PoolParams { int cols; int side; int tokens_side; };
+struct GluMulParams { int count; int silu; };
+struct WindowAttentionParams { int dim; int stride; int hidden; float scale; };
+constexpr int kMaxWindowKeys = 1024;  // as decoder_kernels.metal
 
 // A matrix on the device with the dense_mm variant that reads it.
 struct GpuMatrix {
@@ -527,15 +530,19 @@ class Gemma4VisionMetal final : public Gemma4VisionEncoder, private MetalKit {
   id<MTLBuffer> scores_ = nil, pooled_ = nil, features_ = nil;
 };
 
-// Qwen3.5's tower. Buffers grow to the largest image encoded so far, since
-// the processor's bounds allow images far larger than most.
+// Qwen3.5's, Qwen3-VL's and Qwen2.5-VL's tower. Buffers grow to the largest
+// image encoded so far, since the processor's bounds allow images far larger
+// than most. Qwen2.5-VL's patches run window by window, as Transformers
+// orders them, so each window is a run of rows; the features return to the
+// merged grid's order on readback.
 class Qwen35VisionMetal final : public Qwen35VisionEncoder, private MetalKit {
  public:
   explicit Qwen35VisionMetal(std::shared_ptr<const Qwen35VisionWeights> weights)
       : Qwen35VisionEncoder(std::move(weights)) {
     @autoreleasepool {
       LK_CHECK(metal_qwen3_5_vision_supports(*weights_),
-               "metal: the vision tower has quantized matrices; use --backend cpu");
+               "metal: the vision tower has quantized matrices or windows of over " + std::to_string(kMaxWindowKeys) +
+                   " patches; use --backend cpu");
       upload();
     }
   }
@@ -549,20 +556,45 @@ class Qwen35VisionMetal final : public Qwen35VisionEncoder, private MetalKit {
       const int rows = token_rows * c.merge, cols = token_cols * c.merge, N = rows * cols;
       const int tokens = token_rows * token_cols, hidden = c.hidden_size;
       reserve(N);
+      // Row `slot` runs patch order[slot] of the merge-block order (for
+      // Qwen2.5-VL, window by window, with its window's rows bounded by
+      // window_[2 * slot] and window_[2 * slot + 1]).
+      std::vector<int32_t> bounds;
+      const std::vector<int> order = run_order(rows, cols, c.qwen2_5 ? &bounds : nullptr);
+      if (c.qwen2_5) std::memcpy([window_ contents], bounds.data(), sizeof(int32_t) * bounds.size());
       // Host side: the normalized patches, the interpolated position rows
       // (into x_, which the patch embedding then accumulates onto), and the
-      // 2-D RoPE tables in double.
+      // 2-D RoPE tables in double, each in run order.
+      const size_t width = static_cast<size_t>(3 * c.patch_size * c.patch_size);
+      const size_t half = static_cast<size_t>(c.head_dim() / 2);
       const std::vector<float> rows_data = patches(image);
-      std::memcpy([patches_ contents], rows_data.data(), sizeof(float) * rows_data.size());
+      std::vector<float> cos_rows(static_cast<size_t>(N) * half), sin_rows(static_cast<size_t>(N) * half);
+      rope_tables(rows, cols, cos_rows.data(), sin_rows.data());
+      float* patch_out = static_cast<float*>([patches_ contents]);
+      float* cos_out = static_cast<float*>([cos_ contents]);
+      float* sin_out = static_cast<float*>([sin_ contents]);
       float* x = static_cast<float*>([x_ contents]);
       std::fill(x, x + static_cast<size_t>(N) * hidden, 0.0f);
-      for (int t = 0; t < N; ++t) add_position(x + static_cast<size_t>(t) * hidden, t, rows, cols);
-      rope_tables(rows, cols, static_cast<float*>([cos_ contents]), static_cast<float*>([sin_ contents]));
+      for (size_t slot = 0; slot < static_cast<size_t>(N); ++slot) {
+        const size_t t = static_cast<size_t>(order[slot]);
+        std::copy_n(rows_data.data() + t * width, width, patch_out + slot * width);
+        std::copy_n(cos_rows.data() + t * half, half, cos_out + slot * half);
+        std::copy_n(sin_rows.data() + t * half, half, sin_out + slot * half);
+        if (c.position_side > 0) add_position(x + slot * hidden, static_cast<int>(t), rows, cols);
+      }
       run([&](id<MTLComputeCommandEncoder> enc) { encode_tower(enc, N); });
-      const size_t size = static_cast<size_t>(tokens) * c.text_hidden_size;
+      // Feature row r is the merged token of the patches in rows r * merge^2
+      // onward.
+      const size_t square = static_cast<size_t>(c.merge * c.merge), text = static_cast<size_t>(c.text_hidden_size);
+      const size_t size = static_cast<size_t>(tokens) * text;
       auto read = [&](id<MTLBuffer> buffer) {
         const float* out = static_cast<const float*>([buffer contents]);
-        return std::vector<float>(out, out + size);
+        std::vector<float> features(size);
+        for (size_t row = 0; row < static_cast<size_t>(tokens); ++row) {
+          const size_t token = static_cast<size_t>(order[row * square]) / square;
+          std::copy_n(out + row * text, text, features.data() + token * text);
+        }
+        return features;
       };
       ImageFeatures features{read(features_), {}};
       for (id<MTLBuffer> buffer : deepstack_features_) features.deepstack.push_back(read(buffer));
@@ -571,10 +603,12 @@ class Qwen35VisionMetal final : public Qwen35VisionEncoder, private MetalKit {
   }
 
  private:
+  // Qwen3.5's MLP is fc1 / fc2, Qwen2.5-VL's gate / up / down; its norms
+  // have no biases and its patch embedding none (nil buffers).
   struct Layer {
     id<MTLBuffer> norm1_weight, norm1_bias, norm2_weight, norm2_bias;
-    GpuMatrix qkv, proj, fc1, fc2;
-    id<MTLBuffer> qkv_bias, proj_bias, fc1_bias, fc2_bias;
+    GpuMatrix qkv, proj, fc1, fc2, gate, up, down;
+    id<MTLBuffer> qkv_bias, proj_bias, fc1_bias, fc2_bias, gate_bias, up_bias, down_bias;
   };
   struct Merger {
     id<MTLBuffer> norm_weight, norm_bias;
@@ -583,18 +617,23 @@ class Qwen35VisionMetal final : public Qwen35VisionEncoder, private MetalKit {
   };
   struct HalfRopeParams { int heads; int dim; int stride; };
 
+  // A buffer of `values`, or nil when there are none.
+  id<MTLBuffer> optional(const std::vector<float>& values) { return values.empty() ? nil : buffer_of(values); }
+  GpuMatrix optional(const Linear& linear) { return linear.cols > 0 ? matrix_of(linear) : GpuMatrix{}; }
+
   void upload() {
     const Qwen35VisionWeights& w = *weights_;
     patch_ = GpuMatrix{buffer_of(w.patch_weight), "f32"};
-    patch_bias_ = buffer_of(w.patch_bias);
+    patch_bias_ = optional(w.patch_bias);
     for (const Qwen35VisionWeights::Layer& L : w.layers) {
-      layers_.push_back(Layer{buffer_of(L.norm1_weight), buffer_of(L.norm1_bias), buffer_of(L.norm2_weight),
-                              buffer_of(L.norm2_bias), matrix_of(L.qkv), matrix_of(L.proj), matrix_of(L.fc1),
-                              matrix_of(L.fc2), buffer_of(L.qkv_bias), buffer_of(L.proj_bias), buffer_of(L.fc1_bias),
-                              buffer_of(L.fc2_bias)});
+      layers_.push_back(Layer{buffer_of(L.norm1_weight), optional(L.norm1_bias), buffer_of(L.norm2_weight),
+                              optional(L.norm2_bias), matrix_of(L.qkv), matrix_of(L.proj), optional(L.fc1),
+                              optional(L.fc2), optional(L.gate), optional(L.up), optional(L.down),
+                              buffer_of(L.qkv_bias), buffer_of(L.proj_bias), optional(L.fc1_bias), optional(L.fc2_bias),
+                              optional(L.gate_bias), optional(L.up_bias), optional(L.down_bias)});
     }
     auto merger = [&](const Qwen35VisionWeights::Merger& m) {
-      return Merger{buffer_of(m.norm_weight), buffer_of(m.norm_bias), matrix_of(m.fc1), matrix_of(m.fc2),
+      return Merger{buffer_of(m.norm_weight), optional(m.norm_bias), matrix_of(m.fc1), matrix_of(m.fc2),
                     buffer_of(m.fc1_bias), buffer_of(m.fc2_bias)};
     };
     merger_ = merger(w.merger);
@@ -615,6 +654,10 @@ class Qwen35VisionMetal final : public Qwen35VisionEncoder, private MetalKit {
     qkv_ = private_buffer(n * 3 * hidden * f);
     attn_ = private_buffer(n * hidden * f);
     f_ = private_buffer(n * static_cast<size_t>(c.intermediate_size) * f);
+    if (c.qwen2_5) {
+      up_ = private_buffer(n * static_cast<size_t>(c.intermediate_size) * f);
+      window_ = shared_buffer(n * 2 * sizeof(int32_t));
+    }
     scores_ = private_buffer(n * n * f);  // one head's [patches, patches]
     merged_ = private_buffer(n * hidden * f);  // [tokens, merge^2 * hidden]
     features_ = shared_buffer(tokens * static_cast<size_t>(c.text_hidden_size) * f);
@@ -642,6 +685,22 @@ class Qwen35VisionMetal final : public Qwen35VisionEncoder, private MetalKit {
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(rows), 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   }
 
+  // The tower's norm: Qwen2.5-VL's RMSNorm (no bias), else a LayerNorm.
+  void norm(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> in, id<MTLBuffer> weight, id<MTLBuffer> bias,
+            id<MTLBuffer> out, int rows, int cols) {
+    if (!config().qwen2_5) {
+      layer_norm(enc, in, weight, bias, out, rows, cols);
+      return;
+    }
+    [enc setComputePipelineState:pipeline("rms_norm_rows")];
+    [enc setBuffer:in offset:0 atIndex:0];
+    [enc setBuffer:weight offset:0 atIndex:1];
+    [enc setBuffer:out offset:0 atIndex:2];
+    bytes(enc, NormParams{cols, 1e-6f, 0.0f}, 3);
+    [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(rows), 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  }
+
   // 2-D RoPE on the q (part 0) or k (part 1) heads inside qkv_ [N, 3 * hidden].
   void rope(id<MTLComputeCommandEncoder> enc, int part, int N) {
     const Qwen35VisionConfig& c = config();
@@ -666,13 +725,24 @@ class Qwen35VisionMetal final : public Qwen35VisionEncoder, private MetalKit {
     const float scale = 1.0f / std::sqrt(static_cast<float>(D));
     const GpuMatrix fused{qkv_, "f32"};
     for (const Layer& L : layers_) {
-      layer_norm(enc, x_, L.norm1_weight, L.norm1_bias, h_, N, hidden);
+      const int block = static_cast<int>(&L - layers_.data());
+      norm(enc, x_, L.norm1_weight, L.norm1_bias, h_, N, hidden);
       linear(enc, h_, L.qkv, L.qkv_bias, qkv_, N, stride, hidden, false);
       rope(enc, 0, N);
       rope(enc, 1, N);
-      // Every patch sees every patch, one head at a time through scores_;
-      // each qkv_ row is [q | k | v].
-      for (int head = 0; head < heads; ++head) {
+      const bool global = !c.qwen2_5 || std::binary_search(c.full_attention.begin(), c.full_attention.end(), block);
+      if (!global) {  // each patch over its window's rows, every head at once
+        [enc setComputePipelineState:pipeline("window_attention")];
+        [enc setBuffer:qkv_ offset:0 atIndex:0];
+        [enc setBuffer:window_ offset:0 atIndex:1];
+        [enc setBuffer:attn_ offset:0 atIndex:2];
+        bytes(enc, WindowAttentionParams{D, stride, hidden, scale}, 3);
+        [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(heads), static_cast<NSUInteger>(N), 1)
+            threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+      }
+      // Otherwise every patch sees every patch, one head at a time through
+      // scores_; each qkv_ row is [q | k | v].
+      for (int head = 0; global && head < heads; ++head) {
         const size_t column = static_cast<size_t>(head) * D;
         mm(enc, qkv_, column, fused, hidden + column, true, scores_, 0,
            MmParams{N, N, D, stride, stride, N, scale, 0, 0});
@@ -684,12 +754,24 @@ class Qwen35VisionMetal final : public Qwen35VisionEncoder, private MetalKit {
            MmParams{N, D, N, N, stride, hidden, 1.0f, 0, 0});
       }
       linear(enc, attn_, L.proj, L.proj_bias, x_, N, hidden, hidden, true);
-      layer_norm(enc, x_, L.norm2_weight, L.norm2_bias, h_, N, hidden);
-      linear(enc, h_, L.fc1, L.fc1_bias, f_, N, inter, hidden, false);
-      [enc setBuffer:f_ offset:0 atIndex:0];
-      elementwise(enc, "gelu_inplace", N * inter, 1);
-      linear(enc, f_, L.fc2, L.fc2_bias, x_, N, hidden, inter, true);
-      const auto deep = std::find(c.deepstack.begin(), c.deepstack.end(), static_cast<int>(&L - layers_.data()));
+      norm(enc, x_, L.norm2_weight, L.norm2_bias, h_, N, hidden);
+      if (c.qwen2_5) {  // x += down(silu(gate(h)) * up(h))
+        linear(enc, h_, L.gate, L.gate_bias, f_, N, inter, hidden, false);
+        linear(enc, h_, L.up, L.up_bias, up_, N, inter, hidden, false);
+        [enc setComputePipelineState:pipeline("glu_mul")];
+        [enc setBuffer:f_ offset:0 atIndex:0];
+        [enc setBuffer:up_ offset:0 atIndex:1];
+        bytes(enc, GluMulParams{N * inter, 1}, 2);
+        [enc dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(N) * static_cast<NSUInteger>(inter), 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        linear(enc, f_, L.down, L.down_bias, x_, N, hidden, inter, true);
+      } else {
+        linear(enc, h_, L.fc1, L.fc1_bias, f_, N, inter, hidden, false);
+        [enc setBuffer:f_ offset:0 atIndex:0];
+        elementwise(enc, "gelu_inplace", N * inter, 1);
+        linear(enc, f_, L.fc2, L.fc2_bias, x_, N, hidden, inter, true);
+      }
+      const auto deep = std::find(c.deepstack.begin(), c.deepstack.end(), block);
       if (deep != c.deepstack.end()) {
         const size_t which = static_cast<size_t>(deep - c.deepstack.begin());
         merge(enc, deepstack_[which], false, deepstack_features_[which], N);
@@ -704,7 +786,7 @@ class Qwen35VisionMetal final : public Qwen35VisionEncoder, private MetalKit {
   void merge(id<MTLComputeCommandEncoder> enc, const Merger& m, bool per_patch, id<MTLBuffer> out, int N) {
     const Qwen35VisionConfig& c = config();
     const int square = c.merge * c.merge, tokens = N / square, merged = c.hidden_size * square;
-    layer_norm(enc, x_, m.norm_weight, m.norm_bias, h_, per_patch ? N : tokens, per_patch ? c.hidden_size : merged);
+    norm(enc, x_, m.norm_weight, m.norm_bias, h_, per_patch ? N : tokens, per_patch ? c.hidden_size : merged);
     linear(enc, h_, m.fc1, m.fc1_bias, merged_, tokens, merged, merged, false);
     [enc setBuffer:merged_ offset:0 atIndex:0];
     elementwise(enc, "gelu_erf_inplace", tokens * merged, 1);
@@ -722,6 +804,7 @@ class Qwen35VisionMetal final : public Qwen35VisionEncoder, private MetalKit {
   // rows and the features (shared, read back).
   id<MTLBuffer> patches_ = nil, x_ = nil, cos_ = nil, sin_ = nil;
   id<MTLBuffer> h_ = nil, qkv_ = nil, attn_ = nil, f_ = nil, scores_ = nil, merged_ = nil, features_ = nil;
+  id<MTLBuffer> up_ = nil, window_ = nil;  // Qwen2.5-VL: the MLP's up rows, each slot's window bounds
 };
 
 }  // namespace
@@ -754,7 +837,8 @@ std::unique_ptr<VisionEncoder> make_gemma4_vision_metal(std::shared_ptr<const Ge
 }
 
 bool metal_qwen3_5_vision_supports(const Qwen35VisionWeights& weights) {
-  if (weights.config.qwen2_5) return false;  // window attention: CPU only so far
+  const Qwen35VisionConfig& c = weights.config;
+  if (c.qwen2_5 && c.window * c.window * c.merge * c.merge > kMaxWindowKeys) return false;
   std::vector<const Qwen35VisionWeights::Merger*> mergers = {&weights.merger};
   for (const Qwen35VisionWeights::Merger& m : weights.deepstack) mergers.push_back(&m);
   for (const Qwen35VisionWeights::Merger* m : mergers) {
@@ -763,8 +847,8 @@ bool metal_qwen3_5_vision_supports(const Qwen35VisionWeights& weights) {
     }
   }
   for (const Qwen35VisionWeights::Layer& L : weights.layers) {
-    for (const Linear* l : {&L.qkv, &L.proj, &L.fc1, &L.fc2}) {
-      if (l->quant.quantized() || mm_variant(l->dense_dtype) == nullptr) return false;
+    for (const Linear* l : {&L.qkv, &L.proj, &L.fc1, &L.fc2, &L.gate, &L.up, &L.down}) {
+      if (l->cols > 0 && (l->quant.quantized() || mm_variant(l->dense_dtype) == nullptr)) return false;
     }
   }
   return true;

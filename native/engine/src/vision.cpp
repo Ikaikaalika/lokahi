@@ -90,8 +90,6 @@ std::unique_ptr<VisionEncoder> VisionEncoder::load(const std::string& directory,
   }
   if (is_qwen3_5_vision(config)) {
     auto weights = Qwen35VisionWeights::load(directory, config);
-    // Qwen2.5-VL's window attention runs on the CPU for every decoder backend.
-    if (weights->config.qwen2_5) return make_qwen3_5_vision_cpu(std::move(weights), threads);
 #if defined(LOKAHI_WITH_METAL)
     if (backend == "auto") backend = metal_qwen3_5_vision_supports(*weights) && metal_available() ? "metal" : "cpu";
     if (backend == "metal") return make_qwen3_5_vision_metal(std::move(weights));
