@@ -102,6 +102,14 @@ class Qwen35VisionEncoder : public VisionEncoder {
   std::vector<float> patches(const Image& image) const;
   // Patch i's (row, column) in merge-block order.
   std::pair<int, int> patch_position(int index, int cols) const;
+  // Adds patch `index`'s position embedding, the table bilinearly
+  // interpolated to a rows x cols patch grid (linspace sample points), to x.
+  void add_position(float* x, int index, int rows, int cols) const;
+  // The 2-D RoPE tables [rows * cols, head_dim / 2] in merge-block order:
+  // head_dim / 4 frequencies over a head_dim / 2 rotary dimension; channel
+  // i < head_dim / 4 turns by the patch row, the next head_dim / 4 by its
+  // column, and channel i + head_dim / 2 is i's rotate-half partner.
+  void rope_tables(int rows, int cols, float* cos_table, float* sin_table) const;
 
   std::shared_ptr<const Qwen35VisionWeights> weights_;
 };

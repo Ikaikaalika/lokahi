@@ -89,10 +89,14 @@ std::unique_ptr<VisionEncoder> VisionEncoder::load(const std::string& directory,
     return make_gemma4_vision_cpu(std::move(weights), threads);
   }
   if (is_qwen3_5_vision(config)) {
-    // The Qwen3.5 tower runs on the CPU for every decoder backend so far.
-    LK_CHECK(backend == "auto" || backend == "cpu" || backend == "metal",
-             "unknown or unavailable backend '" + backend + "'");
-    return make_qwen3_5_vision_cpu(Qwen35VisionWeights::load(directory, config), threads);
+    auto weights = Qwen35VisionWeights::load(directory, config);
+#if defined(LOKAHI_WITH_METAL)
+    if (backend == "auto") backend = metal_qwen3_5_vision_supports(*weights) && metal_available() ? "metal" : "cpu";
+    if (backend == "metal") return make_qwen3_5_vision_metal(std::move(weights));
+#endif
+    if (backend == "auto") backend = "cpu";
+    LK_CHECK(backend == "cpu", "unknown or unavailable backend '" + backend + "'");
+    return make_qwen3_5_vision_cpu(std::move(weights), threads);
   }
   LK_CHECK(is_siglip(config), "vision: unsupported vision tower '" +
                                   config.at("vision_config").string_or("model_type", "") + "'");
