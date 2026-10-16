@@ -149,12 +149,12 @@ def test_image_features_match_oracle(native_cli, vlm, backend, tmp_path):
     out = tmp_path / "features.bin"
     report = _run(native_cli, "image-features", "--model", str(directory), "--backend", backend,
                   "--images", files, "--out", str(out))
-    # The tower runs on the CPU for every decoder backend so far.
     tokens = [rows * cols for rows, cols in GRIDS]
-    assert report == {"backend": "cpu", "tokens": tokens, "width": oracle.language.config.hidden_size}
+    assert report == {"backend": backend, "tokens": tokens, "width": oracle.language.config.hidden_size}
     got = np.fromfile(out, dtype=np.float32).reshape(sum(tokens), -1)
     expected = np.concatenate([oracle.encode(image) for image in images])
-    np.testing.assert_allclose(got, expected, atol=1e-5 * np.abs(expected).max(), rtol=0)
+    tolerance = 1e-5 if backend == "cpu" else 1e-3
+    np.testing.assert_allclose(got, expected, atol=tolerance * np.abs(expected).max(), rtol=0)
 
 
 # Chunks of 3 split both images: the images attend causally, so a pass may

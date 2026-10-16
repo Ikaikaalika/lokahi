@@ -249,29 +249,7 @@ std::vector<float> Qwen35VisionEncoder::patches(const Image& image) const {
   return out;
 }
 
-namespace {
-
-class Qwen35VisionCpu final : public Qwen35VisionEncoder {
- public:
-  Qwen35VisionCpu(std::shared_ptr<const Qwen35VisionWeights> weights, unsigned threads)
-      : Qwen35VisionEncoder(std::move(weights)), pool_(threads) {
-    const Qwen35VisionConfig& c = config();
-    patch_ = dense_view("patch_embed", weights_->patch_weight, c.hidden_size, int64_t{3} * c.patch_size * c.patch_size);
-  }
-
-  const char* backend() const override { return "cpu"; }
-  std::vector<float> encode(const Image& image) override;
-
- private:
-  // The position table bilinearly interpolated to a rows x cols patch grid
-  // (linspace sample points), row `index` in merge-block order, added to x.
-  void add_positions(float* x, int index, int rows, int cols) const;
-
-  ThreadPool pool_;
-  Linear patch_;
-};
-
-void Qwen35VisionCpu::add_positions(float* x, int index, int rows, int cols) const {
+void Qwen35VisionEncoder::add_position(float* x, int index, int rows, int cols) const {
   const Qwen35VisionConfig& c = config();
   const int side = c.position_side;
   const int64_t hidden = c.hidden_size;
@@ -292,6 +270,38 @@ void Qwen35VisionCpu::add_positions(float* x, int index, int rows, int cols) con
   }
 }
 
+void Qwen35VisionEncoder::rope_tables(int rows, int cols, float* cos_table, float* sin_table) const {
+  const int64_t D = config().head_dim(), quarter = D / 4, half = D / 2;
+  std::vector<double> inv_freq(static_cast<size_t>(quarter));
+  for (int64_t i = 0; i < quarter; ++i) inv_freq[static_cast<size_t>(i)] = 1.0 / std::pow(10000.0, 2.0 * i / half);
+  for (int64_t t = 0; t < int64_t{rows} * cols; ++t) {
+    const auto [pr, pc] = patch_position(static_cast<int>(t), cols);
+    for (int64_t i = 0; i < half; ++i) {
+      const double angle = (i < quarter ? pr : pc) * inv_freq[static_cast<size_t>(i % quarter)];
+      cos_table[t * half + i] = static_cast<float>(std::cos(angle));
+      sin_table[t * half + i] = static_cast<float>(std::sin(angle));
+    }
+  }
+}
+
+namespace {
+
+class Qwen35VisionCpu final : public Qwen35VisionEncoder {
+ public:
+  Qwen35VisionCpu(std::shared_ptr<const Qwen35VisionWeights> weights, unsigned threads)
+      : Qwen35VisionEncoder(std::move(weights)), pool_(threads) {
+    const Qwen35VisionConfig& c = config();
+    patch_ = dense_view("patch_embed", weights_->patch_weight, c.hidden_size, int64_t{3} * c.patch_size * c.patch_size);
+  }
+
+  const char* backend() const override { return "cpu"; }
+  std::vector<float> encode(const Image& image) override;
+
+ private:
+  ThreadPool pool_;
+  Linear patch_;
+};
+
 std::vector<float> Qwen35VisionCpu::encode(const Image& image) {
   const Qwen35VisionConfig& c = config();
   const Qwen35VisionWeights& w = *weights_;
@@ -306,23 +316,11 @@ std::vector<float> Qwen35VisionCpu::encode(const Image& image) {
       f(sn * inter);
   matmul(patch_, patch_rows.data(), N, x.data(), pool_);
   add_rows(x.data(), w.patch_bias, N);
-  for (int64_t t = 0; t < N; ++t) add_positions(x.data() + t * hidden, static_cast<int>(t), rows, cols);
+  for (int64_t t = 0; t < N; ++t) add_position(x.data() + t * hidden, static_cast<int>(t), rows, cols);
 
-  // 2-D RoPE: D / 4 frequencies over a D / 2 rotary dimension; channel i < D / 4
-  // turns by the patch row, D / 4 <= i < D / 2 by its column, and channel
-  // i + D / 2 is i's rotate-half partner.
-  const int64_t quarter = D / 4, half = D / 2;
-  std::vector<double> inv_freq(static_cast<size_t>(quarter));
-  for (int64_t i = 0; i < quarter; ++i) inv_freq[static_cast<size_t>(i)] = 1.0 / std::pow(10000.0, 2.0 * i / half);
+  const int64_t half = D / 2;
   std::vector<float> cos_table(sn * half), sin_table(sn * half);
-  for (int64_t t = 0; t < N; ++t) {
-    const auto [pr, pc] = patch_position(static_cast<int>(t), cols);
-    for (int64_t i = 0; i < half; ++i) {
-      const double angle = (i < quarter ? pr : pc) * inv_freq[static_cast<size_t>(i % quarter)];
-      cos_table[static_cast<size_t>(t * half + i)] = static_cast<float>(std::cos(angle));
-      sin_table[static_cast<size_t>(t * half + i)] = static_cast<float>(std::sin(angle));
-    }
-  }
+  rope_tables(rows, cols, cos_table.data(), sin_table.data());
   auto rope = [&](float* v, int64_t t) {
     const float* cosine = cos_table.data() + t * half;
     const float* sine = sin_table.data() + t * half;

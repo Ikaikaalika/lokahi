@@ -2087,3 +2087,59 @@ kernel void pool_standardize(const device float* in [[buffer(0)]],
   if (p.standardize != 0) v = (v - bias[c]) * mul[c];
   out[token * p.cols + c] = v;
 }
+
+// ---------------------------------------------------------------------------
+// Qwen3.5's vision tower: rotate-half 2-D RoPE over whole heads, and the
+// merger's exact GELU.
+// ---------------------------------------------------------------------------
+
+struct HalfRopeParams {
+  int heads;
+  int dim;     // head size; rotate-half over the whole head
+  int stride;  // floats from one token's heads to the next's
+};
+
+// In place on heads of `dim` floats, token t's starting at x + t * stride:
+// channels i and i + dim / 2 turn by row t, column i of the tables
+// [tokens, dim / 2] (computed on the host in double). Grid: (dim / 2, heads, tokens).
+kernel void rope_half_rows(device float* x [[buffer(0)]],
+                           const device float* cos_table [[buffer(1)]],
+                           const device float* sin_table [[buffer(2)]],
+                           constant HalfRopeParams& p [[buffer(3)]],
+                           uint3 gid [[thread_position_in_grid]]) {
+  const int i = int(gid.x);
+  const int head = int(gid.y);
+  const int t = int(gid.z);
+  const int half_dim = p.dim / 2;
+  if (i >= half_dim || head >= p.heads) return;
+  device float* v = x + t * p.stride + head * p.dim;
+  const float c = cos_table[t * half_dim + i];
+  const float s = sin_table[t * half_dim + i];
+  const float a = v[i];
+  const float b = v[i + half_dim];
+  v[i] = a * c - b * s;
+  v[i + half_dim] = b * c + a * s;
+}
+
+// erf through Numerical Recipes' Chebyshev fit of erfc (fractional error
+// below 1.2e-7); the Metal library has no erf.
+inline float erf_approx(float x) {
+  const float z = fabs(x);
+  const float t = 1.0f / (1.0f + 0.5f * z);
+  const float poly =
+      -1.26551223f +
+      t * (1.00002368f +
+           t * (0.37409196f +
+                t * (0.09678418f +
+                     t * (-0.18628806f +
+                          t * (0.27886807f +
+                               t * (-1.13520398f + t * (1.48851587f + t * (-0.82215223f + t * 0.17087277f))))))));
+  const float erfc_z = t * precise::exp(-z * z + poly);
+  return x >= 0.0f ? 1.0f - erfc_z : erfc_z - 1.0f;
+}
+
+kernel void gelu_erf_inplace(device float* x [[buffer(0)]],
+                             constant ElementwiseParams& p [[buffer(1)]],
+                             uint gid [[thread_position_in_grid]]) {
+  if (int(gid) < p.count) x[gid] = 0.5f * x[gid] * (1.0f + erf_approx(x[gid] * 0.70710678f));
+}

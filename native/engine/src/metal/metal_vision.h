@@ -4,6 +4,7 @@
 #include <memory>
 
 #include "gemma4_vision.h"
+#include "qwen3_5_vision.h"
 #include "siglip.h"
 
 namespace lokahi {
@@ -19,5 +20,11 @@ std::unique_ptr<VisionEncoder> make_siglip_metal(std::shared_ptr<const SiglipWei
 bool metal_gemma4_vision_supports(const Gemma4VisionWeights& weights);
 
 std::unique_ptr<VisionEncoder> make_gemma4_vision_metal(std::shared_ptr<const Gemma4VisionWeights> weights);
+
+// Whether the Metal Qwen3.5 encoder reads these weights: dense block and
+// merger matrices, as mlx-community's conversions keep them.
+bool metal_qwen3_5_vision_supports(const Qwen35VisionWeights& weights);
+
+std::unique_ptr<VisionEncoder> make_qwen3_5_vision_metal(std::shared_ptr<const Qwen35VisionWeights> weights);
 
 }  // namespace lokahi
