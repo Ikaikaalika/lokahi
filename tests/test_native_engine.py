@@ -257,8 +257,7 @@ def fixture_model(request, tmp_path_factory):
     return directory, LlamaFamilyReference.load(directory)
 
 
-# Architectures (text model_type) the Metal backend refuses: Gated DeltaNet.
-CPU_ONLY: tuple[str, ...] = ("qwen3_5_text", "qwen3_5_moe_text", "qwen3_next")
+CPU_ONLY: tuple[str, ...] = ()  # architectures the Metal backend refuses (none today)
 
 
 def _dense_mxfp4(config: dict) -> bool:
@@ -1005,25 +1004,37 @@ def test_qwen35_fixtures_exercise_every_feature(tmp_path):
         assert np.abs(offset.logits(TOKENS) - expected).max() > 0.01 * scale, (name, "norm offset")
 
 
-def test_qwen35_reset_clears_the_recurrent_state(native_cli, tmp_path):
+@pytest.mark.parametrize("backend", _backends())
+def test_qwen35_reset_clears_the_recurrent_state(native_cli, backend, tmp_path):
     # Each benchmark repetition resets the model: the Gated DeltaNet states and
     # conv histories must start from zero again, so every repetition matches
     # the oracle (correctness only; no timing is read).
     directory = write_tiny_qwen35(tmp_path / "model", QWEN35_VARIANTS["qwen3.5-mlx"])
     prompt = TOKENS[:6]
-    report = _run(native_cli, "bench", "--model", str(directory), "--backend", "cpu",
+    report = _run(native_cli, "bench", "--model", str(directory), "--backend", backend,
                   "--tokens", ",".join(map(str, prompt)), "--max-new", "8", "--warmups", "0", "--repetitions", "2")
     expected = Qwen35Reference.load(directory).greedy(prompt, 8)
     assert [run["token_ids"] for run in report["repetitions"]] == [expected, expected]
 
 
-def test_gated_deltanet_models_fall_back_to_the_cpu(native_cli, tmp_path):
-    directory = write_tiny_qwen35(tmp_path / "model", QWEN35_VARIANTS["qwen3.5-mlx"])
-    info = _run(native_cli, "info", "--model", str(directory), "--backend", "auto")
-    assert (info["architecture"], info["backend"]) == ("qwen3_5", "cpu")
-    if "metal" in _backends():
-        assert "the Metal backend does not implement qwen3_5 (Gated DeltaNet) yet" in _load_error(
-            native_cli, directory, "metal")
+@pytest.mark.parametrize("backend", _backends())
+@pytest.mark.parametrize("name", ["qwen3.5-mlx", "qwen3-next-mlx"])
+def test_generation_that_stops_resumes_from_the_kept_tokens(native_cli, backend, name, tmp_path):
+    # Metal keeps two decode steps in flight and discards the one launched past
+    # a stop token. A recurrent state cannot rewind, so the backend must not
+    # let that step's update stand: decoding on after the stop has to continue
+    # from the tokens generation kept.
+    directory = write_tiny_qwen35(tmp_path / "model", QWEN35_VARIANTS[name])
+    _skip_unsupported(directory, backend)
+    oracle = Qwen35Reference.load(directory)
+    prompt = TOKENS[:6]
+    expected = oracle.greedy(prompt, 12)
+    stop = next(i for i in range(2, 8) if expected[i] not in expected[:i])  # its first occurrence
+    _edit_text_config(directory, {"eos_token_id": expected[stop]})
+    report = _run(native_cli, "generate", "--model", str(directory), "--backend", backend,
+                  "--tokens", ",".join(map(str, prompt)), "--max-new", "12", "--continue", "4")
+    assert report["tokens"] == expected[: stop + 1]
+    assert report["continued"] == expected[stop + 1 : stop + 5]
 
 
 _FULL_AT_3 = ["linear_attention"] * 3 + ["full_attention", "linear_attention"]

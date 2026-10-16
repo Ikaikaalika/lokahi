@@ -1059,6 +1059,259 @@ kernel void mla_rope_store(const device float* q [[buffer(0)]],
 }
 
 // ---------------------------------------------------------------------------
+// Gated DeltaNet (Qwen3.5, Qwen3-Next). Per pass of n tokens: the input
+// projections (qmm) fill mixed [n, C] = [q | k | v] channels, z, and the raw
+// b and a [n, Hv] (Qwen3-Next's grouped projections go through gdn_split
+// first); gdn_conv runs the causal depthwise conv and SiLU over the channels;
+// gdn_qk_norm L2-normalizes q and k per key head; gdn_gates turns b into beta
+// and a into the decay exp(g); gdn_recurrence runs every value head's state
+// over the pass; gated_rms_norm_rows applies rms(o) * w * silu(z) per value
+// head before out_proj. The conv history [taps - 1, C] and the states
+// [Hv, dv, dk] are double-buffered by position parity: a pass at start reads
+// buffer start % 2 and writes buffer (start + n) % 2, so a decode step
+// launched past a stop token, and then discarded, never overwrites the state
+// the next step reads. Each thread (or simdgroup) owns its slice of the
+// state, so a pass whose two buffers coincide updates it in place safely.
+// ---------------------------------------------------------------------------
+
+struct GdnSplitParams {
+  int key_heads;    // Hk
+  int key_dim;      // dk
+  int ratio;        // value heads per key head
+  int value_dim;    // dv
+  int n;
+};
+
+// Qwen3-Next: each key head's [q, k, v, z] rows of in_proj_qkvz and [b, a]
+// rows of in_proj_ba into the [q | k | v] channels, z, b and a. Grid:
+// (Hk * (2 dk + 2 r dv + 2 r), n).
+kernel void gdn_split(const device float* qkvz [[buffer(0)]],
+                      const device float* ba [[buffer(1)]],
+                      device float* mixed [[buffer(2)]],
+                      device float* z [[buffer(3)]],
+                      device float* b [[buffer(4)]],
+                      device float* a [[buffer(5)]],
+                      constant GdnSplitParams& p [[buffer(6)]],
+                      uint2 gid [[thread_position_in_grid]]) {
+  const int dk = p.key_dim, r = p.ratio, dv = p.value_dim, hk = p.key_heads;
+  const int group = 2 * dk + 2 * r * dv, per_head = group + 2 * r;
+  const int kh = int(gid.x) / per_head, j = int(gid.x) % per_head, t = int(gid.y);
+  if (kh >= hk || t >= p.n) return;
+  const int channels = 2 * hk * dk + hk * r * dv, values = hk * r * dv, hv = hk * r;
+  if (j >= group) {  // [b, a]
+    const int i = j - group;
+    const float value = ba[(t * hk + kh) * 2 * r + i];
+    if (i < r) b[t * hv + kh * r + i] = value;
+    else a[t * hv + kh * r + i - r] = value;
+    return;
+  }
+  const float value = qkvz[(t * hk + kh) * group + j];
+  device float* row = mixed + t * channels;
+  if (j < dk) row[kh * dk + j] = value;
+  else if (j < 2 * dk) row[(hk + kh) * dk + j - dk] = value;
+  else if (j < 2 * dk + r * dv) row[2 * hk * dk + kh * r * dv + j - 2 * dk] = value;
+  else z[t * values + kh * r * dv + j - 2 * dk - r * dv] = value;
+}
+
+constant constexpr int GDN_MAX_TAPS = 8;
+
+struct GdnConvParams {
+  int channels;
+  int taps;
+  int n;
+};
+
+// mixed[t, c] = silu(sum_k taps[c, k] * input[t - (K - 1) + k, c]), in place,
+// with the inputs before the pass from history_in; history_out gets the
+// pass's last K - 1 inputs. One thread per channel.
+kernel void gdn_conv(device float* mixed [[buffer(0)]],
+                     const device float* taps [[buffer(1)]],
+                     const device float* history_in [[buffer(2)]],
+                     device float* history_out [[buffer(3)]],
+                     constant GdnConvParams& p [[buffer(4)]],
+                     uint gid [[thread_position_in_grid]]) {
+  const int c = int(gid), C = p.channels, K = p.taps;
+  if (c >= C) return;
+  float window[GDN_MAX_TAPS];  // the previous K - 1 inputs, oldest first
+  float w[GDN_MAX_TAPS];
+  for (int k = 0; k < K; ++k) w[k] = taps[c * K + k];
+  for (int k = 0; k < K - 1; ++k) window[k] = history_in[k * C + c];
+  for (int t = 0; t < p.n; ++t) {
+    const float x = mixed[t * C + c];
+    float sum = w[K - 1] * x;
+    for (int k = 0; k < K - 1; ++k) sum += w[k] * window[k];
+    for (int k = 0; k + 1 < K - 1; ++k) window[k] = window[k + 1];
+    if (K > 1) window[K - 2] = x;
+    mixed[t * C + c] = silu(sum);
+  }
+  for (int k = 0; k < K - 1; ++k) history_out[k * C + c] = window[k];
+}
+
+struct GdnNormParams {
+  int key_heads;
+  int key_dim;
+  int channels;
+  float q_scale;
+};
+
+// q and k L2-normalized per key head, x * rsqrt(sum(x^2) + 1e-6), q also
+// times q_scale (dk^-0.5). Grid: threadgroups (2 Hk, n) of dk threads.
+kernel void gdn_qk_norm(device float* mixed [[buffer(0)]],
+                        constant GdnNormParams& p [[buffer(1)]],
+                        uint2 tgp [[threadgroup_position_in_grid]],
+                        uint2 tid2 [[thread_position_in_threadgroup]],
+                        uint2 tpg2 [[threads_per_threadgroup]],
+                        uint sg [[simdgroup_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float scratch[32];
+  const int head = int(tgp.x), t = int(tgp.y), i = int(tid2.x);
+  device float* x = mixed + t * p.channels + head * p.key_dim;
+  const float v = x[i];
+  const float total = threadgroup_sum(v * v, scratch, sg, lane, (tpg2.x + 31) / 32);
+  const float scale = head < p.key_heads ? p.q_scale : 1.0f;
+  x[i] = v * precise::rsqrt(total + 1e-6f) * scale;
+}
+
+struct GdnGateParams {
+  int value_heads;
+  int count;  // n * Hv
+};
+
+// beta = sigmoid(b) and decay = exp(-A * softplus(a + dt_bias)), A = exp(A_log), in place.
+kernel void gdn_gates(device float* b [[buffer(0)]],
+                      device float* a [[buffer(1)]],
+                      const device float* decay_rate [[buffer(2)]],
+                      const device float* dt_bias [[buffer(3)]],
+                      constant GdnGateParams& p [[buffer(4)]],
+                      uint gid [[thread_position_in_grid]]) {
+  if (int(gid) >= p.count) return;
+  const int h = int(gid) % p.value_heads;
+  b[gid] = 1.0f / (1.0f + precise::exp(-b[gid]));
+  const float x = a[gid] + dt_bias[h];
+  const float softplus = x > 0.0f ? x + precise::log(1.0f + precise::exp(-x)) : precise::log(1.0f + precise::exp(x));
+  a[gid] = precise::exp(-decay_rate[h] * softplus);
+}
+
+constant constexpr int GDN_MAX_ROWS = 8;  // dk up to 256: dk / 32 state values per lane
+constant constexpr int GDN_SIMDGROUPS = 4;
+
+struct GdnRecurrenceParams {
+  int key_heads;
+  int value_heads;
+  int key_dim;
+  int value_dim;
+  int channels;
+  int n;
+};
+
+// One simdgroup per (value head h, value column j): its lanes hold column j
+// of S (rows lane, lane + 32, ...), which per token decays by exp(g), takes
+// k * (beta * (v_j - S_j . k)) and gives out[t, h, j] = S_j . q. The state is
+// stored [Hv, dv, dk], so each column's rows are contiguous. Grid:
+// threadgroups (ceil(dv / 4), Hv) of 4 simdgroups.
+kernel void gdn_recurrence(const device float* mixed [[buffer(0)]],
+                           const device float* beta [[buffer(1)]],
+                           const device float* decay [[buffer(2)]],
+                           const device float* state_in [[buffer(3)]],
+                           device float* state_out [[buffer(4)]],
+                           device float* out [[buffer(5)]],
+                           constant GdnRecurrenceParams& p [[buffer(6)]],
+                           uint2 tgp [[threadgroup_position_in_grid]],
+                           uint sg [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+  const int j = int(tgp.x) * GDN_SIMDGROUPS + int(sg), h = int(tgp.y);
+  if (j >= p.value_dim) return;  // uniform across the simdgroup
+  const int dk = p.key_dim, hv = p.value_heads;
+  const int kh = h / (hv / p.key_heads);
+  const int rows = (dk - int(lane) + 31) / 32;  // this lane's rows: lane, lane + 32, ...
+  const size_t column = (size_t(h) * p.value_dim + j) * dk;
+  float s[GDN_MAX_ROWS];
+  for (int r = 0; r < rows; ++r) s[r] = state_in[column + lane + 32 * r];
+  for (int t = 0; t < p.n; ++t) {
+    const device float* row = mixed + t * p.channels;
+    const device float* q = row + kh * dk;
+    const device float* k = row + (p.key_heads + kh) * dk;
+    const float v = row[2 * p.key_heads * dk + h * p.value_dim + j];
+    const float g = decay[t * hv + h], bt = beta[t * hv + h];
+    float memory = 0.0f;
+    for (int r = 0; r < rows; ++r) {
+      s[r] *= g;
+      memory += s[r] * k[lane + 32 * r];
+    }
+    const float delta = (v - simd_sum(memory)) * bt;
+    float read = 0.0f;
+    for (int r = 0; r < rows; ++r) {
+      s[r] += k[lane + 32 * r] * delta;
+      read += s[r] * q[lane + 32 * r];
+    }
+    read = simd_sum(read);
+    if (lane == 0) out[(t * hv + h) * p.value_dim + j] = read;
+  }
+  for (int r = 0; r < rows; ++r) state_out[column + lane + 32 * r] = s[r];
+}
+
+// Gated DeltaNet's output norm: out = rms(o) * w * silu(z) per row of
+// p.cols (one value head), with a plain weight. One threadgroup per row.
+kernel void gated_rms_norm_rows(device float* o [[buffer(0)]],
+                                const device float* weight [[buffer(1)]],
+                                const device float* z [[buffer(2)]],
+                                constant NormParams& p [[buffer(3)]],
+                                uint row [[threadgroup_position_in_grid]],
+                                uint tid [[thread_position_in_threadgroup]],
+                                uint tpg [[threads_per_threadgroup]],
+                                uint sg [[simdgroup_index_in_threadgroup]],
+                                uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float scratch[32];
+  device float* x = o + row * p.cols;
+  const device float* gate = z + row * p.cols;
+  float ss = 0.0f;
+  for (int i = int(tid); i < p.cols; i += int(tpg)) ss += x[i] * x[i];
+  const float total = threadgroup_sum(ss, scratch, sg, lane, (tpg + 31) / 32);
+  const float inv = precise::rsqrt(total / float(p.cols) + p.eps);
+  for (int i = int(tid); i < p.cols; i += int(tpg)) x[i] = x[i] * inv * weight[i] * silu(gate[i]);
+}
+
+// Zeroes Gated DeltaNet's conv histories and states, on load and reset.
+kernel void zero_floats(device float* x [[buffer(0)]],
+                        constant ElementwiseParams& p [[buffer(1)]],
+                        uint gid [[thread_position_in_grid]]) {
+  if (int(gid) < p.count) x[gid] = 0.0f;
+}
+
+struct SplitGateParams {
+  int head_dim;
+  int count;  // n * heads * head_dim
+};
+
+// Qwen3.5's gated attention: q_proj's [query | gate] rows per head into q and
+// gate, both [n, heads, head_dim].
+kernel void split_query_gate(const device float* both [[buffer(0)]],
+                             device float* q [[buffer(1)]],
+                             device float* gate [[buffer(2)]],
+                             constant SplitGateParams& p [[buffer(3)]],
+                             uint gid [[thread_position_in_grid]]) {
+  if (int(gid) >= p.count) return;
+  const int head = int(gid) / p.head_dim, d = int(gid) % p.head_dim;
+  q[gid] = both[(2 * head) * p.head_dim + d];
+  gate[gid] = both[(2 * head + 1) * p.head_dim + d];
+}
+
+struct SigmoidScaleParams {
+  int cols;   // values per scale
+  int count;  // n * rows * cols
+};
+
+// x[i] *= sigmoid(scales[i / cols]): the gated attention's output (cols 1)
+// and the shared expert's gate (one scale per token, cols hidden).
+kernel void mul_sigmoid(device float* x [[buffer(0)]],
+                        const device float* scales [[buffer(1)]],
+                        constant SigmoidScaleParams& p [[buffer(2)]],
+                        uint gid [[thread_position_in_grid]]) {
+  if (int(gid) >= p.count) return;
+  x[gid] *= 1.0f / (1.0f + precise::exp(-scales[int(gid) / p.cols]));
+}
+
+// ---------------------------------------------------------------------------
 // Gemma 4's per-layer inputs. per_layer_combine turns the pass's projection
 // of the scaled embedding and its per-layer embedding lookup (already times
 // sqrt(P)) into out[t, l, :] = (norm(proj * proj_scale) * w + lookup) *
