@@ -31,10 +31,10 @@ from .qwen35_vision_tiny import TinyQwen35VisionSpec, write_tower
 # A low RoPE base, so each M-RoPE axis moves the logits well beyond the
 # tolerances, and an untied head, so greedy continuations vary.
 VL_TEXT = TinyDenseSpec(model_type="qwen3", vocab_size=512, hidden_size=128, intermediate_size=256,
-                        num_hidden_layers=3, num_attention_heads=4, num_key_value_heads=2, head_dim=32,
+                        num_hidden_layers=3, num_attention_heads=4, num_key_value_heads=2, head_dim=64,
                         rope_theta=100.0, tie_word_embeddings=False, seed=0)
 VL_MOE_TEXT = TinyDenseSpec(model_type="qwen3_moe", vocab_size=512, hidden_size=128, intermediate_size=256,
-                            num_hidden_layers=3, num_attention_heads=4, num_key_value_heads=2, head_dim=32,
+                            num_hidden_layers=3, num_attention_heads=4, num_key_value_heads=2, head_dim=64,
                             rope_theta=100.0, num_experts=8, num_experts_per_tok=2, moe_intermediate_size=64,
                             tie_word_embeddings=False, seed=1)
 
@@ -47,7 +47,9 @@ class TinyQwen3VLSpec:
     # after tower blocks 0 and 2 go to the text model's layers 0 and 1.
     tower: TinyQwen35VisionSpec = field(default_factory=lambda: TinyQwen35VisionSpec(depth=3, seed=310))
     deepstack_visual_indexes: tuple[int, ...] = (0, 2)
-    mrope_section: tuple[int, ...] = (6, 5, 5)  # head_dim 32: 16 frequencies, 5 on rows and 5 on columns
+    # head_dim 64 (the smallest the Metal decoder takes): 32 frequencies, 10
+    # on rows and 10 on columns, as Qwen3-VL-2B's [24, 20, 20] is for 64.
+    mrope_section: tuple[int, ...] = (12, 10, 10)
 
     @property
     def model_type(self) -> str:
