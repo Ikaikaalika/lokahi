@@ -836,6 +836,49 @@ static const char* kQwen35_35BA3BConfig = R"({
   "vision_end_token_id": 248054, "vision_start_token_id": 248053
 })";
 
+// Qwen/Qwen3.8-27B's config, as published (Transformers 5's layout, as
+// lmstudio-community's and mlx-community's MLX conversions keep it).
+static const char* kQwen38_27BConfig = R"({
+  "architectures": ["Qwen3_5ForConditionalGeneration"], "image_token_id": 248056, "language_model_only": false,
+  "model_type": "qwen3_5",
+  "text_config": {
+    "attention_bias": false, "attention_dropout": 0.0, "attn_output_gate": true, "bos_token_id": 248044,
+    "dtype": "bfloat16", "eos_token_id": 248044, "full_attention_interval": 4, "head_dim": 256,
+    "hidden_act": "silu", "hidden_size": 5120, "initializer_range": 0.02, "intermediate_size": 17408,
+    "layer_types": [
+      "linear_attention", "linear_attention", "linear_attention", "full_attention",
+      "linear_attention", "linear_attention", "linear_attention", "full_attention",
+      "linear_attention", "linear_attention", "linear_attention", "full_attention",
+      "linear_attention", "linear_attention", "linear_attention", "full_attention",
+      "linear_attention", "linear_attention", "linear_attention", "full_attention",
+      "linear_attention", "linear_attention", "linear_attention", "full_attention",
+      "linear_attention", "linear_attention", "linear_attention", "full_attention",
+      "linear_attention", "linear_attention", "linear_attention", "full_attention",
+      "linear_attention", "linear_attention", "linear_attention", "full_attention",
+      "linear_attention", "linear_attention", "linear_attention", "full_attention",
+      "linear_attention", "linear_attention", "linear_attention", "full_attention",
+      "linear_attention", "linear_attention", "linear_attention", "full_attention",
+      "linear_attention", "linear_attention", "linear_attention", "full_attention",
+      "linear_attention", "linear_attention", "linear_attention", "full_attention",
+      "linear_attention", "linear_attention", "linear_attention", "full_attention",
+      "linear_attention", "linear_attention", "linear_attention", "full_attention"],
+    "linear_conv_kernel_dim": 4, "linear_key_head_dim": 128, "linear_num_key_heads": 16,
+    "linear_num_value_heads": 48, "linear_value_head_dim": 128, "mamba_ssm_dtype": "float32",
+    "max_position_embeddings": 262144, "model_type": "qwen3_5_text", "mtp_num_hidden_layers": 1,
+    "mtp_use_dedicated_embeddings": false, "num_attention_heads": 24, "num_hidden_layers": 64,
+    "num_key_value_heads": 4, "output_gate_type": "swish", "pad_token_id": null, "partial_rotary_factor": 0.25,
+    "rms_norm_eps": 1e-06,
+    "rope_parameters": {"mrope_interleaved": true, "mrope_section": [11, 11, 10], "partial_rotary_factor": 0.25,
+                        "rope_theta": 10000000, "rope_type": "default"},
+    "tie_word_embeddings": false, "use_cache": true, "vocab_size": 248320},
+  "tie_word_embeddings": false, "transformers_version": "5.8.0.dev0", "video_token_id": 248057,
+  "vision_config": {"deepstack_visual_indexes": [], "depth": 27, "hidden_act": "gelu_pytorch_tanh",
+                    "hidden_size": 1152, "in_channels": 3, "initializer_range": 0.02, "intermediate_size": 4304,
+                    "model_type": "qwen3_5", "num_heads": 16, "num_position_embeddings": 2304,
+                    "out_hidden_size": 5120, "patch_size": 16, "spatial_merge_size": 2, "temporal_patch_size": 2},
+  "vision_end_token_id": 248054, "vision_start_token_id": 248053
+})";
+
 // Qwen/Qwen3-Next-80B-A3B-Instruct's config, as published.
 static const char* kQwen3Next80BConfig = R"({
   "architectures": ["Qwen3NextForCausalLM"], "attention_dropout": 0.0, "bos_token_id": 151643,
@@ -882,6 +925,23 @@ void test_qwen3_5_configs() {
   EXPECT(moe.is_moe(0) && moe.is_moe(3) && moe.is_moe(39) && linear_every_fourth(moe) && rope_64_of_256(moe));
   EXPECT(moe.eos_token_ids == std::vector<int32_t>({248046, 248044}));
 
+  // Qwen3.8-27B is a Qwen3.5 model: 16 groups of three Gated DeltaNet layers
+  // and one gated full-attention layer, 48 value heads over 16 key heads.
+  const DecoderConfig q38 = DecoderConfig::from_json(Json::parse(kQwen38_27BConfig));
+  EXPECT(q38.architecture == "qwen3_5" && q38.num_layers == 64 && q38.hidden_size == 5120);
+  EXPECT(q38.num_heads == 24 && q38.num_kv_heads == 4 && q38.head_dim == 256 && q38.qk_norm);
+  EXPECT(q38.attn_output_gate && q38.intermediate_size == 17408 && q38.num_experts == 0);
+  EXPECT(q38.linear_k_heads == 16 && q38.linear_v_heads == 48 && q38.linear_k_dim == 128);
+  EXPECT(q38.linear_v_dim == 128 && q38.linear_channels() == 10240 && q38.vocab_size == 248320);
+  EXPECT(linear_every_fourth(q38) && rope_64_of_256(q38) && q38.eos_token_ids == std::vector<int32_t>({248044}));
+  // output_gate_type names the Gated DeltaNet norm's gate: SiLU ("swish"),
+  // as in Qwen3.5. Another activation fails closed.
+  std::string silu_gate = kQwen38_27BConfig, sigmoid_gate = kQwen38_27BConfig;
+  silu_gate.replace(silu_gate.find("\"swish\""), 7, "\"silu\"");
+  sigmoid_gate.replace(sigmoid_gate.find("\"swish\""), 7, "\"sigmoid\"");
+  EXPECT(DecoderConfig::from_json(Json::parse(silu_gate)).linear_channels() == 10240);
+  EXPECT(throws([&] { DecoderConfig::from_json(Json::parse(sigmoid_gate)); }));
+
   const DecoderConfig next = DecoderConfig::from_json(Json::parse(kQwen3Next80BConfig));
   EXPECT(next.architecture == "qwen3_next" && next.num_layers == 48 && next.intermediate_size == 5120);
   EXPECT(next.num_experts == 512 && next.experts_per_token == 10 && next.norm_topk_prob && next.shared_expert_gate);
@@ -898,7 +958,7 @@ void test_qwen3_5_configs() {
     }
     return true;
   };
-  EXPECT(interleaved(small) && interleaved(moe) && next.rope_axes.empty());
+  EXPECT(interleaved(small) && interleaved(moe) && interleaved(q38) && next.rope_axes.empty());
   // Without mrope_section, Transformers and MLX-VLM use [11, 11, 10].
   std::string unsectioned = kQwen35_08BConfig;
   const std::string section = "\"mrope_section\": [11, 11, 10], ";
@@ -1216,6 +1276,18 @@ void test_qwen3_5_vision_config() {
   const Qwen35VisionConfig old = Qwen35VisionConfig::from_json(config, &legacy);
   EXPECT(old.min_pixels == 3136 && old.max_pixels == 12845056 && std::fabs(old.mean[0] - 0.48145466f) < 1e-7f);
   EXPECT(throws([&] { Qwen35VisionConfig::from_json(config, nullptr); }));
+
+  // Qwen/Qwen3.8-27B's tower: 27 blocks 1152 wide (16 heads of 72), without
+  // deepstack, and its preprocessor_config.json.
+  const Json q38_processor = Json::parse(R"({"size": {"longest_edge": 16777216, "shortest_edge": 65536},
+    "patch_size": 16, "temporal_patch_size": 2, "merge_size": 2, "image_mean": [0.5, 0.5, 0.5],
+    "image_std": [0.5, 0.5, 0.5], "processor_class": "Qwen3VLProcessor",
+    "image_processor_type": "Qwen2VLImageProcessorFast"})");
+  const Qwen35VisionConfig q38 = Qwen35VisionConfig::from_json(Json::parse(kQwen38_27BConfig), &q38_processor);
+  EXPECT(q38.tower == Qwen35VisionConfig::Tower::Qwen3_5 && q38.depth == 27 && q38.hidden_size == 1152);
+  EXPECT(q38.intermediate_size == 4304 && q38.num_heads == 16 && q38.head_dim() == 72);
+  EXPECT(q38.position_side == 48 && q38.factor() == 32 && q38.text_hidden_size == 5120);
+  EXPECT(q38.deepstack.empty() && q38.min_pixels == 65536 && q38.max_pixels == 16777216);
 }
 
 int main() {

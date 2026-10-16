@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <fstream>
 #include <functional>
 #include <limits>
 #include <utility>
@@ -643,6 +644,12 @@ DecoderConfig qwen3_5_config(const Json& raw) {
   LK_CHECK(gate == nullptr || (gate->is_bool() && gate->as_bool()), arch + ": attn_output_gate false is not supported");
   const std::string activation = cfg.string_or("hidden_act", "silu");
   LK_CHECK(activation == "silu", arch + ": unsupported activation " + activation);
+  // Qwen3.8 names the activation of the Gated DeltaNet output norm's gate,
+  // which Transformers fixes at SiLU ("swish" in its ACT2FN) and MLX-LM
+  // ignores; another value would mean another model.
+  const std::string norm_gate = cfg.string_or("output_gate_type", "silu");
+  LK_CHECK(norm_gate == "silu" || norm_gate == "swish",
+           arch + ": output_gate_type '" + norm_gate + "' is not supported");
   LK_CHECK(!flag(cfg, "attention_bias"), arch + ": attention_bias is not supported");
   LK_CHECK(!flag(cfg, "use_sliding_window"), arch + ": use_sliding_window is not supported");
 
@@ -1102,6 +1109,14 @@ std::shared_ptr<DecoderWeights> DecoderWeights::load(const std::string& director
   w->raw_config = Json::parse(read_text_file(directory + "/config.json"));
   DecoderConfig& c = w->config;
   c = DecoderConfig::from_json(w->raw_config);
+  // Transformers and MLX-LM stop at generation_config.json's eos_token_id
+  // when it gives one; Qwen's checkpoints list <|im_end|> only there.
+  const std::string generation_path = directory + "/generation_config.json";
+  if (std::ifstream(generation_path, std::ios::binary).good()) {
+    const Json generation = Json::parse(read_text_file(generation_path));
+    LK_CHECK(generation.is_object(), "generation_config.json must be an object");
+    if (std::vector<int32_t> ids = eos_ids(generation, generation); !ids.empty()) c.eos_token_ids = std::move(ids);
+  }
   // FP8 block-quantized originals (DeepSeek V3, Kimi K2) store tensors the
   // engine does not read; MLX-LM converts them.
   if (const Json* hf = w->raw_config.find("quantization_config"); hf != nullptr && hf->is_object()) {
