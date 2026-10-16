@@ -432,6 +432,82 @@ def test_unknown_kv_cache_type_fails_closed(native_cli, tmp_path):
     assert "kv_cache must be auto, f16 or f32, not 'bf16'" in _load_error(native_cli, directory, "cpu", "bf16")
 
 
+def _speculative_run(native_cli, directory, backend, prompt, reference, *extra):
+    if reference is not None:
+        (directory / "reference.txt").write_text(",".join(map(str, reference)))
+        extra = ("--draft-reference", str(directory / "reference.txt"), *extra)
+    return _run(native_cli, "generate", "--model", str(directory), "--backend", backend,
+                "--tokens", ",".join(map(str, prompt)), "--speculate", "4", *extra)
+
+
+@pytest.mark.parametrize("backend", _backends())
+def test_speculative_generation_matches_plain_greedy(native_cli, fixture_model, backend):
+    # Drafts from a reference that is the greedy continuation with two tokens
+    # changed: the model takes the drafts it agrees with, rejects the rest,
+    # and rolls its keys, values and recurrent states back; the output is
+    # plain greedy decoding's either way.
+    directory, _ = fixture_model
+    _skip_unsupported(directory, backend)
+    prompt = TOKENS[:6]
+    args = ("--max-new", "16", "--no-eos-stop")
+    plain = _run(native_cli, "generate", "--model", str(directory), "--backend", backend,
+                 "--tokens", ",".join(map(str, prompt)), *args)["tokens"]
+    reference = list(prompt + plain)
+    for at in (len(prompt) + 3, len(prompt) + 9):
+        reference[at] = (reference[at] + 1) % 64
+    report = _speculative_run(native_cli, directory, backend, prompt, reference, *args)
+    assert report["tokens"] == plain
+    stats = report["speculation"]
+    if backend == "cpu":
+        assert 0 < stats["accepted"] < stats["drafted"] and stats["passes"] < len(plain)
+    else:  # Metal decodes one token at a time until it can verify
+        assert stats == {"passes": 0, "drafted": 0, "accepted": 0}
+    # Drafting from the context alone changes nothing either.
+    assert _speculative_run(native_cli, directory, backend, prompt, None, *args)["tokens"] == plain
+
+
+@pytest.mark.parametrize("name", ["mistral-sliding-untied", "qwen3.5-mlx", "deepseek-v3-absorbed-grouped"])
+def test_speculative_stop_keeps_the_tokens_before_it(native_cli, name, tmp_path):
+    # A stop token inside an accepted run, and a limit inside a pass: decoding
+    # on afterwards continues from the tokens generation kept, for a sliding
+    # window (8 tokens, so the ring wraps), recurrent states and latents.
+    directory = tmp_path / "model"
+    if name in DENSE_VARIANTS:
+        write_tiny_dense(directory, DENSE_VARIANTS[name])
+    elif name in QWEN35_VARIANTS:
+        write_tiny_qwen35(directory, QWEN35_VARIANTS[name])
+    else:
+        write_tiny_deepseek(directory, DEEPSEEK_VARIANTS[name])
+    prompt = TOKENS[:6]
+    plain = _run(native_cli, "generate", "--model", str(directory), "--backend", "cpu",
+                 "--tokens", ",".join(map(str, prompt)), "--max-new", "16", "--no-eos-stop")["tokens"]
+    # Every stop position and limit, so some fall inside a pass's accepted run.
+    for stop in [i for i in range(2, 12) if plain[i] not in plain[:i]]:
+        _edit_text_config(directory, {"eos_token_id": plain[stop]})
+        report = _speculative_run(native_cli, directory, "cpu", prompt, prompt + plain, "--max-new", "16",
+                                  "--continue", "4")
+        assert report["tokens"] == plain[: stop + 1] and report["continued"] == plain[stop + 1 : stop + 5]
+        assert report["speculation"]["accepted"] > 0
+    for limit in range(2, 12):
+        report = _speculative_run(native_cli, directory, "cpu", prompt, prompt + plain, "--max-new", str(limit),
+                                  "--no-eos-stop", "--continue", "3")
+        assert report["tokens"] == plain[:limit] and report["continued"] == plain[limit : limit + 3]
+
+
+def test_speculation_is_greedy_only(native_cli, tmp_path):
+    # Sampled generation decodes one token at a time, with the same draws.
+    directory = write_tiny_qwen35(tmp_path / "model", QWEN35_VARIANTS["qwen3.5-mlx"])
+    args = ("generate", "--model", str(directory), "--backend", "cpu", "--tokens", ",".join(map(str, TOKENS[:6])),
+            "--max-new", "12", "--temperature", "0.8", "--seed", "7")
+    sampled = _run(native_cli, *args)["tokens"]
+    (tmp_path / "reference.txt").write_text(",".join(map(str, TOKENS[:6] + sampled)))
+    report = _run(native_cli, *args, "--speculate", "4", "--draft-reference", str(tmp_path / "reference.txt"))
+    assert report["tokens"] == sampled
+    assert report["speculation"] == {"passes": 0, "drafted": 0, "accepted": 0}
+    result = subprocess.run([str(native_cli), *args, "--speculate", "-1"], capture_output=True, text=True)
+    assert result.returncode != 0 and "--speculate must not be negative" in result.stderr
+
+
 @pytest.mark.parametrize("backend", _backends())
 def test_greedy_generation_matches_full_recompute(native_cli, fixture_model, backend):
     directory, oracle = fixture_model

@@ -5,6 +5,7 @@
 //   lokahi generate   --model DIR (--tokens 2,5,9 | --prompt TEXT) --max-new N [--no-eos-stop]
 //                     [--images A.rgb,B.rgb]
 //                     [--temperature T] [--top-p P] [--top-k K] [--min-p M] [--seed S]
+//                     [--speculate N [--draft-reference FILE]]   # greedy: verify up to N drafts a pass
 //   lokahi image-features --model DIR --images A.ppm[,B.ppm] --out FILE [--backend B]
 //   lokahi image-geometry --model DIR --width W --height H   # the processor's resize target
 //   lokahi sample     --logits-file F.f32 --vocab V [sampling flags] [--steps N] [--first-step S]
@@ -330,6 +331,13 @@ int cmd_generate(const Args& args) {
   std::vector<int32_t> tokens = prompt_tokens(args);
   GenerationTiming timing;
   inject_images(args, *model, tokens);
+  // --speculate N drafts up to N tokens per verify pass from the prompt and
+  // the output so far, and from --draft-reference's tokens when given.
+  SpeculationOptions speculation;
+  speculation.max_draft = args.get_int("speculate", 0);
+  LK_CHECK(speculation.max_draft >= 0, "--speculate must not be negative");
+  if (args.has("draft-reference")) speculation.reference = parse_tokens(read_text_file(args.get("draft-reference")));
+  model->set_speculation(std::move(speculation));
   auto generated = model->generate(tokens, args.get_int("max-new", 16), sampling_options(args),
                                    !args.has("no-eos-stop"), &timing);
   std::string text;
@@ -347,9 +355,13 @@ int cmd_generate(const Args& args) {
     }
     continued = ",\"continued\":" + json_tokens(more);
   }
-  std::printf("{\"backend\":\"%s\",\"tokens\":%s%s%s,\"prefill_seconds\":%.9f,\"decode_seconds\":%.9f}\n",
-              model->backend(), json_tokens(generated).c_str(), text.c_str(), continued.c_str(), timing.prefill_seconds,
-              timing.decode_seconds);
+  const SpeculationStats& stats = model->speculation_stats();
+  const std::string speculated = ",\"speculation\":{\"passes\":" + std::to_string(stats.passes) +
+                                 ",\"drafted\":" + std::to_string(stats.drafted) +
+                                 ",\"accepted\":" + std::to_string(stats.accepted) + "}";
+  std::printf("{\"backend\":\"%s\",\"tokens\":%s%s%s%s,\"prefill_seconds\":%.9f,\"decode_seconds\":%.9f}\n",
+              model->backend(), json_tokens(generated).c_str(), text.c_str(), continued.c_str(), speculated.c_str(),
+              timing.prefill_seconds, timing.decode_seconds);
   return 0;
 }
 

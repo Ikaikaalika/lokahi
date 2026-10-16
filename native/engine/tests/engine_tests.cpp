@@ -21,6 +21,7 @@
 #include "regex.h"
 #include "safetensors.h"
 #include "sampling.h"
+#include "speculation.h"
 #include "thread_pool.h"
 #include "tokenizer.h"
 #include "unicode.h"
@@ -1395,6 +1396,33 @@ void test_qwen3_5_vision_config() {
   EXPECT(q38.deepstack.empty() && q38.min_pixels == 65536 && q38.max_pixels == 16777216);
 }
 
+void test_prompt_lookup_drafter() {
+  using V = std::vector<int32_t>;
+  // From the context alone: what followed the latest earlier occurrence of
+  // the longest suffix (up to 3 tokens), clipped to max_draft.
+  PromptLookupDrafter context_only;
+  EXPECT(context_only.propose({1, 2, 3, 9, 1, 2, 3, 8, 7, 1, 2, 3}, 2) == V({8, 7}));
+  EXPECT(context_only.propose({5, 6, 7, 5, 6}, 4) == V({7, 5, 6}));  // 2-gram (5, 6), to the end
+  EXPECT(context_only.propose({4, 1, 2, 4}, 3) == V({1, 2, 4}));       // 1-gram 4
+  EXPECT(context_only.propose({1, 2, 3, 9, 5, 3, 6, 1, 2, 3}, 2) == V({9, 5}));  // not 3's latest (6, 1)
+  EXPECT(context_only.propose({1, 2, 3}, 3).empty() && context_only.propose({}, 3).empty());
+  EXPECT(context_only.propose({1, 2, 1, 2}, 0).empty());
+  // A reference comes first, onward from where its last run ended.
+  PromptLookupDrafter edit(V{10, 11, 12, 13, 14, 15, 16, 11, 12, 99});
+  EXPECT(edit.propose({0, 10, 11, 12}, 2) == V({13, 14}));
+  EXPECT(edit.propose({0, 10, 11, 12, 13, 14}, 2) == V({15, 16}));  // continues, not the later (11, 12)
+  // Its later occurrence is found when the suffix moves past the cursor...
+  EXPECT(edit.propose({0, 16, 11, 12}, 1) == V({99}));
+  // ...and earlier ones from the start; without a match, the context.
+  EXPECT(edit.propose({0, 10, 11}, 1) == V({12}));
+  EXPECT(edit.propose({7, 8, 7}, 2) == V({8, 7}));
+  // A repeated run follows the cursor: the second (1, 2, 3) continues with
+  // 5, not with what followed the first.
+  PromptLookupDrafter repeat(V{7, 1, 2, 3, 4, 8, 1, 2, 3, 5, 9});
+  EXPECT(repeat.propose({7, 1, 2, 3, 4, 8, 1, 2}, 1) == V({3}));
+  EXPECT(repeat.propose({7, 1, 2, 3, 4, 8, 1, 2, 3}, 2) == V({5, 9}));
+}
+
 void test_kv_cache_option() {
   // Metal stores standard attention's keys and values as FP16 unless asked
   // for FP32; the CPU keeps FP32 unless asked; latent attention keeps FP32.
@@ -1436,6 +1464,7 @@ int main() {
   test_deepseek_configs();
   test_qwen3_5_configs();
   test_kv_cache_option();
+  test_prompt_lookup_drafter();
   test_mrope_injection_plan();
   test_qwen3_vl_config();
   test_qwen2_5_vl_config();
