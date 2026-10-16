@@ -1326,6 +1326,13 @@ bool DecoderWeights::dense_mxfp4() const {
   return false;
 }
 
+bool kv_cache_f16(const LoadOptions& options, const DecoderConfig& c, bool metal) {
+  const std::string& kind = options.kv_cache;
+  LK_CHECK(kind == "auto" || kind == "f16" || kind == "f32", "kv_cache must be auto, f16 or f32, not '" + kind + "'");
+  LK_CHECK(kind != "f16" || !c.mla(), c.architecture + ": latent attention keeps its cache in f32");
+  return kind == "f16" || (kind == "auto" && metal && !c.mla());
+}
+
 namespace traffic {
 
 double linear(const Linear& weights, int n) {
@@ -1341,7 +1348,7 @@ double embed(const Linear& embed, int n) {
 
 double rows(int64_t width, int n, int arrays) { return 4.0 * static_cast<double>(width) * n * arrays; }
 
-double attention(const DecoderConfig& c, int layer, int start, int n) {
+double attention(const DecoderConfig& c, int layer, int start, int n, double kv_element_bytes) {
   const bool sliding = c.layer_is_sliding[static_cast<size_t>(layer)];
   double keys = 0.0;
   for (int t = 0; t < n; ++t) {
@@ -1354,8 +1361,8 @@ double attention(const DecoderConfig& c, int layer, int start, int n) {
     const double width = c.latent_width();
     return 4.0 * (static_cast<double>(n) * c.num_heads * (width + c.kv_lora_rank) + keys * width);
   }
-  const double head_bytes = 4.0 * c.head_dim_of(layer);
-  return head_bytes * (2.0 * n * c.num_heads + 2.0 * keys * c.kv_heads_of(layer));
+  const double head = c.head_dim_of(layer);
+  return head * (4.0 * 2.0 * n * c.num_heads + kv_element_bytes * 2.0 * keys * c.kv_heads_of(layer));
 }
 
 double latent_qkv(const DecoderConfig& c, const DecoderLayer& L, int n) {
@@ -1448,7 +1455,8 @@ class DecoderCpu final : public Model {
  public:
   DecoderCpu(std::shared_ptr<DecoderWeights> weights, const LoadOptions& options)
       : w_(std::move(weights)), c_(w_->config), pool_(options.cpu_threads),
-        max_context_(options.max_context), chunk_(std::max(1, options.prefill_chunk)) {
+        max_context_(options.max_context), chunk_(std::max(1, options.prefill_chunk)),
+        kv_f16_(kv_cache_f16(options, c_, false)) {
     LK_CHECK(max_context_ > 0, "max_context must be positive");
     const size_t layers = static_cast<size_t>(c_.num_layers);
     kv_k_.resize(layers);
@@ -1497,6 +1505,7 @@ class DecoderCpu final : public Model {
   const char* architecture() const override { return c_.architecture.c_str(); }
   int vocab_size() const override { return c_.vocab_size; }
   int max_context() const override { return max_context_; }
+  const char* kv_cache() const override { return kv_f16_ ? "f16" : "f32"; }
   int position() const override { return position_; }
   size_t weight_bytes() const override { return w_->matrix_bytes(); }
   const std::vector<int32_t>& eos_token_ids() const override { return c_.eos_token_ids; }
@@ -1582,8 +1591,15 @@ class DecoderCpu final : public Model {
     const int D = c_.head_dim_of(layer);
     for (int kv = 0; kv < c_.kv_heads_of(layer); ++kv) {
       const size_t dst = (static_cast<size_t>(kv) * capacity + pos % capacity) * D;
-      std::copy_n(k + static_cast<size_t>(kv) * D, D, kv_k_[static_cast<size_t>(layer)].data() + dst);
-      std::copy_n(v + static_cast<size_t>(kv) * D, D, kv_v_[static_cast<size_t>(layer)].data() + dst);
+      float* kd = kv_k_[static_cast<size_t>(layer)].data() + dst;
+      float* vd = kv_v_[static_cast<size_t>(layer)].data() + dst;
+      std::copy_n(k + static_cast<size_t>(kv) * D, D, kd);
+      std::copy_n(v + static_cast<size_t>(kv) * D, D, vd);
+      if (!kv_f16_) continue;
+      for (int i = 0; i < D; ++i) {
+        kd[i] = f16_to_f32(f32_to_f16(kd[i]));
+        vd[i] = f16_to_f32(f32_to_f16(vd[i]));
+      }
     }
   }
 
@@ -2480,6 +2496,7 @@ class DecoderCpu final : public Model {
   ThreadPool pool_;
   int max_context_;
   int chunk_;
+  bool kv_f16_;  // keys and values rounded to FP16 as Metal stores them
   int position_ = 0;
   size_t max_q_ = 0, max_kv_ = 0, max_inter_ = 0;  // per-token widths, the largest over layers
   std::vector<int> capacity_;                       // ring positions per layer; 0 for KV-shared layers

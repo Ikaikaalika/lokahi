@@ -126,6 +126,7 @@ LoadOptions load_options(const Args& args) {
   options.max_context = args.get_int("max-context", 4096);
   options.prefill_chunk = args.get_int("prefill-chunk", 512);
   options.cpu_threads = static_cast<unsigned>(args.get_int("threads", 0));
+  options.kv_cache = args.get("kv-cache", "auto");
   return options;
 }
 
@@ -289,8 +290,8 @@ int cmd_info(const Args& args) {
   }
   std::printf(
       "{\"architecture\":\"%s\",\"backend\":\"%s\",\"vocab_size\":%d,\"max_context\":%d,"
-      "\"weight_bytes\":%zu%s}\n",
-      model->architecture(), model->backend(), model->vocab_size(), model->max_context(),
+      "\"kv_cache\":\"%s\",\"weight_bytes\":%zu%s}\n",
+      model->architecture(), model->backend(), model->vocab_size(), model->max_context(), model->kv_cache(),
       model->weight_bytes(), vision.c_str());
   return 0;
 }

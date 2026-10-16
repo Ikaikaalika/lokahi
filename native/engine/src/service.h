@@ -39,12 +39,13 @@ struct ServiceOptions {
   std::vector<ServiceModel> models;
   std::string backend = "auto";
   int max_context = 4096;
+  std::string kv_cache = "auto";  // LoadOptions::kv_cache
   int queue_limit = 8;           // requests that may wait behind the running one
   double text_flush_ms = 50.0;   // coalescing interval for text_delta events
   std::string runtime_revision;  // 64 hex; when set, requests for another revision are rejected
 
   // {"models": [{"id", "revision", "artifact_digest", "adapter_id"?, "directory"}],
-  //  "backend"?, "max_context"?, "queue_limit"?, "text_flush_ms"?, "runtime_revision"?}
+  //  "backend"?, "max_context"?, "kv_cache"?, "queue_limit"?, "text_flush_ms"?, "runtime_revision"?}
   static ServiceOptions from_json(const Json& config);
 };
 

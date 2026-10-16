@@ -111,6 +111,7 @@ ServiceOptions ServiceOptions::from_json(const Json& config) {
   LK_CHECK(!options.models.empty(), "service config lists no models");
   options.backend = config.string_or("backend", options.backend);
   options.max_context = static_cast<int>(config.int_or("max_context", options.max_context));
+  options.kv_cache = config.string_or("kv_cache", options.kv_cache);
   options.queue_limit = static_cast<int>(config.int_or("queue_limit", options.queue_limit));
   options.text_flush_ms = config.number_or("text_flush_ms", options.text_flush_ms);
   options.runtime_revision = config.string_or("runtime_revision", "");
@@ -123,6 +124,7 @@ struct Service::Impl {
     LoadOptions load;
     load.backend = options.backend;
     load.max_context = options.max_context;
+    load.kv_cache = options.kv_cache;
     for (const ServiceModel& m : options.models) models.push_back(std::make_unique<LoadedModel>(m, load));
     worker = std::thread([this] { work(); });
   }

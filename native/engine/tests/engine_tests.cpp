@@ -68,6 +68,20 @@ void test_half() {
   EXPECT(f16_to_f32(0xC000) == -2.0f);
   EXPECT(f16_to_f32(0x0001) > 0.0f && f16_to_f32(0x0001) < 1e-7f);  // subnormal
   EXPECT(std::isinf(f16_to_f32(0x7C00)));
+  // f32_to_f16 inverts f16_to_f32 on every finite half, and rounds each
+  // midpoint between neighbours to the one with an even code, as Metal does.
+  for (uint32_t h = 0; h < 0x10000u; ++h) {
+    if ((h & 0x7C00u) == 0x7C00u) continue;  // infinities and NaNs
+    EXPECT(f32_to_f16(f16_to_f32(static_cast<uint16_t>(h))) == h);
+    if ((h & 0x7FFFu) == 0x7BFFu) continue;  // the largest finite half: its midpoint is the overflow edge
+    const double low = f16_to_f32(static_cast<uint16_t>(h)), high = f16_to_f32(static_cast<uint16_t>(h + 1));
+    const float midpoint = static_cast<float>((low + high) / 2.0);  // exact in float
+    EXPECT(f32_to_f16(midpoint) == ((h & 1u) == 0 ? h : h + 1));
+    EXPECT(f32_to_f16(std::nextafter(midpoint, static_cast<float>(high))) == h + 1);
+  }
+  EXPECT(f32_to_f16(65504.0f) == 0x7BFF && f32_to_f16(65519.0f) == 0x7BFF && f32_to_f16(65520.0f) == 0x7C00);
+  EXPECT(f32_to_f16(-1e9f) == 0xFC00 && f32_to_f16(1e-9f) == 0 && f32_to_f16(-0.0f) == 0x8000);
+  EXPECT((f32_to_f16(std::nanf("")) & 0x7FFFu) > 0x7C00u);
 }
 
 struct QuantFixture {
@@ -1309,6 +1323,27 @@ void test_qwen3_5_vision_config() {
   EXPECT(q38.deepstack.empty() && q38.min_pixels == 65536 && q38.max_pixels == 16777216);
 }
 
+void test_kv_cache_option() {
+  // Metal stores standard attention's keys and values as FP16 unless asked
+  // for FP32; the CPU keeps FP32 unless asked; latent attention keeps FP32.
+  const DecoderConfig dense = DecoderConfig::from_json(Json::parse(kQwen38_27BConfig));
+  DecoderConfig latent = dense;
+  latent.kv_lora_rank = 512;
+  LoadOptions o;
+  EXPECT(kv_cache_f16(o, dense, true) && !kv_cache_f16(o, dense, false) && !kv_cache_f16(o, latent, true));
+  o.kv_cache = "f32";
+  EXPECT(!kv_cache_f16(o, dense, true));
+  o.kv_cache = "f16";
+  EXPECT(kv_cache_f16(o, dense, false) && throws([&] { kv_cache_f16(o, latent, true); }));
+  o.kv_cache = "bf16";
+  EXPECT(throws([&] { kv_cache_f16(o, dense, true); }));
+  // The profiler's attention traffic: q in and out in float32, and every
+  // visible key and value at the cache's width. Qwen3.8's layer 3 (24 heads,
+  // 4 KV heads of 256) decoding at position 99 sees 100 keys.
+  const double f32 = traffic::attention(dense, 3, 99, 1), f16 = traffic::attention(dense, 3, 99, 1, 2.0);
+  EXPECT(f32 == 256.0 * (4.0 * 2 * 24 + 4.0 * 2 * 100 * 4) && f16 == 256.0 * (4.0 * 2 * 24 + 2.0 * 2 * 100 * 4));
+}
+
 int main() {
   test_json();
   test_half();
@@ -1328,6 +1363,7 @@ int main() {
   test_glm_config();
   test_deepseek_configs();
   test_qwen3_5_configs();
+  test_kv_cache_option();
   test_mrope_injection_plan();
   test_qwen3_vl_config();
   test_qwen2_5_vl_config();

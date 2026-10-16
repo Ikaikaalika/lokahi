@@ -200,6 +200,22 @@ def test_greedy_request_streams_the_oracle_output(native_cli, tiny, tmp_path):
     assert receipt["metrics"]["ttft_ms"] is not None and not server.errors
 
 
+def test_service_config_sets_the_kv_cache(native_cli, tiny, tmp_path):
+    # "kv_cache" reaches the model loader: FP16 keys and values (the CPU
+    # rounds them as Metal stores them) give the same greedy text here, and an
+    # unknown type stops the service from starting.
+    directory = tiny[0]
+    bad = subprocess.run([str(native_cli), "serve", "--config", str(_config(tmp_path / "bad.json", directory,
+                                                                             kv_cache="bf16"))],
+                         input=b"", capture_output=True)
+    assert bad.returncode != 0 and b"kv_cache must be auto, f16 or f32, not 'bf16'" in bad.stderr
+    _, _, text = _expected_greedy(tiny, 16)
+    server = _serve(native_cli, _config(tmp_path / "c.json", directory, kv_cache="f16", text_flush_ms=0),
+                    [_start("req-f16")])
+    receipt = server.streams.receipt("req-f16")
+    assert receipt["status"] == "completed" and receipt["output_text"] == text, receipt
+
+
 def test_text_is_coalesced_into_few_events(native_cli, tiny, tmp_path):
     server = _serve(native_cli, _config(tmp_path / "c.json", tiny[0], text_flush_ms=60_000), [_start("req-coalesce")])
     deltas = [d for d in server.streams.by_request["req-coalesce"] if d.get("kind") == "text_delta"]
