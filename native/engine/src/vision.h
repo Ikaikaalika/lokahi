@@ -27,6 +27,13 @@ struct Image {
   std::vector<uint8_t> rgb;  // [height, width, 3]
 };
 
+// An image's features: one row per image token, and for Qwen3-VL one more
+// set of rows per deepstack layer.
+struct ImageFeatures {
+  std::vector<float> rows;  // [tokens, text_hidden_size]
+  std::vector<std::vector<float>> deepstack;
+};
+
 // A binary PPM (P6, maxval 255) file, or raw RGB8 bytes of a square image of
 // side `raw_side` (0: raw files are refused).
 Image read_image(const std::string& path, int raw_side);
@@ -60,14 +67,17 @@ class VisionEncoder {
   // An image at an accepted size to its features [tokens_for(width, height),
   // text_hidden_size].
   virtual std::vector<float> encode(const Image& image) = 0;
+  // The features with any deepstack rows.
+  virtual ImageFeatures encode_features(const Image& image) { return {encode(image), {}}; }
 };
 
 // Places images' features at the runs of `image_token` in `tokens`, a prompt
 // whose first token sits at position `start`: image i fills the next
-// features[i].size() / width tokens, which become its block. `grids`, when
-// not empty, gives each image's token_grid.
+// images[i].rows.size() / width tokens, which become its block, and its
+// deepstack rows go to the same positions. `grids`, when not empty, gives
+// each image's token_grid.
 PromptInjection place_images(const std::vector<int32_t>& tokens, int start, int image_token, int width,
-                             const std::vector<std::vector<float>>& features,
+                             const std::vector<ImageFeatures>& images,
                              const std::vector<std::pair<int, int>>& grids = {});
 
 }  // namespace lokahi

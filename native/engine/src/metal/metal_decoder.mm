@@ -1634,6 +1634,18 @@ class DecoderMetal final : public Model {
                                 traffic::rows(c_.per_layer_input, n, 2)
                           : 0.0);
         encode_residual_norm(enc, G.pl_norm, next, n, G.scalar);
+      } else if (!plan_.empty() && l < active_.layer_rows.size()) {
+        // Deepstack: x += mlp, then this layer's rows onto the image tokens,
+        // then the next layer's norm.
+        encode_residual_norm(enc, G.mlp_post_norm, nullptr, n, G.scalar);
+        [enc setComputePipelineState:pipeline("add_rows_at")];
+        bind(enc, layer_rows_, sizeof(float) * l * active_.rows.size(), 0);
+        bind(enc, inject_index_, sizeof(int32_t) * static_cast<size_t>(start - plan_.base), 1);
+        bind(enc, x_, 0, 2);
+        bytes(enc, ReplaceParams{c_.hidden_size, n}, 3);
+        [enc dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(c_.hidden_size), static_cast<NSUInteger>(n), 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        encode_rms_norm(enc, x_, *next, h_, n);
       } else {
         encode_residual_norm(enc, G.mlp_post_norm, next, n, G.scalar);
       }
@@ -1695,6 +1707,11 @@ class DecoderMetal final : public Model {
                                           length:std::max<size_t>(sizeof(float) * active_.rows.size(), 16)
                                          options:MTLResourceStorageModeShared];
       LK_CHECK(inject_rows_ != nil, "metal: allocation failed");
+      if (!active_.layer_rows.empty()) {  // every deepstack layer's rows, one after another
+        layer_rows_ = shared_buffer(sizeof(float) * active_.rows.size() * active_.layer_rows.size());
+        float* at = static_cast<float*>([layer_rows_ contents]);
+        for (const std::vector<float>& layer : active_.layer_rows) at = std::copy(layer.begin(), layer.end(), at);
+      }
     }
     std::memcpy([prompt_ contents], tokens, sizeof(int32_t) * static_cast<size_t>(n));
     active_cb_ = [queue_ commandBuffer];
@@ -1773,6 +1790,7 @@ class DecoderMetal final : public Model {
   PromptInjection active_;
   InjectionPlan plan_;
   id<MTLBuffer> inject_rows_ = nil, inject_index_ = nil, last_key_ = nil;
+  id<MTLBuffer> layer_rows_ = nil;  // deepstack rows [layers, injected rows, hidden]
   // M-RoPE: the prefill's positions [n, 3] (shared, written before each
   // prefill), each frequency's axis, and how far RoPE positions run ahead
   // of KV positions until reset().

@@ -54,13 +54,17 @@ class Profiler {
 // Positions are absolute.
 //
 // `grids` gives each block's (rows, columns), for models whose RoPE follows
-// an image's layout (Qwen3.5's M-RoPE): the block's tokens fill the grid row
-// by row. It is empty for every other model.
+// an image's layout (Qwen3.5's and Qwen3-VL's M-RoPE): the block's tokens
+// fill the grid row by row. It is empty for every other model.
+//
+// `layer_rows[l]` (Qwen3-VL's deepstack), laid out like `rows`, is added to
+// the hidden states at `positions` after decoder layer l.
 struct PromptInjection {
   std::vector<int> positions;
   std::vector<float> rows;  // [positions.size(), hidden_size]
   std::vector<std::pair<int, int>> blocks;
   std::vector<std::pair<int, int>> grids;
+  std::vector<std::vector<float>> layer_rows;
   bool empty() const { return positions.empty() && blocks.empty(); }
 };
 
@@ -71,6 +75,7 @@ struct InjectionRules {
   // M-RoPE: how far RoPE positions run ahead of the KV positions before this
   // prefill (images so far have moved them).
   int rope_offset = 0;
+  int deepstack_layers = 0;  // the most layers that may take layer_rows (Qwen3-VL)
 };
 
 // A PromptInjection checked against a prefill of `n` tokens whose first sits
@@ -95,8 +100,9 @@ struct InjectionPlan {
 
 // Fails closed unless every row and block lies inside the prefill, rows are
 // `width` wide, blocks do not overlap, each bidirectional block fits a pass
-// of `chunk` tokens, and grids are given exactly when the rules use them,
-// one per block, each covering its block.
+// of `chunk` tokens, grids are given exactly when the rules use them, one
+// per block, each covering its block, and layer rows match the rows, for no
+// more layers than the rules allow.
 InjectionPlan plan_injection(const PromptInjection& injection, int base, int n, int width, int chunk,
                              const InjectionRules& rules);
 

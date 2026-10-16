@@ -542,7 +542,7 @@ class Qwen35VisionMetal final : public Qwen35VisionEncoder, private MetalKit {
 
   const char* backend() const override { return "metal"; }
 
-  std::vector<float> encode(const Image& image) override {
+  ImageFeatures encode_features(const Image& image) override {
     @autoreleasepool {
       const Qwen35VisionConfig& c = config();
       const auto [token_rows, token_cols] = token_grid(image.width, image.height);
@@ -559,8 +559,14 @@ class Qwen35VisionMetal final : public Qwen35VisionEncoder, private MetalKit {
       for (int t = 0; t < N; ++t) add_position(x + static_cast<size_t>(t) * hidden, t, rows, cols);
       rope_tables(rows, cols, static_cast<float*>([cos_ contents]), static_cast<float*>([sin_ contents]));
       run([&](id<MTLComputeCommandEncoder> enc) { encode_tower(enc, N); });
-      const float* out = static_cast<const float*>([features_ contents]);
-      return std::vector<float>(out, out + static_cast<size_t>(tokens) * c.text_hidden_size);
+      const size_t size = static_cast<size_t>(tokens) * c.text_hidden_size;
+      auto read = [&](id<MTLBuffer> buffer) {
+        const float* out = static_cast<const float*>([buffer contents]);
+        return std::vector<float>(out, out + size);
+      };
+      ImageFeatures features{read(features_), {}};
+      for (id<MTLBuffer> buffer : deepstack_features_) features.deepstack.push_back(read(buffer));
+      return features;
     }
   }
 
@@ -569,6 +575,11 @@ class Qwen35VisionMetal final : public Qwen35VisionEncoder, private MetalKit {
     id<MTLBuffer> norm1_weight, norm1_bias, norm2_weight, norm2_bias;
     GpuMatrix qkv, proj, fc1, fc2;
     id<MTLBuffer> qkv_bias, proj_bias, fc1_bias, fc2_bias;
+  };
+  struct Merger {
+    id<MTLBuffer> norm_weight, norm_bias;
+    GpuMatrix fc1, fc2;
+    id<MTLBuffer> fc1_bias, fc2_bias;
   };
   struct HalfRopeParams { int heads; int dim; int stride; };
 
@@ -582,12 +593,12 @@ class Qwen35VisionMetal final : public Qwen35VisionEncoder, private MetalKit {
                               matrix_of(L.fc2), buffer_of(L.qkv_bias), buffer_of(L.proj_bias), buffer_of(L.fc1_bias),
                               buffer_of(L.fc2_bias)});
     }
-    merger_norm_weight_ = buffer_of(w.merger_norm_weight);
-    merger_norm_bias_ = buffer_of(w.merger_norm_bias);
-    merger_fc1_ = matrix_of(w.merger_fc1);
-    merger_fc2_ = matrix_of(w.merger_fc2);
-    merger_fc1_bias_ = buffer_of(w.merger_fc1_bias);
-    merger_fc2_bias_ = buffer_of(w.merger_fc2_bias);
+    auto merger = [&](const Qwen35VisionWeights::Merger& m) {
+      return Merger{buffer_of(m.norm_weight), buffer_of(m.norm_bias), matrix_of(m.fc1), matrix_of(m.fc2),
+                    buffer_of(m.fc1_bias), buffer_of(m.fc2_bias)};
+    };
+    merger_ = merger(w.merger);
+    for (const Qwen35VisionWeights::Merger& m : w.deepstack) deepstack_.push_back(merger(m));
   }
 
   // Activation buffers for images of up to N patches.
@@ -607,6 +618,10 @@ class Qwen35VisionMetal final : public Qwen35VisionEncoder, private MetalKit {
     scores_ = private_buffer(n * n * f);  // one head's [patches, patches]
     merged_ = private_buffer(n * hidden * f);  // [tokens, merge^2 * hidden]
     features_ = shared_buffer(tokens * static_cast<size_t>(c.text_hidden_size) * f);
+    deepstack_features_.clear();
+    for (size_t i = 0; i < deepstack_.size(); ++i) {
+      deepstack_features_.push_back(shared_buffer(tokens * static_cast<size_t>(c.text_hidden_size) * f));
+    }
     capacity_ = N;
   }
 
@@ -617,13 +632,13 @@ class Qwen35VisionMetal final : public Qwen35VisionEncoder, private MetalKit {
   }
 
   void layer_norm(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> in, id<MTLBuffer> weight, id<MTLBuffer> bias,
-                  id<MTLBuffer> out, int rows) {
+                  id<MTLBuffer> out, int rows, int cols) {
     [enc setComputePipelineState:pipeline("layer_norm_rows")];
     [enc setBuffer:in offset:0 atIndex:0];
     [enc setBuffer:weight offset:0 atIndex:1];
     [enc setBuffer:bias offset:0 atIndex:2];
     [enc setBuffer:out offset:0 atIndex:3];
-    bytes(enc, LayerNormParams{config().hidden_size, 1e-6f}, 4);
+    bytes(enc, LayerNormParams{cols, 1e-6f}, 4);
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(rows), 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   }
 
@@ -645,14 +660,13 @@ class Qwen35VisionMetal final : public Qwen35VisionEncoder, private MetalKit {
     const Qwen35VisionConfig& c = config();
     const int hidden = c.hidden_size, inter = c.intermediate_size, heads = c.num_heads, D = c.head_dim();
     const int patch_width = 3 * c.patch_size * c.patch_size, stride = 3 * hidden;
-    const int square = c.merge * c.merge, tokens = N / square, merged = hidden * square;
 
     // x (the position rows) += patches W^T + bias.
     linear(enc, patches_, patch_, patch_bias_, x_, N, hidden, patch_width, true);
     const float scale = 1.0f / std::sqrt(static_cast<float>(D));
     const GpuMatrix fused{qkv_, "f32"};
     for (const Layer& L : layers_) {
-      layer_norm(enc, x_, L.norm1_weight, L.norm1_bias, h_, N);
+      layer_norm(enc, x_, L.norm1_weight, L.norm1_bias, h_, N, hidden);
       linear(enc, h_, L.qkv, L.qkv_bias, qkv_, N, stride, hidden, false);
       rope(enc, 0, N);
       rope(enc, 1, N);
@@ -670,25 +684,38 @@ class Qwen35VisionMetal final : public Qwen35VisionEncoder, private MetalKit {
            MmParams{N, D, N, N, stride, hidden, 1.0f, 0, 0});
       }
       linear(enc, attn_, L.proj, L.proj_bias, x_, N, hidden, hidden, true);
-      layer_norm(enc, x_, L.norm2_weight, L.norm2_bias, h_, N);
+      layer_norm(enc, x_, L.norm2_weight, L.norm2_bias, h_, N, hidden);
       linear(enc, h_, L.fc1, L.fc1_bias, f_, N, inter, hidden, false);
       [enc setBuffer:f_ offset:0 atIndex:0];
       elementwise(enc, "gelu_inplace", N * inter, 1);
       linear(enc, f_, L.fc2, L.fc2_bias, x_, N, hidden, inter, true);
+      const auto deep = std::find(c.deepstack.begin(), c.deepstack.end(), static_cast<int>(&L - layers_.data()));
+      if (deep != c.deepstack.end()) {
+        const size_t which = static_cast<size_t>(deep - c.deepstack.begin());
+        merge(enc, deepstack_[which], false, deepstack_features_[which], N);
+      }
     }
-
-    // The merger: each merge x merge square's normed patches are consecutive
-    // rows, so h_ reads as [tokens, merge^2 * hidden].
-    layer_norm(enc, x_, merger_norm_weight_, merger_norm_bias_, h_, N);
-    linear(enc, h_, merger_fc1_, merger_fc1_bias_, merged_, tokens, merged, merged, false);
-    [enc setBuffer:merged_ offset:0 atIndex:0];
-    elementwise(enc, "gelu_erf_inplace", tokens * merged, 1);
-    linear(enc, merged_, merger_fc2_, merger_fc2_bias_, features_, tokens, c.text_hidden_size, merged, false);
+    merge(enc, merger_, true, features_, N);
   }
 
-  GpuMatrix patch_, merger_fc1_, merger_fc2_;
-  id<MTLBuffer> patch_bias_ = nil, merger_norm_weight_ = nil, merger_norm_bias_ = nil;
-  id<MTLBuffer> merger_fc1_bias_ = nil, merger_fc2_bias_ = nil;
+  // A merger over the patch rows in x_, into `out` [tokens, text width]. Each
+  // merge x merge square's patches are consecutive rows, so they read as
+  // [tokens, merge^2 * hidden]; the norm covers a patch or the whole square.
+  void merge(id<MTLComputeCommandEncoder> enc, const Merger& m, bool per_patch, id<MTLBuffer> out, int N) {
+    const Qwen35VisionConfig& c = config();
+    const int square = c.merge * c.merge, tokens = N / square, merged = c.hidden_size * square;
+    layer_norm(enc, x_, m.norm_weight, m.norm_bias, h_, per_patch ? N : tokens, per_patch ? c.hidden_size : merged);
+    linear(enc, h_, m.fc1, m.fc1_bias, merged_, tokens, merged, merged, false);
+    [enc setBuffer:merged_ offset:0 atIndex:0];
+    elementwise(enc, "gelu_erf_inplace", tokens * merged, 1);
+    linear(enc, merged_, m.fc2, m.fc2_bias, out, tokens, c.text_hidden_size, merged, false);
+  }
+
+  GpuMatrix patch_;
+  id<MTLBuffer> patch_bias_ = nil;
+  Merger merger_;
+  std::vector<Merger> deepstack_;
+  std::vector<id<MTLBuffer>> deepstack_features_;  // shared, read back
   std::vector<Layer> layers_;
   int capacity_ = 0;  // patches the activation buffers hold
   // Host-written inputs (shared), activations, one head's scores, the merged
@@ -727,8 +754,12 @@ std::unique_ptr<VisionEncoder> make_gemma4_vision_metal(std::shared_ptr<const Ge
 }
 
 bool metal_qwen3_5_vision_supports(const Qwen35VisionWeights& weights) {
-  for (const Linear* l : {&weights.merger_fc1, &weights.merger_fc2}) {
-    if (l->quant.quantized() || mm_variant(l->dense_dtype) == nullptr) return false;
+  std::vector<const Qwen35VisionWeights::Merger*> mergers = {&weights.merger};
+  for (const Qwen35VisionWeights::Merger& m : weights.deepstack) mergers.push_back(&m);
+  for (const Qwen35VisionWeights::Merger* m : mergers) {
+    for (const Linear* l : {&m->fc1, &m->fc2}) {
+      if (l->quant.quantized() || mm_variant(l->dense_dtype) == nullptr) return false;
+    }
   }
   for (const Qwen35VisionWeights::Layer& L : weights.layers) {
     for (const Linear* l : {&L.qkv, &L.proj, &L.fc1, &L.fc2}) {

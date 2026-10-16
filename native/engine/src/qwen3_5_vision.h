@@ -1,6 +1,6 @@
-// Qwen3.5's image path, as Transformers' Qwen2VLImageProcessorFast (which
-// Qwen3VLProcessor uses) and Qwen3_5VisionModel (Qwen3-VL's tower without
-// deepstack) compute it:
+// Qwen3.5's and Qwen3-VL's image path, as Transformers' Qwen2VLImageProcessorFast
+// (which Qwen3VLProcessor uses) and Qwen3VLVisionModel (which Qwen3_5VisionModel
+// is without deepstack) compute it:
 //
 // * the processor resizes an image (the caller does, to target_size) so both
 //   sides are multiples of patch_size * spatial_merge_size and its area lies
@@ -15,7 +15,10 @@
 //   the whole head (the first quarter of the frequencies by patch row, the
 //   second by column, each half repeated); every patch sees every patch;
 // * the merger LayerNorms each patch, concatenates each merge x merge square
-//   and applies fc2(gelu(fc1(.))) with exact GELU into the text width.
+//   and applies fc2(gelu(fc1(.))) with exact GELU into the text width;
+// * Qwen3-VL's deepstack: after each block in deepstack_visual_indexes, a
+//   merger of its own, which LayerNorms the concatenated square instead of
+//   each patch, gives one more set of feature rows (ImageFeatures::deepstack).
 //
 // Patches run in merge-block order (block rows, block columns, then row and
 // column within the block), so merged tokens follow the merged grid row by
@@ -46,6 +49,7 @@ struct Qwen35VisionConfig {
   int position_side = 0;    // sqrt(num_position_embeddings)
   int text_hidden_size = 0;  // out_hidden_size
   int image_token_id = -1;
+  std::vector<int> deepstack;  // deepstack_visual_indexes, increasing
   int64_t min_pixels = 65536;     // the processor's size.shortest_edge
   int64_t max_pixels = 16777216;  // and size.longest_edge
   float rescale = 1.0f / 255.0f;
@@ -59,7 +63,7 @@ struct Qwen35VisionConfig {
   static Qwen35VisionConfig from_json(const Json& config, const Json* preprocessor);
 };
 
-// Whether config.json describes a Qwen3.5 (or Qwen3.5-MoE) vision-language model.
+// Whether config.json describes a Qwen3.5 or Qwen3-VL (dense or MoE) vision-language model.
 bool is_qwen3_5_vision(const Json& config);
 
 struct Qwen35VisionWeights {
@@ -76,9 +80,15 @@ struct Qwen35VisionWeights {
   // bias; the position table [side * side, hidden].
   std::vector<float> patch_weight, patch_bias, positions;
   std::vector<Layer> layers;
-  std::vector<float> merger_norm_weight, merger_norm_bias;
-  Linear merger_fc1, merger_fc2;
-  std::vector<float> merger_fc1_bias, merger_fc2_bias;
+  // fc2(gelu(fc1(norm(.)))): the norm covers one patch (the merger) or a
+  // concatenated square (the deepstack mergers).
+  struct Merger {
+    std::vector<float> norm_weight, norm_bias;
+    Linear fc1, fc2;
+    std::vector<float> fc1_bias, fc2_bias;
+  };
+  Merger merger;
+  std::vector<Merger> deepstack;  // one per deepstack index
 
   static std::shared_ptr<Qwen35VisionWeights> load(const std::string& directory, const Json& config);
 };
@@ -91,6 +101,7 @@ class Qwen35VisionEncoder : public VisionEncoder {
   std::pair<int, int> target_size(int width, int height) const override;
   int tokens_for(int width, int height) const override;
   std::pair<int, int> token_grid(int width, int height) const override;
+  std::vector<float> encode(const Image& image) override { return encode_features(image).rows; }
 
   const Qwen35VisionConfig& config() const { return weights_->config; }
 

@@ -111,32 +111,40 @@ std::unique_ptr<VisionEncoder> VisionEncoder::load(const std::string& directory,
 }
 
 PromptInjection place_images(const std::vector<int32_t>& tokens, int start, int image_token, int width,
-                             const std::vector<std::vector<float>>& features,
+                             const std::vector<ImageFeatures>& images,
                              const std::vector<std::pair<int, int>>& grids) {
-  LK_CHECK(grids.empty() || grids.size() == features.size(), "give one token grid per image");
+  LK_CHECK(grids.empty() || grids.size() == images.size(), "give one token grid per image");
   const size_t w = static_cast<size_t>(width);
   std::vector<int> runs;
   for (size_t i = 0; i < tokens.size(); ++i) {
     if (tokens[i] == image_token) runs.push_back(static_cast<int>(i));
   }
   size_t rows = 0;
-  for (const auto& image : features) {
-    LK_CHECK(!image.empty() && image.size() % w == 0, "image features have the wrong size");
-    rows += image.size() / w;
+  for (const ImageFeatures& image : images) {
+    LK_CHECK(!image.rows.empty() && image.rows.size() % w == 0, "image features have the wrong size");
+    LK_CHECK(image.deepstack.size() == images.front().deepstack.size(), "images differ in their deepstack layers");
+    for (const std::vector<float>& layer : image.deepstack) {
+      LK_CHECK(layer.size() == image.rows.size(), "deepstack rows have the wrong size");
+    }
+    rows += image.rows.size() / w;
   }
   LK_CHECK(runs.size() == rows, "the prompt has " + std::to_string(runs.size()) + " image tokens for " +
-                                    std::to_string(features.size()) + " image(s) of " + std::to_string(rows) +
+                                    std::to_string(images.size()) + " image(s) of " + std::to_string(rows) +
                                     " tokens in all");
   PromptInjection out;
+  if (!images.empty()) out.layer_rows.resize(images.front().deepstack.size());
   size_t next = 0;
-  for (const auto& image : features) {
-    const int count = static_cast<int>(image.size() / w);
+  for (const ImageFeatures& image : images) {
+    const int count = static_cast<int>(image.rows.size() / w);
     const int first = runs[next];
     LK_CHECK(runs[next + static_cast<size_t>(count) - 1] == first + count - 1, "each image's tokens must be contiguous");
     next += static_cast<size_t>(count);
     out.blocks.emplace_back(start + first, start + first + count);
     for (int j = 0; j < count; ++j) out.positions.push_back(start + first + j);
-    out.rows.insert(out.rows.end(), image.begin(), image.end());
+    out.rows.insert(out.rows.end(), image.rows.begin(), image.rows.end());
+    for (size_t l = 0; l < image.deepstack.size(); ++l) {
+      out.layer_rows[l].insert(out.layer_rows[l].end(), image.deepstack[l].begin(), image.deepstack[l].end());
+    }
   }
   out.grids = grids;
   return out;

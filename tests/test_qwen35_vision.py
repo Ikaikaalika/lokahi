@@ -222,7 +222,7 @@ def _edit_json(path: Path, change: dict, remove: tuple = ()) -> None:
     ("file", "change", "remove", "message"),
     [
         ("config.json", {"vision_config": {**SPEC.vision_config(), "deepstack_visual_indexes": [1]}}, (),
-         "deepstack visual features are not supported"),
+         "deepstack features are Qwen3-VL's, not qwen3_5's"),
         ("config.json", {"vision_config": {**SPEC.vision_config(), "hidden_act": "gelu"}}, (),
          "unsupported activation gelu"),
         ("config.json", {"vision_config": {**SPEC.vision_config(), "out_hidden_size": 64}}, (),
