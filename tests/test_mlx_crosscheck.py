@@ -4,11 +4,13 @@ These tests pin the oracles' semantics to an independent implementation:
 ``mx.dequantize`` for the packed affine layout, and MLX-LM's ``gemma3_text``,
 ``gemma4``, ``llama``, ``qwen2``, ``qwen3``, ``qwen3_moe``, ``gpt_oss``, ``glm4_moe``,
 ``deepseek_v2``, ``deepseek_v3`` and ``glm4_moe_lite`` models for the full decoders. They need
-``mlx`` and ``mlx_lm`` and therefore run on Apple Silicon only.
+``mlx`` and ``mlx_lm``: hosted macOS CI runs them on its virtual GPU, and
+``mlx[cpu]`` runs them on Linux.
 """
 from __future__ import annotations
 
 import importlib.util
+import json
 
 import numpy as np
 import pytest
@@ -123,9 +125,12 @@ def test_oracle_matches_mlx_lm_gemma3(tmp_path, spec):
                                     "original_max_position_embeddings": 4096, "truncate": True}, seed=14),
         TinyDenseSpec(model_type="glm4_moe", head_dim=64, num_hidden_layers=3, num_experts=8, num_experts_per_tok=2,
                       moe_intermediate_size=64, rope_theta=1e6, tie_word_embeddings=False, seed=18),
+        # MLX-LM's glm4_moe always reads lm_head (released GLM-4.5 checkpoints
+        # are untied), so this variant is untied too.
         TinyDenseSpec(model_type="glm4_moe", head_dim=64, num_hidden_layers=3, num_experts=8, num_experts_per_tok=3,
                       moe_intermediate_size=64, rope_theta=1e6, n_group=4, topk_group=2, routed_scaling_factor=2.5,
-                      use_qk_norm=True, n_shared_experts=2, norm_topk_prob=False, seed=18),
+                      use_qk_norm=True, n_shared_experts=2, norm_topk_prob=False, tie_word_embeddings=False,
+                      seed=18),
     ],
     ids=["llama3-rope-llama3", "qwen3-qk-norm", "qwen2-bias-group7", "mistral-untied", "qwen3-moe-top2-of-8",
          "qwen3-moe-mxfp4-experts", "qwen3-yarn", "gpt-oss-mxfp4-truncated-yarn", "glm4-moe-air", "glm4-moe-grouped"],
@@ -149,6 +154,14 @@ def test_oracle_matches_mlx_lm_llama_family(tmp_path, spec):
 )
 def test_oracle_matches_mlx_lm_gemma4(tmp_path, spec):
     directory = write_tiny_gemma4(tmp_path / "model", spec)
+    if spec.nested:
+        # MLX-LM's gemma4 overwrites text_config's vocab_size with a top-level
+        # one that defaults to Gemma's 262144 (mlx-community's conversions
+        # leave it out), so the tiny vocabulary has to be spelled out for it.
+        config_path = directory / "config.json"
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        config["vocab_size"] = config["text_config"]["vocab_size"]
+        config_path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
     # In float32, MLX-LM's scalar constants are not rounded to BF16.
     _assert_mlx_lm_matches(directory, Gemma4Reference.load(directory, bf16_constants=False).logits(TOKENS))
 
