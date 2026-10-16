@@ -1531,6 +1531,7 @@ class DecoderCpu final : public Model {
     position_ = 0;
     rope_offset_ = 0;
     injection_ = {};
+    verify_n_ = 0;
     // Keys and values are rewritten before they are read; recurrent states
     // are not.
     for (auto* states : {&conv_state_, &delta_state_}) {
@@ -1540,6 +1541,7 @@ class DecoderCpu final : public Model {
 
   const float* prefill(const int32_t* tokens, int n) override {
     LK_CHECK(n > 0, "prefill requires at least one token");
+    verify_n_ = 0;
     begin_injection(n);
     for (int start = 0; start < n;) {
       const int count = plan_.pass_length(start, std::min(chunk_, n - start));
@@ -1551,8 +1553,46 @@ class DecoderCpu final : public Model {
   }
 
   const float* decode(int32_t token) override {
+    verify_n_ = 0;
     forward(&token, 1, true);
     return logits_.data();
+  }
+
+  bool can_verify() const override { return true; }
+
+  // One pass over the tokens with every row's logits. Recurrent states are
+  // snapshotted first, and each Gated DeltaNet layer records its inputs, so
+  // accept can rebuild the states after any prefix of the pass.
+  const float* verify(const int32_t* tokens, int n) override {
+    LK_CHECK(n > 0 && n <= chunk_, "verify takes 1 to prefill_chunk tokens");
+    LK_CHECK(injection_.empty(), "verify cannot take an injection");
+    verify_start_ = position_;
+    verify_n_ = n;
+    if (c_.has_linear()) {
+      conv_snapshot_ = conv_state_;
+      delta_snapshot_ = delta_state_;
+      verify_inputs_.assign(static_cast<size_t>(c_.num_layers), {});
+    }
+    verifying_ = true;
+    try {
+      forward(tokens, n, true);
+    } catch (...) {
+      verifying_ = false;
+      throw;
+    }
+    verifying_ = false;
+    return all_logits_.data();
+  }
+
+  void accept(int kept) override {
+    LK_CHECK(verify_n_ > 0 && kept >= 1 && kept <= verify_n_, "accept needs 1 to n tokens of the last verify");
+    position_ = verify_start_ + kept;
+    if (kept < verify_n_ && c_.has_linear()) {
+      for (int l = 0; l < c_.num_layers; ++l) {
+        if (c_.is_linear(l)) replay_linear(l, kept);
+      }
+    }
+    verify_n_ = 0;
   }
 
  protected:
@@ -1888,14 +1928,31 @@ class DecoderCpu final : public Model {
     }
     position_ += n;
     if (!want_logits) return;
+    const float cap = c_.final_logit_softcapping;
+    if (verifying_) {  // every row's logits
+      Section section(profiler_, "lm_head", profiling ? traffic::linear(w_->lm_head, n) + 4.0 * hidden * n : 0.0);
+      std::vector<float> normed(sn * static_cast<size_t>(hidden));
+      for (int t = 0; t < n; ++t) {
+        norm(x_.data() + static_cast<size_t>(t) * hidden, w_->final_norm, hidden, normed.data() + t * hidden);
+      }
+      all_logits_.resize(sn * static_cast<size_t>(c_.vocab_size));
+      if (n == 1) {
+        matvec(w_->lm_head, normed.data(), all_logits_.data(), pool_);
+      } else {
+        matmul(w_->lm_head, normed.data(), n, all_logits_.data(), pool_);
+      }
+      if (cap > 0.0f) {
+        for (float& v : all_logits_) v = std::tanh(v / cap) * cap;
+      }
+      return;
+    }
     // Only the last row's logits are needed: skip the vocabulary projection
     // for every other prompt token.
     Section section(profiler_, "lm_head", profiling ? traffic::linear(w_->lm_head, 1) + 4.0 * hidden : 0.0);
     std::vector<float> last(static_cast<size_t>(hidden));
     norm(x_.data() + static_cast<size_t>(n - 1) * hidden, w_->final_norm, hidden, last.data());
     matvec(w_->lm_head, last.data(), logits_.data(), pool_);
-    if (c_.final_logit_softcapping > 0.0f) {
-      const float cap = c_.final_logit_softcapping;
+    if (cap > 0.0f) {
       for (float& v : logits_) v = std::tanh(v / cap) * cap;
     }
   }
@@ -2107,6 +2164,7 @@ class DecoderCpu final : public Model {
       conv_in_.resize(history + sn * C);
       std::copy(state.begin(), state.end(), conv_in_.begin());
       std::copy_n(mixed_.data(), sn * C, conv_in_.data() + history);
+      if (verifying_) verify_inputs_[static_cast<size_t>(l)].raw.assign(mixed_.begin(), mixed_.begin() + sn * C);
       for (size_t t = 0; t < sn; ++t) {
         float* out = mixed_.data() + t * C;
         for (int ch = 0; ch < C; ++ch) {
@@ -2143,46 +2201,16 @@ class DecoderCpu final : public Model {
       }
     }
     linear_out_.resize(sn * values);
+    if (verifying_) {
+      LinearInputs& in = verify_inputs_[static_cast<size_t>(l)];
+      in.rows.assign(mixed_.begin(), mixed_.begin() + sn * C);
+      in.beta.assign(beta_.begin(), beta_.begin() + sn * Hv);
+      in.decay.assign(decay_.begin(), decay_.begin() + sn * Hv);
+    }
     {
       Section section(profiler_, "attention", profiling ? traffic::linear_recurrence(c_, n) : 0.0);
-      float* states = delta_state_[static_cast<size_t>(l)].data();
-      const int ratio = Hv / Hk;
-      pool_.parallel_for(static_cast<size_t>(Hv), [&](size_t begin, size_t end) {
-        std::vector<float> delta(static_cast<size_t>(dv));
-        for (size_t h = begin; h < end; ++h) {
-          float* S = states + h * dk * dv;  // [dk, dv]
-          const int kh = static_cast<int>(h) / ratio;
-          for (size_t t = 0; t < sn; ++t) {
-            const float* row = mixed_.data() + t * C;
-            const float* q = row + kh * dk;
-            const float* k = row + (Hk + kh) * dk;
-            const float* v = row + 2 * Hk * dk + h * dv;
-            const float decay = decay_[t * Hv + h], beta = beta_[t * Hv + h];
-            // S *= decay, and delta = (v - S^T k) * beta.
-            std::fill(delta.begin(), delta.end(), 0.0f);
-            for (int i = 0; i < dk; ++i) {
-              float* Si = S + static_cast<size_t>(i) * dv;
-              const float ki = k[i];
-              for (int j = 0; j < dv; ++j) {
-                Si[j] *= decay;
-                delta[static_cast<size_t>(j)] += Si[j] * ki;
-              }
-            }
-            for (int j = 0; j < dv; ++j) delta[static_cast<size_t>(j)] = (v[j] - delta[static_cast<size_t>(j)]) * beta;
-            // S += k delta^T, and the output S^T q.
-            float* out = linear_out_.data() + (t * Hv + h) * dv;
-            std::fill(out, out + dv, 0.0f);
-            for (int i = 0; i < dk; ++i) {
-              float* Si = S + static_cast<size_t>(i) * dv;
-              const float ki = k[i], qi = q[i];
-              for (int j = 0; j < dv; ++j) {
-                Si[j] += ki * delta[static_cast<size_t>(j)];
-                out[j] += Si[j] * qi;
-              }
-            }
-          }
-        }
-      });
+      recur(delta_state_[static_cast<size_t>(l)].data(), mixed_.data(), beta_.data(), decay_.data(), sn,
+            linear_out_.data());
     }
     Section section(profiler_, "o_proj", profiling ? traffic::linear_out(c_, L, n) : 0.0);
     // The gated norm per value head: rms(o) * w * silu(z), with a plain weight.
@@ -2193,6 +2221,66 @@ class DecoderCpu final : public Model {
       for (int j = 0; j < dv; ++j) o[j] *= silu(z[j]);
     }
     matmul(L.out_proj, linear_out_.data(), n, r_.data(), pool_);
+  }
+
+  // The gated delta rule over `count` tokens' rows (q, k, v; C channels each,
+  // q and k normed), betas and decays, from and into `states`
+  // [v_heads, dk, dv]; each token's output S^T q goes to `out` unless null.
+  void recur(float* states, const float* rows, const float* beta, const float* decay_in, size_t count,
+             float* out_rows) {
+    const int Hk = c_.linear_k_heads, Hv = c_.linear_v_heads, dk = c_.linear_k_dim, dv = c_.linear_v_dim;
+    const size_t C = static_cast<size_t>(c_.linear_channels());
+    const int ratio = Hv / Hk;
+    pool_.parallel_for(static_cast<size_t>(Hv), [&](size_t begin, size_t end) {
+      std::vector<float> delta(static_cast<size_t>(dv));
+      for (size_t h = begin; h < end; ++h) {
+        float* S = states + h * dk * dv;  // [dk, dv]
+        const int kh = static_cast<int>(h) / ratio;
+        for (size_t t = 0; t < count; ++t) {
+          const float* row = rows + t * C;
+          const float* q = row + kh * dk;
+          const float* k = row + (Hk + kh) * dk;
+          const float* v = row + 2 * Hk * dk + h * dv;
+          const float decay = decay_in[t * Hv + h], b = beta[t * Hv + h];
+          // S *= decay, and delta = (v - S^T k) * beta.
+          std::fill(delta.begin(), delta.end(), 0.0f);
+          for (int i = 0; i < dk; ++i) {
+            float* Si = S + static_cast<size_t>(i) * dv;
+            const float ki = k[i];
+            for (int j = 0; j < dv; ++j) {
+              Si[j] *= decay;
+              delta[static_cast<size_t>(j)] += Si[j] * ki;
+            }
+          }
+          for (int j = 0; j < dv; ++j) delta[static_cast<size_t>(j)] = (v[j] - delta[static_cast<size_t>(j)]) * b;
+          // S += k delta^T, and the output S^T q.
+          float* out = out_rows != nullptr ? out_rows + (t * Hv + h) * dv : nullptr;
+          if (out != nullptr) std::fill(out, out + dv, 0.0f);
+          for (int i = 0; i < dk; ++i) {
+            float* Si = S + static_cast<size_t>(i) * dv;
+            const float ki = k[i], qi = q[i];
+            for (int j = 0; j < dv; ++j) {
+              Si[j] += ki * delta[static_cast<size_t>(j)];
+              if (out != nullptr) out[j] += Si[j] * qi;
+            }
+          }
+        }
+      }
+    });
+  }
+
+  // Layer l's conv history and state after the first `kept` tokens of the
+  // last verify: the snapshot, then those tokens' recorded inputs.
+  void replay_linear(int l, int kept) {
+    const size_t C = static_cast<size_t>(c_.linear_channels());
+    const size_t history = static_cast<size_t>(c_.linear_conv - 1) * C;
+    const LinearInputs& in = verify_inputs_[static_cast<size_t>(l)];
+    std::vector<float> stream(conv_snapshot_[static_cast<size_t>(l)]);
+    stream.insert(stream.end(), in.raw.begin(), in.raw.begin() + static_cast<std::ptrdiff_t>(kept * C));
+    std::copy(stream.end() - static_cast<std::ptrdiff_t>(history), stream.end(), conv_state_[static_cast<size_t>(l)].begin());
+    std::vector<float>& state = delta_state_[static_cast<size_t>(l)];
+    state = delta_snapshot_[static_cast<size_t>(l)];
+    recur(state.data(), in.rows.data(), in.beta.data(), in.decay.data(), static_cast<size_t>(kept), nullptr);
   }
 
   // gate[i] = act(gate[i]) * up[i]
@@ -2544,6 +2632,16 @@ class DecoderCpu final : public Model {
   // z, beta and decay; the conv's padded input; Qwen3-Next's grouped
   // projections; the recurrence's outputs [n, Hv * dv].
   std::vector<std::vector<float>> conv_state_, delta_state_;
+  // Speculative decoding: the last verify pass, the recurrent states before
+  // it, and each Gated DeltaNet layer's inputs during it.
+  struct LinearInputs {
+    std::vector<float> raw, rows, beta, decay;  // the conv's inputs; normed q, k, v; betas; decays
+  };
+  bool verifying_ = false;
+  int verify_start_ = 0, verify_n_ = 0;
+  std::vector<std::vector<float>> conv_snapshot_, delta_snapshot_;
+  std::vector<LinearInputs> verify_inputs_;
+  std::vector<float> all_logits_;
   std::vector<float> mixed_, z_, beta_, decay_, conv_in_, grouped_, grouped_ba_, linear_out_;
 };
 

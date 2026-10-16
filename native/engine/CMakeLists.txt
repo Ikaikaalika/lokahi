@@ -30,6 +30,7 @@ set(LOKAHI_CORE_SOURCES
   src/regex.cpp
   src/safetensors.cpp
   src/sampling.cpp
+  src/speculation.cpp
   src/siglip.cpp
   src/service.cpp
   src/text_stream.cpp

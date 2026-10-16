@@ -118,12 +118,24 @@ int32_t argmax(const float* values, int count) {
   return best;
 }
 
+const float* Model::verify(const int32_t*, int) {
+  throw Error(std::string(backend()) + ": speculative decoding is not supported on this backend");
+}
+
+void Model::accept(int) {
+  throw Error(std::string(backend()) + ": speculative decoding is not supported on this backend");
+}
+
 std::vector<int32_t> Model::generate(const std::vector<int32_t>& prompt, int max_new,
                                      const SamplingParams& sampling, bool stop_at_eos, GenerationTiming* timing,
                                      const TokenCallback& on_token) {
   std::vector<int32_t> out;
   if (max_new <= 0) return out;
   validate_sampling(sampling);
+  speculation_stats_ = {};
+  if (speculation_.max_draft > 0 && sampling.greedy() && can_verify()) {
+    return generate_speculative(prompt, max_new, sampling, stop_at_eos, timing, on_token);
+  }
   const auto& eos = eos_token_ids();
   auto pick = [&](const float* logits) {
     return sample_token(logits, vocab_size(), sampling, static_cast<int>(out.size()));
@@ -143,6 +155,65 @@ std::vector<int32_t> Model::generate(const std::vector<int32_t>& prompt, int max
     out.push_back(token);
     if (timing) timing->token_times.push_back(now_seconds());
     keep_going = !on_token || on_token(token);
+  }
+  if (timing) timing->decode_seconds = timing->token_times.back() - first;
+  return out;
+}
+
+std::vector<int32_t> Model::generate_speculative(const std::vector<int32_t>& prompt, int max_new,
+                                                 const SamplingParams& sampling, bool stop_at_eos,
+                                                 GenerationTiming* timing, const TokenCallback& on_token) {
+  std::vector<int32_t> out;
+  const auto& eos = eos_token_ids();
+  const int vocab = vocab_size();
+  auto pick = [&](const float* logits) { return sample_token(logits, vocab, sampling, static_cast<int>(out.size())); };
+  PromptLookupDrafter drafter(speculation_.reference);
+  std::vector<int32_t> context = prompt;
+  bool keep_going = true;
+  // Emits one generated token; false once generation must stop after it.
+  auto emit = [&](int32_t token) {
+    out.push_back(token);
+    context.push_back(token);
+    if (timing) timing->token_times.push_back(now_seconds());
+    keep_going = !on_token || on_token(token);
+    const bool stop = stop_at_eos && std::find(eos.begin(), eos.end(), token) != eos.end();
+    return keep_going && !stop && static_cast<int>(out.size()) < max_new;
+  };
+  const double start = now_seconds();
+  if (timing) timing->token_times.clear();
+  int32_t token = pick(prefill(prompt.data(), static_cast<int>(prompt.size())));
+  const double first = now_seconds();
+  bool more = emit(token);
+  if (timing) {
+    timing->prefill_seconds = first - start;
+    timing->token_times = {first};
+  }
+  while (more) {
+    // A pass yields up to one token beyond its drafts, so it drafts at most
+    // the tokens still wanted minus one.
+    const int room = std::min(speculation_.max_draft, max_new - static_cast<int>(out.size()) - 1);
+    const std::vector<int32_t> draft = drafter.propose(context, room);
+    if (draft.empty()) {
+      token = pick(decode(token));
+      more = emit(token);
+      continue;
+    }
+    std::vector<int32_t> inputs = {token};
+    inputs.insert(inputs.end(), draft.begin(), draft.end());
+    const float* logits = verify(inputs.data(), static_cast<int>(inputs.size()));
+    ++speculation_stats_.passes;
+    speculation_stats_.drafted += static_cast<int>(draft.size());
+    // Row i's greedy choice follows inputs[i]; while it equals the next
+    // draft, that draft's keys and values (and states) stand.
+    int kept = 1;
+    for (size_t i = 0; i < inputs.size(); ++i) {
+      token = pick(logits + i * static_cast<size_t>(vocab));
+      more = emit(token);
+      if (!more || i == draft.size() || token != draft[i]) break;
+      ++kept;
+      ++speculation_stats_.accepted;
+    }
+    accept(kept);
   }
   if (timing) timing->decode_seconds = timing->token_times.back() - first;
   return out;

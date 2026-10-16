@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "sampling.h"
+#include "speculation.h"
 
 namespace lokahi {
 
@@ -140,6 +141,20 @@ class Model {
   void inject(PromptInjection injection);
   virtual const float* decode(int32_t token) = 0;
 
+  // Speculative decoding. verify appends n tokens at the current position, as
+  // prefill does, and returns every row's logits ([n, vocab_size]); accept
+  // then keeps the first `kept` (1 to n) of them and rolls the rest back,
+  // recurrent states included. Backends that cannot roll back say so here,
+  // and generate decodes one token at a time instead.
+  virtual bool can_verify() const { return false; }
+  virtual const float* verify(const int32_t* tokens, int n);
+  virtual void accept(int kept);
+
+  // Greedy generation drafts up to options.max_draft tokens per verify pass
+  // (speculation.h); other sampling decodes one token at a time.
+  void set_speculation(SpeculationOptions options) { speculation_ = std::move(options); }
+  const SpeculationStats& speculation_stats() const { return speculation_stats_; }
+
   // Called with each generated token as it becomes available on the host;
   // returning false stops generation after that token.
   using TokenCallback = std::function<bool(int32_t)>;
@@ -159,8 +174,15 @@ class Model {
  protected:
   virtual bool accepts_injection() const { return false; }
 
+  // The speculative loop behind generate, for greedy sampling.
+  std::vector<int32_t> generate_speculative(const std::vector<int32_t>& prompt, int max_new,
+                                            const SamplingParams& sampling, bool stop_at_eos,
+                                            GenerationTiming* timing, const TokenCallback& on_token);
+
   Profiler* profiler_ = nullptr;
   PromptInjection injection_;  // pending for the next prefill
+  SpeculationOptions speculation_;
+  SpeculationStats speculation_stats_;
 };
 
 int32_t argmax(const float* values, int count);
