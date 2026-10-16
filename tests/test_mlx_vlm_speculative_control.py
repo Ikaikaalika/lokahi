@@ -2,8 +2,11 @@
 
 Correctness only: the fixture's timings are not evidence. Plain and MTP
 greedy runs must produce the oracle's tokens, and the MTP run must count
-its own rounds. Needs ``mlx`` and an ``mlx_vlm`` with the ``qwen3_5_mtp``
-drafter, like ``test_mlx_vlm_mtp_crosscheck.py``.
+its own rounds. The fixture stores BF16 norms and scales, and on a GPU BF16
+greedy decoding parts from the oracle's at near ties of its random logits,
+so the test runs MLX in float32, as the cross-checks do. Needs ``mlx`` and an
+``mlx_vlm`` with the ``qwen3_5_mtp`` drafter, like
+``test_mlx_vlm_mtp_crosscheck.py``.
 """
 from __future__ import annotations
 
@@ -25,6 +28,13 @@ def _has_drafter() -> bool:
 pytestmark = pytest.mark.skipif(not _has_drafter(), reason="mlx and an mlx_vlm with the qwen3_5_mtp drafter")
 
 
+def _float32(module) -> None:
+    import mlx.core as mx
+    from mlx.utils import tree_map
+
+    module.update(tree_map(lambda x: x.astype(mx.float32) if x.dtype == mx.bfloat16 else x, module.parameters()))
+
+
 def test_the_control_decodes_greedily_with_and_without_the_head(tmp_path):
     from benchmarks.benchmark_mlx_vlm_speculative import bench, load_control
 
@@ -33,6 +43,8 @@ def test_the_control_decodes_greedily_with_and_without_the_head(tmp_path):
     prompt = [2, 5, 9, 33, 100, 7]
     expected = Qwen35Reference.load(model_dir).greedy(prompt, 12)
     model, processor, draft_model, kind = load_control(model_dir, drafter)
+    _float32(model)
+    _float32(draft_model)
     plain = bench(model, processor, prompt, 12, 1, 2)
     assert [run["token_ids"] for run in plain["repetitions"]] == [expected, expected]
     assert plain["matches_plain_greedy"] is None and "speculation" not in plain["repetitions"][0]
