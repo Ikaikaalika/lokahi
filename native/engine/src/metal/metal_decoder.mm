@@ -215,6 +215,7 @@ struct GdnConvParams { int channels; int taps; int n; };
 struct GdnNormParams { int key_heads; int key_dim; int channels; float q_scale; };
 struct GdnGateParams { int value_heads; int count; };
 struct GdnRecurrenceParams { int key_heads; int value_heads; int key_dim; int value_dim; int channels; int n; };
+struct GdnHistoryParams { int channels; int taps; int kept; };
 struct SplitGateParams { int head_dim; int count; };
 struct SigmoidScaleParams { int cols; int count; };
 struct MoeGroupedParams { int experts; int k; int groups; int topk_groups; int norm_topk; float scaling; int exclude; };
@@ -283,12 +284,15 @@ class DecoderMetal final : public Model {
     position_ = 0;
     rope_offset_ = 0;
     injection_ = {};
+    verify_n_ = 0;
+    parity_ = 0;
     zero_states();
   }
 
   const float* prefill(const int32_t* tokens, int n) override {
     @autoreleasepool {
       drain();
+      verify_n_ = 0;
       run_prefill(tokens, n);
       return static_cast<const float*>([logits_ contents]);
     }
@@ -297,6 +301,7 @@ class DecoderMetal final : public Model {
   const float* decode(int32_t token) override {
     @autoreleasepool {
       drain();
+      verify_n_ = 0;
       LK_CHECK(token >= 0 && token < c_.vocab_size, "token id out of range");
       LK_CHECK(position_ + 1 <= max_context_, "context length exceeded");
       static_cast<int32_t*>([token_ contents])[0] = token;
@@ -306,6 +311,78 @@ class DecoderMetal final : public Model {
       position_ += 1;
       return static_cast<const float*>([logits_ contents]);
     }
+  }
+
+  bool can_verify() const override { return true; }
+
+  // One pass over the tokens with every row's logits. Keys and values rewind
+  // by position. The pass reads each Gated DeltaNet layer's buffers for the
+  // current position and writes the other ones, which then hold the
+  // position after the pass, as a prefill's would; the state before it
+  // survives, with the pass's conv inputs and recurrence inputs recorded,
+  // for accept.
+  const float* verify(const int32_t* tokens, int n) override {
+    @autoreleasepool {
+      drain();
+      verify_n_ = 0;
+      LK_CHECK(n > 0 && n <= chunk_, "verify takes 1 to prefill_chunk tokens");
+      LK_CHECK(injection_.empty(), "verify cannot take an injection");
+      LK_CHECK(position_ + n <= max_context_, "context length exceeded");
+      for (int i = 0; i < n; ++i) LK_CHECK(tokens[i] >= 0 && tokens[i] < c_.vocab_size, "token id out of range");
+      reserve_verify(n);
+      std::memcpy([prompt_ contents], tokens, sizeof(int32_t) * static_cast<size_t>(n));
+      struct Clear {
+        bool& flag;
+        ~Clear() { flag = false; }
+      } clear{verifying_};
+      verifying_ = true;
+      active_cb_ = [queue_ commandBuffer];
+      id<MTLComputeCommandEncoder> enc = [active_cb_ computeCommandEncoder];
+      encode_forward(enc, prompt_, 0, n, position_, false, 0);
+      // The last layer's residual leaves every row final-normed in h_.
+      encode_qmm(enc, lm_head_, h_, n, verify_logits_);
+      if (c_.final_logit_softcapping > 0.0f) {
+        [enc setComputePipelineState:pipeline("softcap")];
+        bind(enc, verify_logits_, 0, 0);
+        bytes(enc, c_.final_logit_softcapping, 1);
+        bytes(enc, ElementwiseParams{n * c_.vocab_size}, 2);
+        encode_elementwise(enc, n * c_.vocab_size);
+      }
+      section(enc, "lm_head", profiler_ != nullptr ? traffic::linear(w_->lm_head, n) : 0.0);
+      [enc endEncoding];
+      id<MTLCommandBuffer> cb = active_cb_;
+      [cb commit];
+      wait(cb);
+      verify_read_ = state_buffer(position_);
+      verify_start_ = position_;
+      verify_n_ = n;
+      position_ += n;
+      parity_ = static_cast<int>((1 - verify_read_ + static_cast<size_t>(position_)) % 2);
+      return static_cast<const float*>([verify_logits_ contents]);
+    }
+  }
+
+  // Keeps the first `kept` tokens of the last verify. When it rejects some,
+  // each Gated DeltaNet layer's written buffers are rebuilt from the ones the
+  // pass read and the kept tokens' recorded inputs, and then hold the kept
+  // position's state.
+  void accept(int kept) override {
+    LK_CHECK(verify_n_ > 0 && kept >= 1 && kept <= verify_n_, "accept needs 1 to n tokens of the last verify");
+    const int n = verify_n_;
+    verify_n_ = 0;
+    const size_t read = verify_read_, written = 1 - read;
+    if (kept < n && c_.has_linear()) {
+      @autoreleasepool {
+        id<MTLCommandBuffer> cb = [queue_ commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+        encode_replay(enc, kept, read, written);
+        [enc endEncoding];
+        [cb commit];
+        wait(cb);
+      }
+    }
+    position_ = verify_start_ + kept;
+    parity_ = static_cast<int>((written + static_cast<size_t>(position_)) % 2);
   }
 
   std::vector<int32_t> generate(const std::vector<int32_t>& prompt, int max_new, const SamplingParams& sampling,
@@ -323,6 +400,13 @@ class DecoderMetal final : public Model {
       sampling_ = sampling;
       const int prompt_len = static_cast<int>(prompt.size());
       LK_CHECK(position_ + prompt_len + max_new - 1 <= max_context_, "context length exceeded");
+      verify_n_ = 0;
+      speculation_stats_ = {};
+      // Greedy generation with speculation verifies drafts; it waits for each
+      // pass instead of pipelining steps.
+      if (speculation_.max_draft > 0 && sampling.greedy()) {
+        return generate_speculative(prompt, max_new, sampling, stop_at_eos, timing, on_token);
+      }
       const auto& eos = c_.eos_token_ids;
       auto is_eos = [&](int32_t t) { return std::find(eos.begin(), eos.end(), t) != eos.end(); };
       const int32_t* history = static_cast<const int32_t*>([history_ contents]);
@@ -1045,15 +1129,24 @@ class DecoderMetal final : public Model {
         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   }
 
-  // The conv (history from parity start % 2 to (start + n) % 2) and SiLU, the
-  // q/k L2 norms, and beta and the decay.
+  // The buffer of each Gated DeltaNet pair holding the conv history and
+  // state at position p.
+  size_t state_buffer(int p) const { return static_cast<size_t>((p + parity_) % 2); }
+  // The buffer a pass from `start` writes: the one for its end position, or
+  // during a verify pass always the other one.
+  size_t written_buffer(int start, int n) const {
+    return verifying_ ? 1 - state_buffer(start) : state_buffer(start + n);
+  }
+
+  // The conv (history from the start position's buffer to the written one)
+  // and SiLU, the q/k L2 norms, and beta and the decay.
   void encode_gdn_conv(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n, int start) {
     const int channels = c_.linear_channels();
     [enc setComputePipelineState:pipeline("gdn_conv")];
     bind(enc, mixed_, 0, 0);
     bind(enc, G.conv_taps, 1);
-    bind(enc, G.conv_history[static_cast<size_t>(start % 2)], 0, 2);
-    bind(enc, G.conv_history[static_cast<size_t>((start + n) % 2)], 0, 3);
+    bind(enc, G.conv_history[state_buffer(start)], 0, 2);
+    bind(enc, G.conv_history[written_buffer(start, n)], 0, 3);
     bytes(enc, GdnConvParams{channels, c_.linear_conv, n}, 4);
     encode_elementwise(enc, channels);
     [enc setComputePipelineState:pipeline("gdn_qk_norm")];
@@ -1074,12 +1167,20 @@ class DecoderMetal final : public Model {
   }
 
   void encode_gdn_recurrence(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n, int start) {
+    encode_delta_rule(enc, mixed_, lin_b_, lin_a_, G.delta_state[state_buffer(start)],
+                      G.delta_state[written_buffer(start, n)], n);
+  }
+
+  // The gated delta rule over n tokens' rows (q, k, v; normed), betas and
+  // decays, from state_in into state_out; the outputs go to lin_out_.
+  void encode_delta_rule(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> rows, id<MTLBuffer> beta,
+                         id<MTLBuffer> decay, id<MTLBuffer> state_in, id<MTLBuffer> state_out, int n) {
     [enc setComputePipelineState:pipeline("gdn_recurrence")];
-    bind(enc, mixed_, 0, 0);
-    bind(enc, lin_b_, 0, 1);
-    bind(enc, lin_a_, 0, 2);
-    bind(enc, G.delta_state[static_cast<size_t>(start % 2)], 0, 3);
-    bind(enc, G.delta_state[static_cast<size_t>((start + n) % 2)], 0, 4);
+    bind(enc, rows, 0, 0);
+    bind(enc, beta, 0, 1);
+    bind(enc, decay, 0, 2);
+    bind(enc, state_in, 0, 3);
+    bind(enc, state_out, 0, 4);
     bind(enc, lin_out_, 0, 5);
     bytes(enc, GdnRecurrenceParams{c_.linear_k_heads, c_.linear_v_heads, c_.linear_k_dim, c_.linear_v_dim,
                                    c_.linear_channels(), n},
@@ -1087,6 +1188,54 @@ class DecoderMetal final : public Model {
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((c_.linear_v_dim + 3) / 4),
                                           static_cast<NSUInteger>(c_.linear_v_heads), 1)
         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+  }
+
+  // dst[0, count) = src[0, count).
+  void encode_copy(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> src, id<MTLBuffer> dst, int count) {
+    [enc setComputePipelineState:pipeline("copy_floats")];
+    bind(enc, src, 0, 0);
+    bind(enc, dst, 0, 1);
+    bytes(enc, ElementwiseParams{count}, 2);
+    encode_elementwise(enc, count);
+  }
+
+  // Each Gated DeltaNet layer's conv history and state after the first
+  // `kept` tokens of the last verify, from the buffers it read into the ones
+  // it wrote.
+  void encode_replay(id<MTLComputeCommandEncoder> enc, int kept, size_t read, size_t written) {
+    const int channels = c_.linear_channels(), history = c_.linear_conv - 1;
+    for (size_t l = 0; l < layers_.size(); ++l) {
+      const GpuLayer& G = layers_[l];
+      if (!G.linear) continue;
+      const VerifyRecord& record = records_[l];
+      if (history > 0) {
+        [enc setComputePipelineState:pipeline("gdn_history_replay")];
+        bind(enc, G.conv_history[read], 0, 0);
+        bind(enc, record.raw, 0, 1);
+        bind(enc, G.conv_history[written], 0, 2);
+        bytes(enc, GdnHistoryParams{channels, c_.linear_conv, kept}, 3);
+        [enc dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(channels), static_cast<NSUInteger>(history), 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      }
+      encode_delta_rule(enc, record.rows, record.beta, record.decay, G.delta_state[read], G.delta_state[written],
+                        kept);
+    }
+  }
+
+  // Room for a verify pass of n tokens: every row's logits, and each Gated
+  // DeltaNet layer's records.
+  void reserve_verify(int n) {
+    if (n <= verify_capacity_) return;
+    const size_t f = sizeof(float), rows = static_cast<size_t>(n);
+    verify_logits_ = shared_buffer(rows * static_cast<size_t>(c_.vocab_size) * f);
+    records_.assign(layers_.size(), {});
+    for (size_t l = 0; l < layers_.size(); ++l) {
+      if (!layers_[l].linear) continue;
+      const size_t channels = rows * static_cast<size_t>(c_.linear_channels()) * f;
+      const size_t gates = rows * static_cast<size_t>(c_.linear_v_heads) * f;
+      records_[l] = {private_buffer(channels), private_buffer(channels), private_buffer(gates), private_buffer(gates)};
+    }
+    verify_capacity_ = n;
   }
 
   // The gated norm per value head, then out_proj into r_.
@@ -1552,10 +1701,24 @@ class DecoderMetal final : public Model {
       if (G.linear) {
         encode_gdn_projections(enc, G, n);
         section(enc, "qkv", profiling ? traffic::linear_projections(L, n) : 0.0);
+        // A verify pass records its conv inputs, then its recurrence's
+        // inputs, for accept (each copy read and written once).
+        const int channels = c_.linear_channels(), gates = n * c_.linear_v_heads;
+        const VerifyRecord* record = verifying_ ? &records_[l] : nullptr;
+        if (record != nullptr) encode_copy(enc, mixed_, record->raw, n * channels);
         encode_gdn_conv(enc, G, n, start);
-        section(enc, "rope_kv", profiling ? traffic::linear_conv(c_, n) : 0.0);
+        section(enc, "rope_kv",
+                profiling ? traffic::linear_conv(c_, n) + (record ? traffic::rows(channels, n, 2) : 0.0) : 0.0);
+        if (record != nullptr) {
+          encode_copy(enc, mixed_, record->rows, n * channels);
+          encode_copy(enc, lin_b_, record->beta, gates);
+          encode_copy(enc, lin_a_, record->decay, gates);
+        }
         encode_gdn_recurrence(enc, G, n, start);
-        section(enc, "attention", profiling ? traffic::linear_recurrence(c_, n) : 0.0);
+        section(enc, "attention",
+                profiling ? traffic::linear_recurrence(c_, n) +
+                                (record ? traffic::rows(channels, n, 2) + traffic::rows(c_.linear_v_heads, n, 4) : 0.0)
+                          : 0.0);
         encode_gdn_out(enc, G, n);
         section(enc, "o_proj", profiling ? traffic::linear_out(c_, L, n) : 0.0);
       } else if (c_.mla()) {
@@ -1823,6 +1986,21 @@ class DecoderMetal final : public Model {
   id<MTLCommandBuffer> active_cb_ = nil;
   // How the final step picks a token; greedy outside generate().
   SamplingParams sampling_;
+  // Speculative decoding. Each Gated DeltaNet pair holds position p's conv
+  // history and state in buffer (p + parity_) % 2; verify and accept set the
+  // parity so that the buffers a verify pass wrote hold the current
+  // position's.
+  int parity_ = 0;
+  bool verifying_ = false;  // encode_forward is encoding a verify pass
+  int verify_start_ = 0, verify_n_ = 0, verify_capacity_ = 0;
+  size_t verify_read_ = 0;  // the buffer of each pair the last verify read
+  id<MTLBuffer> verify_logits_ = nil;  // [verify capacity, vocab]
+  // Per Gated DeltaNet layer, the last verify's conv inputs and its
+  // recurrence's rows [capacity, channels], betas and decays [capacity, Hv].
+  struct VerifyRecord {
+    id<MTLBuffer> raw = nil, rows = nil, beta = nil, decay = nil;
+  };
+  std::vector<VerifyRecord> records_;
 };
 
 }  // namespace
