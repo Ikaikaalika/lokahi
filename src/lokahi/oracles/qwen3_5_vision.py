@@ -1,8 +1,8 @@
-"""NumPy reference for Qwen3.5's image path: processor, vision tower, merger, M-RoPE positions.
+"""NumPy reference for Qwen3.5's and Qwen3-VL's image path: processor, tower, mergers, M-RoPE positions.
 
 Semantics follow Transformers' ``Qwen2VLImageProcessorFast`` (as
-``Qwen3VLProcessor`` uses it), ``Qwen3_5VisionModel`` (Qwen3-VL's tower
-without deepstack) and ``Qwen3_5Model.get_rope_index``:
+``Qwen3VLProcessor`` uses it), ``Qwen3VLVisionModel`` (which
+``Qwen3_5VisionModel`` is without deepstack) and ``get_rope_index``:
 
 * the processor resizes an image (the caller does, to ``target_size``) so
   both sides are multiples of ``patch_size * spatial_merge_size`` and its
@@ -24,6 +24,10 @@ without deepstack) and ``Qwen3_5Model.get_rope_index``:
 * the merger LayerNorms each patch, concatenates each block's ``merge^2``
   patches and applies ``fc2(gelu(fc1(.)))`` (exact GELU) into the text width;
   merged tokens follow the merged grid row by row;
+* Qwen3-VL's deepstack: after each block in ``deepstack_visual_indexes``, a
+  merger of its own (which LayerNorms the concatenated square instead of each
+  patch) gives one more feature row per token; the text model adds the i-th
+  of them to its hidden states at the image's tokens after its i-th layer;
 * in the prompt, image tokens take M-RoPE positions ``(s, s + row, s + col)``
   over the merged grid, ``s`` being the text position where the image
   starts; text after the image continues at ``s + max(rows, cols)``, and
@@ -61,12 +65,11 @@ class Qwen35VisionConfig:
     vision_end_token_id: int
     min_pixels: int = 65536
     max_pixels: int = 16777216
+    deepstack_visual_indexes: tuple[int, ...] = ()
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any], processor: Mapping[str, Any] | None = None) -> "Qwen35VisionConfig":
         v = raw["vision_config"]
-        if v.get("deepstack_visual_indexes"):
-            raise NotImplementedError("deepstack visual features")
         if v.get("hidden_act", "gelu_pytorch_tanh") != "gelu_pytorch_tanh":
             raise NotImplementedError(f"vision activation {v.get('hidden_act')!r}")
         size = (processor or {}).get("size") or {}
@@ -86,6 +89,7 @@ class Qwen35VisionConfig:
             vision_end_token_id=int(raw["vision_end_token_id"]),
             min_pixels=int(size.get("shortest_edge", 65536)),
             max_pixels=int(size.get("longest_edge", 16777216)),
+            deepstack_visual_indexes=tuple(int(i) for i in v.get("deepstack_visual_indexes") or ()),
         )
 
     @property
@@ -258,14 +262,31 @@ class Qwen35VisionReference:
         rotated = np.concatenate([-x[..., half:], x[..., :half]], axis=-1)
         return x * cos + rotated * sin
 
+    def _merge(self, name: str, x: np.ndarray, postshuffle: bool) -> np.ndarray:
+        """A merger: LayerNorm (per patch, or per concatenated square), then ``fc2(gelu(fc1))``."""
+
+        square = self.config.spatial_merge_size**2
+        if postshuffle:
+            h = _layer_norm(x.reshape(-1, x.shape[1] * square), self.w[f"{name}.norm"], self.w[f"{name}.norm.bias"])
+        else:
+            h = _layer_norm(x, self.w[f"{name}.norm"], self.w[f"{name}.norm.bias"]).reshape(-1, x.shape[1] * square)
+        h = _gelu(h @ self.w[f"{name}.linear_fc1"].T + self.w[f"{name}.linear_fc1.bias"])
+        return (h @ self.w[f"{name}.linear_fc2"].T + self.w[f"{name}.linear_fc2.bias"]).astype(np.float32)
+
     def encode(self, rgb: np.ndarray) -> np.ndarray:
         """An RGB8 image ``[H, W, 3]`` at an accepted size to features ``[tokens, text_hidden]``."""
+
+        return self.encode_all(rgb)[0]
+
+    def encode_all(self, rgb: np.ndarray) -> tuple[np.ndarray, list[np.ndarray]]:
+        """The features and the deepstack features (one ``[tokens, text_hidden]`` per index)."""
 
         cfg, t = self.config, self.tower
         rows, cols = cfg.grid(*rgb.shape[:2])
         x = patchify(rgb, cfg) @ self._patch_weight().T + self.w[f"{t}.patch_embed.proj.bias"]
         x = (x + self._position_embeddings(rows, cols)).astype(np.float32)
         n, heads, dim = x.shape[0], cfg.num_heads, cfg.head_dim
+        deepstack: list[np.ndarray] = []
         for index in range(cfg.depth):
             block = f"{t}.blocks.{index}"
             h = _layer_norm(x, self.w[f"{block}.norm1"], self.w[f"{block}.norm1.bias"])
@@ -282,11 +303,10 @@ class Qwen35VisionReference:
             h = _layer_norm(x, self.w[f"{block}.norm2"], self.w[f"{block}.norm2.bias"])
             h = _gelu_tanh(h @ self.w[f"{block}.mlp.linear_fc1"].T + self.w[f"{block}.mlp.linear_fc1.bias"])
             x = (x + h @ self.w[f"{block}.mlp.linear_fc2"].T + self.w[f"{block}.mlp.linear_fc2.bias"]).astype(np.float32)
-        merger = f"{t}.merger"
-        h = _layer_norm(x, self.w[f"{merger}.norm"], self.w[f"{merger}.norm.bias"])
-        h = h.reshape(n // cfg.spatial_merge_size**2, -1)
-        h = _gelu(h @ self.w[f"{merger}.linear_fc1"].T + self.w[f"{merger}.linear_fc1.bias"])
-        return (h @ self.w[f"{merger}.linear_fc2"].T + self.w[f"{merger}.linear_fc2.bias"]).astype(np.float32)
+            if index in cfg.deepstack_visual_indexes:
+                which = cfg.deepstack_visual_indexes.index(index)
+                deepstack.append(self._merge(f"{t}.deepstack_merger_list.{which}", x, postshuffle=True))
+        return self._merge(f"{t}.merger", x, postshuffle=False), deepstack
 
     def merged_grid(self, rgb: np.ndarray) -> tuple[int, int]:
         rows, cols = self.config.grid(*rgb.shape[:2])
@@ -294,33 +314,44 @@ class Qwen35VisionReference:
         return rows // m, cols // m
 
     def _inputs(self, token_ids: Sequence[int], images: Sequence[np.ndarray]):
+        """The injected rows, M-RoPE positions, later tokens' delta, and per-layer deepstack rows."""
+
         cfg = self.config
         grids = [self.merged_grid(image) for image in images]
         positions, delta = rope_positions(token_ids, grids, cfg.image_token_id)
         runs = [i for i, token in enumerate(token_ids) if token == cfg.image_token_id]
         injected, at = {}, 0
+        deepstack: list[dict[int, np.ndarray]] = [{} for _ in cfg.deepstack_visual_indexes]
         for image in images:
-            features = self.encode(image)
-            injected.update(zip(runs[at : at + features.shape[0]], features))
+            features, layers = self.encode_all(image)
+            where = runs[at : at + features.shape[0]]
+            injected.update(zip(where, features))
+            for rows, extra in zip(deepstack, layers):
+                rows.update(zip(where, extra))
             at += features.shape[0]
         if at != len(runs):
             raise ValueError("image token count does not match the images")
-        return injected, positions, delta
+        return injected, positions, delta, deepstack
+
+    def _language_logits(self, tokens, injected, positions, deepstack) -> np.ndarray:
+        if deepstack:
+            return self.language.logits(tokens, injected, positions, deepstack)
+        return self.language.logits(tokens, injected, positions)
 
     def logits(self, token_ids: Sequence[int], images: Sequence[np.ndarray]) -> np.ndarray:
-        injected, positions, _ = self._inputs(token_ids, images)
-        return self.language.logits(token_ids, injected, positions)
+        injected, positions, _, deepstack = self._inputs(token_ids, images)
+        return self._language_logits(token_ids, injected, positions, deepstack)
 
     def greedy(self, prompt: Sequence[int], images: Sequence[np.ndarray], steps: int) -> list[int]:
         """Greedy continuation by full recomputation; generated tokens take positions index + delta."""
 
-        injected, positions, delta = self._inputs(prompt, images)
+        injected, positions, delta, deepstack = self._inputs(prompt, images)
         tokens = list(prompt)
         generated: list[int] = []
         for _ in range(steps):
             index = np.arange(positions.shape[1], len(tokens))
             full = np.concatenate([positions, np.broadcast_to(index + delta, (3, index.size))], axis=1)
-            next_token = int(np.argmax(self.language.logits(tokens, injected, full)[-1]))
+            next_token = int(np.argmax(self._language_logits(tokens, injected, full, deepstack)[-1]))
             generated.append(next_token)
             tokens.append(next_token)
         return generated

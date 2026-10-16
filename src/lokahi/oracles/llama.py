@@ -30,7 +30,14 @@ Semantics follow the Hugging Face ``LlamaForCausalLM``, ``MistralForCausalLM``,
   router picks experts by score plus ``e_score_correction_bias`` (within the
   best ``topk_group`` of ``n_group`` groups) but weights them by the raw
   scores, renormalized and times ``routed_scaling_factor``, plus a shared
-  expert.
+  expert;
+* Qwen3-VL's text models (Qwen 3 and Qwen 3 MoE) use interleaved M-RoPE
+  (``rope_scaling.mrope_section``): rotation frequency i reads a token's row
+  position when ``i % 3 == 1`` and ``i < 3 * section[1]``, its column
+  position when ``i % 3 == 2`` and ``i < 3 * section[2]``, and its temporal
+  one otherwise; ``logits`` takes the three positions per token, injected
+  embeddings, and deepstack rows added to the hidden states after each of
+  the first layers.
 
 Quantized MLX checkpoints are dequantized to float32 on load.
 """
@@ -78,6 +85,7 @@ class LlamaFamilyConfig:
     topk_group: int = 1
     routed_scaling_factor: float = 1.0
     n_shared_experts: int = 0
+    mrope_section: tuple[int, ...] = ()  # interleaved M-RoPE (Qwen3-VL); empty: one position per token
 
     @classmethod
     def from_dict(cls, cfg: Mapping[str, Any]) -> "LlamaFamilyConfig":
@@ -124,7 +132,16 @@ class LlamaFamilyConfig:
             topk_group=int(cfg.get("topk_group") or 1),
             routed_scaling_factor=float(cfg.get("routed_scaling_factor") or 1.0),
             n_shared_experts=int(cfg.get("n_shared_experts") or 0),
+            mrope_section=tuple(int(s) for s in (scaling or {}).get("mrope_section") or ()),
         )
+
+    def rope_axes(self) -> np.ndarray:
+        """The position axis (0 temporal, 1 row, 2 column) each rotation frequency reads."""
+
+        axes = np.zeros((self.rotary_dim or self.head_dim) // 2, dtype=np.int64)
+        for axis in (1, 2) if self.mrope_section else ():
+            axes[axis : 3 * self.mrope_section[axis] : 3] = axis
+        return axes
 
     def sliding(self, layer: int) -> bool:
         if self.model_type == "gpt_oss":
@@ -217,8 +234,11 @@ def _silu(x: np.ndarray) -> np.ndarray:
 
 
 def _rope(x: np.ndarray, positions: np.ndarray, inv_freq: np.ndarray) -> np.ndarray:
+    """``positions`` [tokens], or [tokens, frequencies] (each frequency's own position)."""
+
     half = x.shape[-1] // 2
-    angles = positions[:, None].astype(np.float64) * inv_freq[None, :]
+    positions = positions.astype(np.float64)
+    angles = (positions if positions.ndim == 2 else positions[:, None]) * inv_freq[None, :]
     cos = np.cos(angles).astype(np.float32)[:, None, :]
     sin = np.sin(angles).astype(np.float32)[:, None, :]
     x1, x2 = x[..., :half], x[..., half:]
@@ -248,6 +268,8 @@ class LlamaFamilyReference:
         return out + bias if bias is not None else out
 
     def _attention(self, index: int, x: np.ndarray, positions: np.ndarray) -> np.ndarray:
+        """``positions`` [3, tokens]: each token's temporal, row and column RoPE positions."""
+
         cfg = self.config
         prefix = f"model.layers.{index}.self_attn"
         tokens = x.shape[0]
@@ -261,11 +283,13 @@ class LlamaFamilyReference:
         inv_freq = cfg.inv_freq()
         factor = np.float32(cfg.attention_factor())
         rot = cfg.rotary_dim or dim  # partial RoPE: rotate-half within the first `rot` dimensions
-        q = np.concatenate([_rope(q[..., :rot], positions, inv_freq), q[..., rot:]], axis=-1) * factor
-        k = np.concatenate([_rope(k[..., :rot], positions, inv_freq), k[..., rot:]], axis=-1) * factor
+        angles = positions[cfg.rope_axes()].T
+        q = np.concatenate([_rope(q[..., :rot], angles, inv_freq), q[..., rot:]], axis=-1) * factor
+        k = np.concatenate([_rope(k[..., :rot], angles, inv_freq), k[..., rot:]], axis=-1) * factor
 
-        i = positions[:, None]
-        j = positions[None, :]
+        # Causal by sequence index (M-RoPE positions repeat within an image).
+        i = np.arange(tokens)[:, None]
+        j = np.arange(tokens)[None, :]
         allowed = j <= i
         if cfg.sliding(index):
             allowed &= (i - j) < cfg.sliding_window
@@ -378,17 +402,30 @@ class LlamaFamilyReference:
             out = out + gated @ self.w[f"{shared}.down_proj"].T
         return out
 
-    def logits(self, token_ids: Sequence[int]) -> np.ndarray:
-        """Return ``[len(token_ids), vocab]`` float32 logits."""
+    def logits(self, token_ids: Sequence[int], injected: Mapping[int, np.ndarray] | None = None,
+               positions: np.ndarray | None = None,
+               deepstack: Sequence[Mapping[int, np.ndarray]] = ()) -> np.ndarray:
+        """Return ``[len(token_ids), vocab]`` float32 logits.
+
+        ``injected`` replaces the embeddings at some positions (image
+        features); ``positions`` [3, tokens] gives the M-RoPE positions
+        (default: each token's index on all three axes); ``deepstack[l]``
+        adds rows to the hidden states at some positions after layer ``l``.
+        """
 
         cfg = self.config
         tokens = np.asarray(token_ids, dtype=np.int64)
-        positions = np.arange(tokens.shape[0])
-        x = self.w["model.embed_tokens"][tokens]
+        if positions is None:
+            positions = np.broadcast_to(np.arange(tokens.shape[0]), (3, tokens.shape[0]))
+        x = self.w["model.embed_tokens"][tokens].copy()
+        for position, row in (injected or {}).items():
+            x[position] = row
         for index in range(cfg.num_hidden_layers):
             prefix = f"model.layers.{index}"
             x = x + self._attention(index, self._norm(f"{prefix}.input_layernorm", x), positions)
             x = x + self._mlp(index, self._norm(f"{prefix}.post_attention_layernorm", x))
+            for position, row in (deepstack[index] if index < len(deepstack) else {}).items():
+                x[position] = x[position] + row
         x = self._norm("model.norm", x)
         return (x @ self.w["lm_head"].T).astype(np.float32)
 

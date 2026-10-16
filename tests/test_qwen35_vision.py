@@ -77,7 +77,7 @@ def test_fixture_images_and_each_rope_axis_matter(reference):
     # Guards the M-RoPE checks below: every part of the image positions moves
     # the logits well beyond the Metal tolerance (2e-2).
     images = _images()
-    injected, positions, _ = reference._inputs(PROMPT, images)
+    injected, positions, _, _ = reference._inputs(PROMPT, images)
     expected = reference.language.logits(PROMPT, injected, positions)
     scale = np.abs(expected).max()
 
@@ -173,7 +173,7 @@ def test_logits_with_images_match_oracle(native_cli, vlm, backend, chunk, tmp_pa
     )
     got = np.fromfile(out, dtype=np.float32).reshape(report["rows"], -1)
     # Decoded tokens take M-RoPE positions index + delta on every axis.
-    injected, positions, delta = oracle._inputs(PROMPT, images)
+    injected, positions, delta, _ = oracle._inputs(PROMPT, images)
     later = np.arange(len(PROMPT), len(tokens)) + delta
     full = np.concatenate([positions, np.broadcast_to(later, (3, later.size))], axis=1)
     expected = oracle.language.logits(tokens, injected, full)[len(PROMPT) - 1 :]

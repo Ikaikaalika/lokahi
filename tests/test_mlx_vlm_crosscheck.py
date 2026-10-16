@@ -1,9 +1,10 @@
-"""Correctness evidence: the Qwen3.5 vision oracle against Transformers and MLX-VLM.
+"""Correctness evidence: the Qwen3.5 and Qwen3-VL oracles against Transformers and MLX-VLM.
 
 ``Qwen35VisionReference`` is pinned to two independent implementations:
 Transformers' ``Qwen2VLImageProcessorPil`` (the NumPy backend) for the resize rule and the patch
 layout, and MLX-VLM's ``qwen3_5`` / ``qwen3_5_moe`` models for the vision
-tower, the merger, the M-RoPE positions and the full model's logits. They need
+tower, the merger, the M-RoPE positions and the full model's logits, and MLX-VLM's
+``qwen3_vl`` / ``qwen3_vl_moe`` for deepstack and the Qwen 3 text models. They need
 ``mlx``, ``mlx_vlm`` and ``transformers``: hosted macOS CI runs them on its
 virtual GPU, and ``mlx[cpu]`` runs them on Linux.
 """
@@ -134,3 +135,91 @@ def test_oracle_matches_mlx_vlm_with_an_image(tmp_path, text):
     ours, our_delta = rope_positions(prompt, [(rows, cols)], cfg.image_token_id)
     np.testing.assert_array_equal(np.array(positions)[:, 0, :], ours)
     assert int(np.array(delta).reshape(-1)[0]) == our_delta
+
+
+# ---------------------------------------------------------------------------
+# Qwen3-VL: Qwen3.5's tower with deepstack, in front of Qwen 3 or Qwen 3 MoE.
+#
+# MLX-VLM 0.4.4 runs the pieces correctly but drops deepstack when they are
+# chained: get_input_embeddings keeps the return value of mx.eval (None)
+# as the deepstack features, and Qwen3-VL-MoE's _deepstack_process returns
+# the unmodified hidden states. Its Qwen3-VL-MoE tower also swaps the two
+# GELUs (Transformers uses tanh GELU in the blocks and exact GELU in the
+# mergers, for both models). So the dense model is checked piece by piece
+# with deepstack passed in, and the MoE text model on the oracle's features.
+# ---------------------------------------------------------------------------
+
+def _qwen3_vl(tmp_path, spec):
+    import mlx.core as mx
+    from mlx_vlm.utils import load_model
+
+    from lokahi.fixtures import write_tiny_qwen3_vl
+    from lokahi.oracles import Qwen3VLReference
+
+    directory = write_tiny_qwen3_vl(tmp_path / "model", spec)
+    if not spec.mlx:  # float32 copies, as above
+        path = str(directory / "model.safetensors")
+        weights = {name: value.astype(mx.float32) if value.dtype == mx.bfloat16 else value
+                   for name, value in mx.load(path).items()}
+        mx.save_safetensors(path, weights, metadata={"format": "pt"})
+    oracle = Qwen3VLReference.load(directory)
+    model = load_model(directory)
+    model.update(_float32(model.parameters()))
+    image = _image((32, 64), 2)
+    rows, cols = oracle.merged_grid(image)
+    cfg = oracle.config
+    prompt = [2, 5, cfg.vision_start_token_id] + [cfg.image_token_id] * (rows * cols) + [cfg.vision_end_token_id,
+                                                                                        7, 9, 11, 13, 17]
+    return oracle, model, image, prompt, mx.array([[1, *cfg.grid(*image.shape[:2])]])
+
+
+def _language_logits(model, prompt, grid, features, deepstack, image_token_id):
+    import mlx.core as mx
+
+    ids = mx.array([prompt])
+    language = model.language_model
+    language._position_ids = language._rope_deltas = None
+    embeds = language.model.embed_tokens(ids)
+    embeds, mask = model.merge_input_ids_with_image_features(features, embeds, ids, image_token_id, -1)
+    out = language(ids, inputs_embeds=embeds, visual_pos_masks=mask[..., 0], deepstack_visual_embeds=deepstack,
+                   image_grid_thw=grid)
+    return np.array((out.logits if hasattr(out, "logits") else out)[0].astype(mx.float32))
+
+
+@pytest.mark.parametrize("mlx_layout", [True, False], ids=["mlx", "hf"])
+def test_qwen3_vl_matches_mlx_vlm(tmp_path, mlx_layout):
+    import mlx.core as mx
+
+    from lokahi.fixtures import TinyQwen3VLSpec
+
+    oracle, model, image, prompt, grid = _qwen3_vl(tmp_path, TinyQwen3VLSpec(mlx=mlx_layout))
+    features, deepstack = model.vision_tower(mx.array(patchify(image, oracle.config)), grid)
+    expected, expected_deepstack = oracle.encode_all(image)
+    assert len(deepstack) == len(expected_deepstack) == 2
+    for got, want in zip([features, *deepstack], [expected, *expected_deepstack]):
+        np.testing.assert_allclose(np.array(got), want, rtol=0, atol=1e-5 * np.abs(want).max())
+
+    logits = _language_logits(model, prompt, grid, features, deepstack, oracle.config.image_token_id)
+    expected = oracle.logits(prompt, [image])
+    np.testing.assert_allclose(logits, expected, rtol=0, atol=2e-3 * np.abs(expected).max())
+    np.testing.assert_array_equal(logits.argmax(axis=1), expected.argmax(axis=1))
+    positions, delta = model.language_model.get_rope_index(mx.array([prompt]), grid)
+    rows, cols = oracle.merged_grid(image)
+    ours, our_delta = rope_positions(prompt, [(rows, cols)], oracle.config.image_token_id)
+    np.testing.assert_array_equal(np.array(positions)[:, 0, :], ours)
+    assert int(np.array(delta).reshape(-1)[0]) == our_delta
+
+
+def test_qwen3_vl_moe_text_model_matches_mlx_vlm(tmp_path):
+    import mlx.core as mx
+
+    from lokahi.fixtures import TinyQwen3VLSpec
+    from lokahi.fixtures.qwen3_vl_tiny import VL_MOE_TEXT
+
+    oracle, model, image, prompt, grid = _qwen3_vl(tmp_path, TinyQwen3VLSpec(text=VL_MOE_TEXT))
+    features, _ = oracle.encode_all(image)
+    logits = _language_logits(model, prompt, grid, mx.array(features), None, oracle.config.image_token_id)
+    injected, positions, _, _ = oracle._inputs(prompt, [image])
+    expected = oracle.language.logits(prompt, injected, positions)
+    np.testing.assert_allclose(logits, expected, rtol=0, atol=2e-3 * np.abs(expected).max())
+    np.testing.assert_array_equal(logits.argmax(axis=1), expected.argmax(axis=1))
