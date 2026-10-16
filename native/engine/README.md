@@ -229,7 +229,10 @@ the same steps with every product in `dense_mm`: q, k and v stay in one
 per-head attention products read with a stride, and the merger's exact GELU
 (`gelu_erf_inplace`) uses Numerical Recipes' Chebyshev fit of erfc (error
 below 1.2e-7), since the Metal library has no erf. Its buffers grow to the
-largest image encoded so far. MLX-VLM 0.4.4 places a second image's
+largest image encoded so far, except one head's attention scores: each
+pass covers at most `--vision-attention-rows` query rows (by default as
+many as fit 128 MiB of scores), so the processor's largest images (65536
+patches) no longer need a 16 GiB score matrix. MLX-VLM 0.4.4 places a second image's
 positions differently from Transformers (it sums every `vision_start`
 index), so multi-image prompts follow Transformers and are cross-checked
 with MLX-VLM for one image only. Qwen3-VL's tower adds deepstack: after

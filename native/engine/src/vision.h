@@ -69,6 +69,10 @@ class VisionEncoder {
   virtual std::vector<float> encode(const Image& image) = 0;
   // The features with any deepstack rows.
   virtual ImageFeatures encode_features(const Image& image) { return {encode(image), {}}; }
+  // Caps the query rows of each attention pass, so a tower that holds an
+  // image's attention scores (Qwen's on Metal) holds rows x patches of them
+  // at a time; 0 picks a budget. Encoders that never hold them ignore it.
+  virtual void set_attention_rows(int /*rows*/) {}
 };
 
 // Places images' features at the runs of `image_token` in `tokens`, a prompt
