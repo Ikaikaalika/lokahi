@@ -6,6 +6,7 @@
 
 #include "common.h"
 #include "gemma4_vision.h"
+#include "qwen3_5_vision.h"
 #include "safetensors.h"
 #include "siglip.h"
 
@@ -86,6 +87,12 @@ std::unique_ptr<VisionEncoder> VisionEncoder::load(const std::string& directory,
     if (backend == "auto") backend = "cpu";
     LK_CHECK(backend == "cpu", "unknown or unavailable backend '" + backend + "'");
     return make_gemma4_vision_cpu(std::move(weights), threads);
+  }
+  if (is_qwen3_5_vision(config)) {
+    // The Qwen3.5 tower runs on the CPU for every decoder backend so far.
+    LK_CHECK(backend == "auto" || backend == "cpu" || backend == "metal",
+             "unknown or unavailable backend '" + backend + "'");
+    return make_qwen3_5_vision_cpu(Qwen35VisionWeights::load(directory, config), threads);
   }
   LK_CHECK(is_siglip(config), "vision: unsupported vision tower '" +
                                   config.at("vision_config").string_or("model_type", "") + "'");

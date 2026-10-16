@@ -17,6 +17,7 @@
 #include "half.h"
 #include "json.h"
 #include "quant.h"
+#include "qwen3_5_vision.h"
 #include "regex.h"
 #include "safetensors.h"
 #include "sampling.h"
@@ -960,6 +961,28 @@ void test_mrope_injection_plan() {
   EXPECT(!throws([&] { plan_injection(no_grids, 10, 20, 1, 8, InjectionRules{true, false, 0}); }));
 }
 
+void test_qwen3_5_vision_config() {
+  // Qwen/Qwen3.5-0.8B's vision fields and preprocessor_config.json.
+  const Json config = Json::parse(R"({
+    "model_type": "qwen3_5", "image_token_id": 248056, "text_config": {"hidden_size": 1024},
+    "vision_config": {"deepstack_visual_indexes": [], "depth": 12, "hidden_act": "gelu_pytorch_tanh",
+                      "hidden_size": 768, "in_channels": 3, "intermediate_size": 3072, "model_type": "qwen3_5",
+                      "num_heads": 12, "num_position_embeddings": 2304, "out_hidden_size": 1024,
+                      "patch_size": 16, "spatial_merge_size": 2, "temporal_patch_size": 2}})");
+  const Json processor = Json::parse(R"({"size": {"longest_edge": 16777216, "shortest_edge": 65536},
+    "patch_size": 16, "temporal_patch_size": 2, "merge_size": 2, "image_mean": [0.5, 0.5, 0.5],
+    "image_std": [0.5, 0.5, 0.5], "image_processor_type": "Qwen2VLImageProcessorFast"})");
+  const Qwen35VisionConfig c = Qwen35VisionConfig::from_json(config, &processor);
+  EXPECT(c.depth == 12 && c.hidden_size == 768 && c.head_dim() == 64 && c.position_side == 48);
+  EXPECT(c.factor() == 32 && c.min_pixels == 65536 && c.max_pixels == 16777216 && c.text_hidden_size == 1024);
+  EXPECT(c.mean[0] == 0.5f && c.std[2] == 0.5f && std::fabs(c.rescale * 255.0f - 1.0f) < 1e-6f);
+  // min_pixels and max_pixels override the size's edges; CLIP's mean and std are the default.
+  const Json legacy = Json::parse(R"({"min_pixels": 3136, "max_pixels": 12845056})");
+  const Qwen35VisionConfig old = Qwen35VisionConfig::from_json(config, &legacy);
+  EXPECT(old.min_pixels == 3136 && old.max_pixels == 12845056 && std::fabs(old.mean[0] - 0.48145466f) < 1e-7f);
+  EXPECT(throws([&] { Qwen35VisionConfig::from_json(config, nullptr); }));
+}
+
 int main() {
   test_json();
   test_half();
@@ -980,6 +1003,7 @@ int main() {
   test_deepseek_configs();
   test_qwen3_5_configs();
   test_mrope_injection_plan();
+  test_qwen3_5_vision_config();
   if (g_failures) {
     std::fprintf(stderr, "%d expectation(s) failed\n", g_failures);
     return 1;
