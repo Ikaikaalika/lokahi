@@ -117,7 +117,8 @@ def _backends() -> list[str]:
 
 
 def _run(cli: Path, *args: str) -> dict:
-    result = subprocess.run([str(cli), *args], check=True, capture_output=True, text=True)
+    result = subprocess.run([str(cli), *args], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
     return json.loads(result.stdout.strip().splitlines()[-1])
 
 
@@ -200,18 +201,21 @@ def test_greedy_with_images_matches_full_recompute(native_cli, vlm, backend):
     assert report["tokens"] == oracle.greedy(PROMPT, images, 10)
 
 
-def test_text_alone_matches_oracle(native_cli, tmp_path):
+@pytest.mark.parametrize("backend", _backends())
+def test_text_alone_matches_oracle(native_cli, tmp_path, backend):
     # Without images M-RoPE is plain RoPE and nothing is injected.
     directory = write_tiny_qwen3_vl(tmp_path / "model", SPEC)
     oracle = Qwen3VLReference.load(directory)
     tokens = [2, 5, 9, 33, 100, 7, 7, 400, 3, 11]
     out = tmp_path / "logits.bin"
-    report = _run(native_cli, "logits", "--model", str(directory), "--backend", "cpu",
+    report = _run(native_cli, "logits", "--model", str(directory), "--backend", backend,
                   "--tokens", ",".join(map(str, tokens)), "--prefill", "4", "--out", str(out))
     got = np.fromfile(out, dtype=np.float32).reshape(report["rows"], -1)
     expected = oracle.language.logits(tokens)[3:]
-    np.testing.assert_allclose(got, expected, atol=2e-4 * np.abs(expected).max(), rtol=0)
-    info = _run(native_cli, "info", "--model", str(directory), "--backend", "cpu")
+    tolerance = 2e-4 if backend == "cpu" else 2e-2
+    np.testing.assert_allclose(got, expected, atol=tolerance * np.abs(expected).max(), rtol=0)
+    np.testing.assert_array_equal(got.argmax(axis=1), expected.argmax(axis=1))
+    info = _run(native_cli, "info", "--model", str(directory), "--backend", backend)
     assert info["architecture"] == "qwen3_vl"
 
 
