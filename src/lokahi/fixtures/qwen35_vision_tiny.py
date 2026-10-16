@@ -35,7 +35,7 @@ class TinyQwen35VisionSpec:
     depth: int = 2
     hidden_size: int = 64
     intermediate_size: int = 128
-    num_heads: int = 2  # head_dim 32: 2-D RoPE with 4 row and 4 column frequencies
+    num_heads: int = 2  # head_dim 32: 2-D RoPE with 8 row and 8 column frequencies
     patch_size: int = 8
     temporal_patch_size: int = 2
     spatial_merge_size: int = 2

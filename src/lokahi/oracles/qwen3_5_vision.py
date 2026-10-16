@@ -8,7 +8,8 @@ Semantics follow Transformers' ``Qwen2VLImageProcessorFast`` (as
   both sides are multiples of ``patch_size * spatial_merge_size`` and its
   area lies within ``[min_pixels, max_pixels]`` (``smart_resize``, which
   rounds half to even as Python does), rescales to ``[0, 1]`` and normalizes
-  with mean = std = 0.5, repeats the image ``temporal_patch_size`` times
+  with the processor's mean and std (CLIP's by default; Qwen3.5's are 0.5),
+  repeats the image ``temporal_patch_size`` times
   along time, and cuts it into patches flattened as (channel, time, row,
   column), ordered so each ``merge x merge`` square of patches is contiguous
   (block rows, block columns, then row and column within the block);
@@ -48,6 +49,24 @@ from .gemma3 import load_dense_weights
 from .qwen3_5 import Qwen35Reference
 
 
+CLIP_MEAN = (0.48145466, 0.4578275, 0.40821073)
+CLIP_STD = (0.26862954, 0.26130258, 0.27577711)
+
+
+def processor_fields(processor: Mapping[str, Any] | None) -> dict[str, Any]:
+    """``Qwen2VLImageProcessor``'s pixel bounds, mean and std: ``min_pixels`` /
+    ``max_pixels`` override the size's ``shortest_edge`` / ``longest_edge``."""
+
+    processor = processor or {}
+    size = processor.get("size") or {}
+    return {
+        "min_pixels": int(processor.get("min_pixels") or size.get("shortest_edge", 65536)),
+        "max_pixels": int(processor.get("max_pixels") or size.get("longest_edge", 16777216)),
+        "image_mean": tuple(float(x) for x in processor.get("image_mean") or CLIP_MEAN),
+        "image_std": tuple(float(x) for x in processor.get("image_std") or CLIP_STD),
+    }
+
+
 @dataclass(frozen=True)
 class Qwen35VisionConfig:
     depth: int
@@ -66,13 +85,14 @@ class Qwen35VisionConfig:
     min_pixels: int = 65536
     max_pixels: int = 16777216
     deepstack_visual_indexes: tuple[int, ...] = ()
+    image_mean: tuple[float, ...] = CLIP_MEAN
+    image_std: tuple[float, ...] = CLIP_STD
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any], processor: Mapping[str, Any] | None = None) -> "Qwen35VisionConfig":
         v = raw["vision_config"]
         if v.get("hidden_act", "gelu_pytorch_tanh") != "gelu_pytorch_tanh":
             raise NotImplementedError(f"vision activation {v.get('hidden_act')!r}")
-        size = (processor or {}).get("size") or {}
         return cls(
             depth=int(v["depth"]),
             hidden_size=int(v["hidden_size"]),
@@ -87,9 +107,8 @@ class Qwen35VisionConfig:
             image_token_id=int(raw["image_token_id"]),
             vision_start_token_id=int(raw["vision_start_token_id"]),
             vision_end_token_id=int(raw["vision_end_token_id"]),
-            min_pixels=int(size.get("shortest_edge", 65536)),
-            max_pixels=int(size.get("longest_edge", 16777216)),
             deepstack_visual_indexes=tuple(int(i) for i in v.get("deepstack_visual_indexes") or ()),
+            **processor_fields(processor),
         )
 
     @property
@@ -135,7 +154,8 @@ def patchify(rgb: np.ndarray, cfg: Qwen35VisionConfig) -> np.ndarray:
 
     p, m, t = cfg.patch_size, cfg.spatial_merge_size, cfg.temporal_patch_size
     rows, cols = cfg.grid(*rgb.shape[:2])
-    image = (np.asarray(rgb, dtype=np.float32) * np.float32(1.0 / 255.0) - 0.5) / 0.5  # [H, W, C]
+    mean, std = np.asarray(cfg.image_mean, dtype=np.float32), np.asarray(cfg.image_std, dtype=np.float32)
+    image = (np.asarray(rgb, dtype=np.float32) * np.float32(1.0 / 255.0) - mean) / std  # [H, W, C]
     chw = image.transpose(2, 0, 1)
     frames = np.broadcast_to(chw[None], (t,) + chw.shape)  # [T, C, H, W]
     c = chw.shape[0]
@@ -249,12 +269,17 @@ class Qwen35VisionReference:
         return grid[r, c].astype(np.float32)
 
     def _rope(self, x: np.ndarray, rows: int, cols: int) -> np.ndarray:
-        """2-D RoPE over ``[N, heads, D]``: frequencies of a D / 2 rotary dimension, rows then columns."""
+        """2-D RoPE over ``[N, heads, D]`` in merge-block order."""
+
+        return self._rope_at(x, *merged_order(rows, cols, self.config.spatial_merge_size))
+
+    def _rope_at(self, x: np.ndarray, r: np.ndarray, c: np.ndarray) -> np.ndarray:
+        """2-D RoPE over ``[N, heads, D]`` for patches at rows ``r`` and columns ``c``:
+        frequencies of a D / 2 rotary dimension, rows then columns."""
 
         cfg = self.config
         dim = cfg.head_dim // 2
         inv_freq = 1.0 / 10000.0 ** (np.arange(0, dim, 2, dtype=np.float64) / dim)
-        r, c = merged_order(rows, cols, cfg.spatial_merge_size)
         freqs = np.concatenate([r[:, None] * inv_freq[None, :], c[:, None] * inv_freq[None, :]], axis=-1)
         cos = np.cos(np.concatenate([freqs, freqs], axis=-1)).astype(np.float32)[:, None, :]
         sin = np.sin(np.concatenate([freqs, freqs], axis=-1)).astype(np.float32)[:, None, :]
