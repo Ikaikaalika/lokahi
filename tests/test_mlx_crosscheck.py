@@ -3,7 +3,8 @@
 These tests pin the oracles' semantics to an independent implementation:
 ``mx.dequantize`` for the packed affine layout, and MLX-LM's ``gemma3_text``,
 ``gemma4``, ``llama``, ``qwen2``, ``qwen3``, ``qwen3_moe``, ``gpt_oss``, ``glm4_moe``,
-``deepseek_v2``, ``deepseek_v3`` and ``glm4_moe_lite`` models for the full decoders. They need
+``deepseek_v2``, ``deepseek_v3``, ``glm4_moe_lite``, ``qwen3_5``, ``qwen3_5_moe`` and ``qwen3_next``
+models for the full decoders. They need
 ``mlx`` and ``mlx_lm``: hosted macOS CI runs them on its virtual GPU, and
 ``mlx[cpu]`` runs them on Linux.
 """
@@ -20,14 +21,16 @@ from lokahi.fixtures import (
     TinyDenseSpec,
     TinyGemma3Spec,
     TinyGemma4Spec,
+    TinyQwen35Spec,
     write_tiny_deepseek,
     write_tiny_dense,
     write_tiny_gemma3,
     write_tiny_gemma4,
+    write_tiny_qwen35,
 )
 from lokahi.formats import QuantSpec, dequantize_affine, pack_affine
 from lokahi.fixtures.deepseek_tiny import DEEPSEEK_YARN
-from lokahi.oracles import DeepseekReference, Gemma3Reference, Gemma4Reference, LlamaFamilyReference
+from lokahi.oracles import DeepseekReference, Gemma3Reference, Gemma4Reference, LlamaFamilyReference, Qwen35Reference
 
 pytestmark = pytest.mark.skipif(
     importlib.util.find_spec("mlx") is None or importlib.util.find_spec("mlx_lm") is None,
@@ -193,6 +196,35 @@ def test_oracle_matches_mlx_lm_gemma4(tmp_path, spec):
 def test_oracle_matches_mlx_lm_deepseek(tmp_path, spec):
     directory = write_tiny_deepseek(tmp_path / "model", spec)
     _assert_mlx_lm_matches(directory, DeepseekReference.load(directory).logits(TOKENS))
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        TinyQwen35Spec(seed=0),
+        TinyQwen35Spec(mlx=False, tie_word_embeddings=True, linear_num_key_heads=4, linear_key_head_dim=16, seed=1),
+        TinyQwen35Spec(model_type="qwen3_5_moe", seed=0),
+        TinyQwen35Spec(model_type="qwen3_5_moe", mlx=False, num_experts_per_tok=3, seed=1),
+        TinyQwen35Spec(model_type="qwen3_next", mlp_only_layers=(1,), norm_topk_prob=False, linear_key_head_dim=16,
+                       seed=0),
+        TinyQwen35Spec(model_type="qwen3_next", mlx=False, decoder_sparse_step=2, seed=0),
+    ],
+    ids=["qwen3.5-mlx", "qwen3.5-hf-tied", "qwen3.5-moe-mlx", "qwen3.5-moe-hf-fused", "qwen3-next-mlx",
+         "qwen3-next-hf"],
+)
+def test_oracle_matches_mlx_lm_qwen35(tmp_path, spec):
+    directory = write_tiny_qwen35(tmp_path / "model", spec)
+    if not spec.mlx:
+        # MLX-LM's sanitize adds the zero-centered norms' 1 to Transformers'
+        # BF16 weights in BF16, rounding 1 + w (Transformers adds it in
+        # float32), so these cases run on exact float32 copies of the weights.
+        import mlx.core as mx
+
+        path = str(directory / "model.safetensors")
+        weights = {name: value.astype(mx.float32) if value.dtype == mx.bfloat16 else value
+                   for name, value in mx.load(path).items()}
+        mx.save_safetensors(path, weights, metadata={"format": "pt"})
+    _assert_mlx_lm_matches(directory, Qwen35Reference.load(directory).logits(TOKENS))
 
 
 def _assert_mlx_lm_matches(directory, expected):
