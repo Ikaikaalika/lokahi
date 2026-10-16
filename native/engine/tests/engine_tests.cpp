@@ -776,6 +776,118 @@ void test_deepseek_configs() {
   EXPECT(g_inv.size() == 32 && std::fabs(g_inv[1] / std::pow(1e6, -2.0 / 64) - 1.0) < 1e-12);
 }
 
+// The text configuration of Qwen/Qwen3.5-0.8B (Transformers' BF16 layout), as
+// published; vision_config omitted.
+static const char* kQwen35_08BConfig = R"({
+  "architectures": ["Qwen3_5ForConditionalGeneration"], "image_token_id": 248056, "model_type": "qwen3_5",
+  "text_config": {
+    "attention_bias": false, "attention_dropout": 0.0, "attn_output_gate": true, "dtype": "bfloat16",
+    "eos_token_id": 248044, "full_attention_interval": 4, "head_dim": 256, "hidden_act": "silu",
+    "hidden_size": 1024, "initializer_range": 0.02, "intermediate_size": 3584,
+    "layer_types": [
+      "linear_attention", "linear_attention", "linear_attention", "full_attention", "linear_attention",
+      "linear_attention", "linear_attention", "full_attention", "linear_attention", "linear_attention",
+      "linear_attention", "full_attention", "linear_attention", "linear_attention", "linear_attention",
+      "full_attention", "linear_attention", "linear_attention", "linear_attention", "full_attention",
+      "linear_attention", "linear_attention", "linear_attention", "full_attention"],
+    "linear_conv_kernel_dim": 4, "linear_key_head_dim": 128, "linear_num_key_heads": 16,
+    "linear_num_value_heads": 16, "linear_value_head_dim": 128, "max_position_embeddings": 262144,
+    "mlp_only_layers": [], "model_type": "qwen3_5_text", "mtp_num_hidden_layers": 1,
+    "mtp_use_dedicated_embeddings": false, "num_attention_heads": 8, "num_hidden_layers": 24,
+    "num_key_value_heads": 2, "rms_norm_eps": 1e-06, "tie_word_embeddings": true, "use_cache": true,
+    "vocab_size": 248320, "mamba_ssm_dtype": "float32",
+    "rope_parameters": {"mrope_interleaved": true, "mrope_section": [11, 11, 10], "rope_type": "default",
+                        "rope_theta": 10000000, "partial_rotary_factor": 0.25}},
+  "tie_word_embeddings": true, "transformers_version": "4.57.0.dev0", "video_token_id": 248057,
+  "vision_end_token_id": 248054, "vision_start_token_id": 248053
+})";
+
+// The text configuration of mlx-community/Qwen3.5-35B-A3B-4bit, as
+// published; vision_config omitted.
+static const char* kQwen35_35BA3BConfig = R"({
+  "architectures": ["Qwen3_5MoeForConditionalGeneration"], "eos_token_id": [248046, 248044],
+  "image_token_id": 248056, "model_type": "qwen3_5_moe",
+  "quantization": {"group_size": 64, "bits": 4, "mode": "affine"},
+  "quantization_config": {"group_size": 64, "bits": 4, "mode": "affine"},
+  "text_config": {
+    "attention_bias": false, "attention_dropout": 0.0, "attn_output_gate": true, "dtype": "bfloat16",
+    "eos_token_id": 248044, "full_attention_interval": 4, "head_dim": 256, "hidden_act": "silu",
+    "hidden_size": 2048, "initializer_range": 0.02,
+    "layer_types": [
+      "linear_attention", "linear_attention", "linear_attention", "full_attention", "linear_attention",
+      "linear_attention", "linear_attention", "full_attention", "linear_attention", "linear_attention",
+      "linear_attention", "full_attention", "linear_attention", "linear_attention", "linear_attention",
+      "full_attention", "linear_attention", "linear_attention", "linear_attention", "full_attention",
+      "linear_attention", "linear_attention", "linear_attention", "full_attention", "linear_attention",
+      "linear_attention", "linear_attention", "full_attention", "linear_attention", "linear_attention",
+      "linear_attention", "full_attention", "linear_attention", "linear_attention", "linear_attention",
+      "full_attention", "linear_attention", "linear_attention", "linear_attention", "full_attention"],
+    "linear_conv_kernel_dim": 4, "linear_key_head_dim": 128, "linear_num_key_heads": 16,
+    "linear_num_value_heads": 32, "linear_value_head_dim": 128, "max_position_embeddings": 262144,
+    "mlp_only_layers": [], "model_type": "qwen3_5_moe_text", "moe_intermediate_size": 512,
+    "mtp_num_hidden_layers": 1, "mtp_use_dedicated_embeddings": false, "num_attention_heads": 16,
+    "num_experts": 256, "num_experts_per_tok": 8, "num_hidden_layers": 40, "num_key_value_heads": 2,
+    "rms_norm_eps": 1e-06, "router_aux_loss_coef": 0.001, "shared_expert_intermediate_size": 512,
+    "use_cache": true, "vocab_size": 248320, "mamba_ssm_dtype": "float32",
+    "rope_parameters": {"mrope_interleaved": true, "mrope_section": [11, 11, 10], "rope_type": "default",
+                        "rope_theta": 10000000, "partial_rotary_factor": 0.25}},
+  "tie_word_embeddings": false, "transformers_version": "4.57.0.dev0", "video_token_id": 248057,
+  "vision_end_token_id": 248054, "vision_start_token_id": 248053
+})";
+
+// Qwen/Qwen3-Next-80B-A3B-Instruct's config, as published.
+static const char* kQwen3Next80BConfig = R"({
+  "architectures": ["Qwen3NextForCausalLM"], "attention_dropout": 0.0, "bos_token_id": 151643,
+  "decoder_sparse_step": 1, "eos_token_id": 151645, "full_attention_interval": 4, "head_dim": 256,
+  "hidden_act": "silu", "hidden_size": 2048, "initializer_range": 0.02, "intermediate_size": 5120,
+  "linear_conv_kernel_dim": 4, "linear_key_head_dim": 128, "linear_num_key_heads": 16,
+  "linear_num_value_heads": 32, "linear_value_head_dim": 128, "max_position_embeddings": 262144,
+  "mlp_only_layers": [], "model_type": "qwen3_next", "moe_intermediate_size": 512, "norm_topk_prob": true,
+  "num_attention_heads": 16, "num_experts": 512, "num_experts_per_tok": 10, "num_hidden_layers": 48,
+  "num_key_value_heads": 2, "output_router_logits": false, "partial_rotary_factor": 0.25, "rms_norm_eps": 1e-06,
+  "rope_scaling": null, "rope_theta": 10000000, "router_aux_loss_coef": 0.001,
+  "shared_expert_intermediate_size": 512, "tie_word_embeddings": false, "torch_dtype": "bfloat16",
+  "transformers_version": "4.57.0.dev0", "use_cache": true, "use_sliding_window": false, "vocab_size": 151936
+})";
+
+void test_qwen3_5_configs() {
+  auto linear_every_fourth = [](const DecoderConfig& c) {
+    for (int l = 0; l < c.num_layers; ++l) {
+      if (c.is_linear(l) != ((l + 1) % 4 != 0)) return false;
+    }
+    return true;
+  };
+  // Partial RoPE: rotate-half within the first 64 of 256 dimensions, exponents over 64.
+  auto rope_64_of_256 = [](const DecoderConfig& c) {
+    const std::vector<double> inv = c.rope_inv_freq(false);
+    return c.rotary_dim == 64 && inv.size() == 32 && std::fabs(inv[1] / std::pow(1e7, -2.0 / 64) - 1.0) < 1e-12;
+  };
+
+  const DecoderConfig small = DecoderConfig::from_json(Json::parse(kQwen35_08BConfig));
+  EXPECT(small.architecture == "qwen3_5" && small.num_layers == 24 && small.hidden_size == 1024);
+  EXPECT(small.num_heads == 8 && small.num_kv_heads == 2 && small.head_dim == 256 && small.qk_norm);
+  EXPECT(small.attn_output_gate && !small.shared_expert_gate && small.intermediate_size == 3584);
+  EXPECT(small.linear_k_heads == 16 && small.linear_v_heads == 16 && small.linear_k_dim == 128);
+  EXPECT(small.linear_v_dim == 128 && small.linear_conv == 4 && small.linear_channels() == 6144);
+  EXPECT(linear_every_fourth(small) && small.num_experts == 0 && !small.is_moe(0) && rope_64_of_256(small));
+  EXPECT(std::fabs(small.attn_scale * 16.0f - 1.0f) < 1e-6f && small.eos_token_ids == std::vector<int32_t>({248044}));
+
+  const DecoderConfig moe = DecoderConfig::from_json(Json::parse(kQwen35_35BA3BConfig));
+  EXPECT(moe.architecture == "qwen3_5_moe" && moe.num_layers == 40 && moe.num_heads == 16);
+  EXPECT(moe.linear_k_heads == 16 && moe.linear_v_heads == 32 && moe.linear_channels() == 8192);
+  EXPECT(moe.num_experts == 256 && moe.experts_per_token == 8 && moe.moe_intermediate == 512);
+  EXPECT(moe.shared_intermediate == 512 && moe.shared_expert_gate && moe.norm_topk_prob);
+  EXPECT(moe.router == DecoderConfig::Router::Softmax && moe.routed_scaling == 1.0f);
+  EXPECT(moe.is_moe(0) && moe.is_moe(3) && moe.is_moe(39) && linear_every_fourth(moe) && rope_64_of_256(moe));
+  EXPECT(moe.eos_token_ids == std::vector<int32_t>({248046, 248044}));
+
+  const DecoderConfig next = DecoderConfig::from_json(Json::parse(kQwen3Next80BConfig));
+  EXPECT(next.architecture == "qwen3_next" && next.num_layers == 48 && next.intermediate_size == 5120);
+  EXPECT(next.num_experts == 512 && next.experts_per_token == 10 && next.norm_topk_prob && next.shared_expert_gate);
+  EXPECT(next.is_moe(0) && next.is_moe(47) && linear_every_fourth(next) && rope_64_of_256(next));
+  EXPECT(next.attn_output_gate && next.linear_v_heads == 32 && next.eos_token_ids == std::vector<int32_t>({151645}));
+}
+
 int main() {
   test_json();
   test_half();
@@ -794,6 +906,7 @@ int main() {
   test_gpt_oss_config();
   test_glm_config();
   test_deepseek_configs();
+  test_qwen3_5_configs();
   if (g_failures) {
     std::fprintf(stderr, "%d expectation(s) failed\n", g_failures);
     return 1;

@@ -20,14 +20,22 @@ from lokahi.fixtures import (
     TinyDenseSpec,
     TinyGemma3Spec,
     TinyGemma4Spec,
+    TinyQwen35Spec,
     write_tiny_deepseek,
     write_tiny_dense,
     write_tiny_gemma3,
     write_tiny_gemma4,
+    write_tiny_qwen35,
 )
 from lokahi.fixtures.deepseek_tiny import DEEPSEEK_YARN
 from lokahi.formats.safetensors import read_safetensors
-from lokahi.oracles import DeepseekReference, Gemma3Reference, Gemma4Reference, LlamaFamilyReference
+from lokahi.oracles import (
+    DeepseekReference,
+    Gemma3Reference,
+    Gemma4Reference,
+    LlamaFamilyReference,
+    Qwen35Reference,
+)
 from lokahi.oracles.gemma3 import Gemma3Config
 
 TOKENS = [2, 5, 9, 33, 100, 7, 7, 7, 400, 3, 2, 11, 90, 91, 92, 93, 17, 18, 19, 20, 21, 22]
@@ -205,7 +213,29 @@ DEEPSEEK_VARIANTS = {
         model_type="glm4_moe_lite", absorbed=True, qk_nope_head_dim=64, v_head_dim=96, num_experts_per_tok=4,
         routed_scaling_factor=1.8, rms_norm_eps=1e-5, rope_theta=1e6, rope_scaling=None, seed=21),
 }
-VARIANTS = sorted(GEMMA3_VARIANTS) + sorted(GEMMA4_VARIANTS) + sorted(DENSE_VARIANTS) + sorted(DEEPSEEK_VARIANTS)
+QWEN35_VARIANTS = {
+    # Qwen3.5 as MLX-LM converts it: 4-bit under language_model., norms stored
+    # as 1 + w, conv weights [C, K, 1]; Gated DeltaNet layers 0-2 and 4 with
+    # two value heads per key head, gated full attention at layer 3, partial
+    # RoPE over a quarter of each head.
+    "qwen3.5-mlx": TinyQwen35Spec(seed=0),
+    # Transformers' BF16 layout under model.language_model. (norms w, conv
+    # [C, 1, K]), tied, one value head per key head, keys narrower than values.
+    "qwen3.5-hf-tied": TinyQwen35Spec(mlx=False, tie_word_embeddings=True, linear_num_key_heads=4,
+                                      linear_key_head_dim=16, seed=1),
+    # Qwen3.5-MoE: experts in every layer with a gated shared expert, 8-bit
+    # router and gate; and Transformers' fused gate_up_proj experts.
+    "qwen3.5-moe-mlx": TinyQwen35Spec(model_type="qwen3_5_moe", seed=0),
+    "qwen3.5-moe-hf-fused": TinyQwen35Spec(model_type="qwen3_5_moe", mlx=False, num_experts_per_tok=3, seed=1),
+    # Qwen3-Next: in_proj_qkvz and in_proj_ba grouped per key head, a dense
+    # layer by mlp_only_layers or by decoder_sparse_step, routing with and
+    # without renormalization.
+    "qwen3-next-mlx": TinyQwen35Spec(model_type="qwen3_next", mlp_only_layers=(1,), norm_topk_prob=False,
+                                     linear_key_head_dim=16, seed=0),
+    "qwen3-next-hf": TinyQwen35Spec(model_type="qwen3_next", mlx=False, decoder_sparse_step=2, seed=0),
+}
+VARIANTS = (sorted(GEMMA3_VARIANTS) + sorted(GEMMA4_VARIANTS) + sorted(DENSE_VARIANTS) + sorted(DEEPSEEK_VARIANTS)
+            + sorted(QWEN35_VARIANTS))
 
 
 @pytest.fixture(scope="module", params=VARIANTS)
@@ -220,11 +250,15 @@ def fixture_model(request, tmp_path_factory):
     if request.param in DEEPSEEK_VARIANTS:
         write_tiny_deepseek(directory, DEEPSEEK_VARIANTS[request.param])
         return directory, DeepseekReference.load(directory)
+    if request.param in QWEN35_VARIANTS:
+        write_tiny_qwen35(directory, QWEN35_VARIANTS[request.param])
+        return directory, Qwen35Reference.load(directory)
     write_tiny_dense(directory, DENSE_VARIANTS[request.param])
     return directory, LlamaFamilyReference.load(directory)
 
 
-CPU_ONLY: tuple[str, ...] = ()  # architectures the Metal backend refuses (none today)
+# Architectures (text model_type) the Metal backend refuses: Gated DeltaNet.
+CPU_ONLY: tuple[str, ...] = ("qwen3_5_text", "qwen3_5_moe_text", "qwen3_next")
 
 
 def _dense_mxfp4(config: dict) -> bool:
@@ -874,3 +908,210 @@ def test_deepseek_unexpected_bias_fails_closed(native_cli, tmp_path):
 
     write_safetensors(path, tensors, metadata=metadata)
     assert "layers.1.self_attn.kv_a_proj_with_mqa: unexpected bias for deepseek_v3" in _load_error(native_cli, directory)
+
+
+def _edit_text_config(directory: Path, change: dict, remove: tuple[str, ...] = ()) -> Path:
+    """Applies `change` to the text configuration (text_config when nested)."""
+
+    path = directory / "config.json"
+    config = json.loads(path.read_text())
+    text = config.get("text_config") or config
+    text.update(change)
+    for key in remove:
+        del text[key]
+    path.write_text(json.dumps(config))
+    return directory
+
+
+def test_qwen35_fixtures_route_far_from_ties(tmp_path):
+    # Guards the fixtures: on the router's real inputs the top-k choice is
+    # stable under float32 error, and every expert serves some token.
+    for name, spec in QWEN35_VARIANTS.items():
+        oracle = Qwen35Reference.load(write_tiny_qwen35(tmp_path / name, spec))
+        if not oracle.config.num_experts:
+            continue
+        k, route = oracle.config.num_experts_per_tok, oracle.route
+        gaps: list[float] = []
+        used: set[int] = set()
+
+        def traced(index, x):
+            ordered = -np.sort(-(x @ oracle.w[f"model.layers.{index}.mlp.gate"].T), axis=-1)
+            gaps.append(float((ordered[:, k - 1] - ordered[:, k]).min()))
+            chosen, weights = route(index, x)
+            used.update(chosen.ravel().tolist())
+            return chosen, weights
+
+        oracle.route = traced
+        oracle.logits(TOKENS)
+        assert min(gaps) > 1e-3, name
+        assert used == set(range(oracle.config.num_experts)), name
+
+
+def test_qwen35_fixtures_exercise_every_feature(tmp_path):
+    # Guards the fixtures: each Gated DeltaNet and gating mechanism moves the
+    # outputs, so parity with the oracle covers it. Removing the decay (A = 0),
+    # dt_bias, the conv's earlier taps, the output gate's variation, the shared
+    # expert's gate or the zero-centered norms' offset must each change the
+    # logits.
+    for name in ("qwen3.5-mlx", "qwen3.5-moe-hf-fused", "qwen3-next-hf"):
+        directory = write_tiny_qwen35(tmp_path / name, QWEN35_VARIANTS[name])
+        oracle = Qwen35Reference.load(directory)
+        expected = oracle.logits(TOKENS)
+        scale = np.abs(expected).max()
+        layers = range(oracle.config.num_hidden_layers)
+        linear = [i for i in layers if oracle.config.layer_types[i] == "linear_attention"]
+        full = [i for i in layers if i not in linear]
+
+        def changed(edit) -> float:
+            mutated = Qwen35Reference.load(directory)
+            edit(mutated)
+            return float(np.abs(mutated.logits(TOKENS) - expected).max())
+
+        def edit_each(names, layers, fn):
+            def apply(mutated):
+                for i in layers:
+                    for suffix in names:
+                        key = f"model.layers.{i}.{suffix}"
+                        mutated.w[key] = fn(mutated.w[key])
+            return apply
+
+        def last_tap_only(conv):
+            out = np.zeros_like(conv)
+            if conv.shape[-1] == 1:  # MLX [C, K, 1]
+                out[:, -1] = conv[:, -1]
+            else:  # Transformers [C, 1, K]
+                out[..., -1] = conv[..., -1]
+            return out
+
+        def constant_gate(q_proj):
+            heads, dim = oracle.config.num_attention_heads, oracle.config.head_dim
+            rows = q_proj.reshape(heads, 2, dim, -1).copy()
+            rows[:, 1] = 0.0  # sigmoid(0) everywhere: the gate no longer depends on x
+            return rows.reshape(q_proj.shape) * np.float32(1.0)
+
+        checks = {
+            "decay": edit_each(["linear_attn.A_log"], linear, lambda a: np.full_like(a, -np.inf)),
+            "dt_bias": edit_each(["linear_attn.dt_bias"], linear, np.zeros_like),
+            "conv history": edit_each(["linear_attn.conv1d"], linear, last_tap_only),
+            "output gate": edit_each(["self_attn.q_proj"], full, constant_gate),
+        }
+        if oracle.config.shared_expert_intermediate_size:
+            sparse = [i for i in layers if oracle.config.sparse(i)]
+            checks["shared expert gate"] = edit_each(["mlp.shared_expert_gate"], sparse, np.zeros_like)
+        for feature, edit in checks.items():
+            assert changed(edit) > 0.01 * scale, (name, feature)
+        offset = Qwen35Reference.load(directory)
+        offset.norm_offset = 1.0 - offset.norm_offset
+        assert np.abs(offset.logits(TOKENS) - expected).max() > 0.01 * scale, (name, "norm offset")
+
+
+def test_qwen35_reset_clears_the_recurrent_state(native_cli, tmp_path):
+    # Each benchmark repetition resets the model: the Gated DeltaNet states and
+    # conv histories must start from zero again, so every repetition matches
+    # the oracle (correctness only; no timing is read).
+    directory = write_tiny_qwen35(tmp_path / "model", QWEN35_VARIANTS["qwen3.5-mlx"])
+    prompt = TOKENS[:6]
+    report = _run(native_cli, "bench", "--model", str(directory), "--backend", "cpu",
+                  "--tokens", ",".join(map(str, prompt)), "--max-new", "8", "--warmups", "0", "--repetitions", "2")
+    expected = Qwen35Reference.load(directory).greedy(prompt, 8)
+    assert [run["token_ids"] for run in report["repetitions"]] == [expected, expected]
+
+
+def test_gated_deltanet_models_fall_back_to_the_cpu(native_cli, tmp_path):
+    directory = write_tiny_qwen35(tmp_path / "model", QWEN35_VARIANTS["qwen3.5-mlx"])
+    info = _run(native_cli, "info", "--model", str(directory), "--backend", "auto")
+    assert (info["architecture"], info["backend"]) == ("qwen3_5", "cpu")
+    if "metal" in _backends():
+        assert "the Metal backend does not implement qwen3_5 (Gated DeltaNet) yet" in _load_error(
+            native_cli, directory, "metal")
+
+
+_FULL_AT_3 = ["linear_attention"] * 3 + ["full_attention", "linear_attention"]
+
+
+@pytest.mark.parametrize(
+    ("model_type", "change", "remove", "message"),
+    [
+        ("qwen3_5", {"attn_output_gate": False}, (), "qwen3_5: attn_output_gate false is not supported"),
+        ("qwen3_5", {"hidden_act": "gelu"}, (), "qwen3_5: unsupported activation gelu"),
+        ("qwen3_5", {"attention_bias": True}, (), "qwen3_5: attention_bias is not supported"),
+        ("qwen3_5", {"rope_parameters": {"rope_type": "yarn", "rope_theta": 1e7, "factor": 4.0}}, (),
+         "qwen3_5: rope type 'yarn' is not supported"),
+        ("qwen3_5", {"rope_parameters": {"rope_type": "default", "partial_rotary_factor": 0.25}}, (), "rope_theta"),
+        ("qwen3_5", {"rope_parameters": {"rope_type": "default", "rope_theta": 1e7, "partial_rotary_factor": 0.3}},
+         (), "qwen3_5: partial_rotary_factor must rotate an even number of dimensions"),
+        # MLX-LM places full attention by full_attention_interval alone.
+        ("qwen3_5", {"layer_types": ["full_attention"] + ["linear_attention"] * 4}, (),
+         "qwen3_5: layer_types must place full attention every full_attention_interval layers"),
+        ("qwen3_5", {"layer_types": _FULL_AT_3[:4]}, (), "qwen3_5: layer_types length mismatch"),
+        ("qwen3_5", {"layer_types": _FULL_AT_3[:4] + ["mamba"]}, (),
+         "qwen3_5: layer_types entries must be linear_attention or full_attention"),
+        ("qwen3_5", {"full_attention_interval": 1, "layer_types": ["full_attention"] * 5}, (),
+         "qwen3_5: expected Gated DeltaNet layers"),
+        ("qwen3_5", {"linear_num_value_heads": 3}, (),
+         "qwen3_5: linear_num_value_heads must be a multiple of linear_num_key_heads"),
+        ("qwen3_5", {"linear_conv_kernel_dim": 1}, (), "qwen3_5: linear_conv_kernel_dim must be at least 2"),
+        ("qwen3_5", {"num_experts": 8, "num_experts_per_tok": 2}, (), "qwen3_5: num_experts needs qwen3_5_moe"),
+        ("qwen3_5", {}, ("intermediate_size",), "qwen3_5: dense layers need intermediate_size"),
+        ("qwen3_5_moe", {"norm_topk_prob": False}, (), "qwen3_5_moe: norm_topk_prob false is not supported"),
+        ("qwen3_5_moe", {"mlp_only_layers": [1]}, (), "qwen3_5_moe: mlp_only_layers is not supported"),
+        ("qwen3_5_moe", {"decoder_sparse_step": 2}, (),
+         "qwen3_5_moe: decoder_sparse_step other than 1 is not supported"),
+        ("qwen3_5_moe", {"shared_expert_intermediate_size": 0}, (), "qwen3_5_moe: invalid expert configuration"),
+        # Transformers renormalizes by default and MLX-LM does not.
+        ("qwen3_next", {}, ("norm_topk_prob",), "norm_topk_prob"),
+        ("qwen3_next", {"rope_scaling": {"rope_type": "yarn", "factor": 4.0}}, (),
+         "qwen3_next: rope_scaling type 'yarn' is not supported"),
+        ("qwen3_next", {"use_sliding_window": True}, (), "qwen3_next: use_sliding_window is not supported"),
+        ("qwen3_next", {"mlp_only_layers": [5]}, (), "qwen3_next: mlp_only_layers entry out of range"),
+    ],
+)
+def test_unsupported_qwen35_configurations_fail_closed(native_cli, tmp_path, model_type, change, remove, message):
+    directory = write_tiny_qwen35(tmp_path / "model", TinyQwen35Spec(model_type=model_type))
+    assert message in _load_error(native_cli, _edit_text_config(directory, change, remove))
+
+
+@pytest.mark.parametrize("backend", _backends())
+def test_qwen35_l2_norm_keeps_its_epsilon(native_cli, backend, tmp_path, monkeypatch):
+    # q and k are L2-normalized as x * rsqrt(sum(x^2) + 1e-6) (Transformers and
+    # MLX-LM). Small q and k make the epsilon visible.
+    import lokahi.oracles.qwen3_5 as qwen3_5
+
+    directory = write_tiny_qwen35(tmp_path / "model", TinyQwen35Spec(qk_scale=1e-3, seed=0))
+    _skip_unsupported(directory, backend)
+    oracle = Qwen35Reference.load(directory)
+    expected = oracle.logits(TOKENS)
+    monkeypatch.setattr(qwen3_5, "L2_EPS", 0.0)
+    assert np.abs(oracle.logits(TOKENS) - expected).max() > 0.05 * np.abs(expected).max()
+    out = tmp_path / "logits.bin"
+    report = _run(native_cli, "logits", "--model", str(directory), "--backend", backend,
+                  "--tokens", ",".join(map(str, TOKENS)), "--prefill", "5", "--out", str(out))
+    got = np.fromfile(out, dtype=np.float32).reshape(report["rows"], oracle.config.vocab_size)
+    tolerance = 2e-4 if backend == "cpu" else 2e-2
+    np.testing.assert_allclose(got, expected[4:], atol=tolerance * np.abs(expected).max(), rtol=0)
+
+
+def test_qwen35_unexpected_bias_fails_closed(native_cli, tmp_path):
+    directory = write_tiny_qwen35(tmp_path / "model", TinyQwen35Spec())
+    path = directory / "model.safetensors"
+    tensors, metadata = read_safetensors(path)
+    tensors["language_model.model.layers.1.linear_attn.in_proj_qkv.bias"] = ("BF16", np.zeros(256, dtype=np.uint16))
+    from lokahi.formats.safetensors import write_safetensors
+
+    write_safetensors(path, tensors, metadata=metadata)
+    assert "layers.1.linear_attn.in_proj_qkv: unexpected bias for qwen3_5" in _load_error(native_cli, directory)
+
+
+def test_qwen35_mixed_conv_layouts_fail_closed(native_cli, tmp_path):
+    # The conv layout tells Transformers' norms (w) from MLX's (1 + w), so
+    # every layer must agree.
+    directory = write_tiny_qwen35(tmp_path / "model", TinyQwen35Spec(mlx=False))
+    path = directory / "model.safetensors"
+    tensors, metadata = read_safetensors(path)
+    name = "model.language_model.layers.1.linear_attn.conv1d.weight"
+    dtype, conv = tensors[name]
+    tensors[name] = (dtype, np.ascontiguousarray(np.swapaxes(conv, 1, 2)))
+    from lokahi.formats.safetensors import write_safetensors
+
+    write_safetensors(path, tensors, metadata=metadata)
+    assert "layers.1: conv1d shape" in _load_error(native_cli, directory)

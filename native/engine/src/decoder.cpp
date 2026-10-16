@@ -50,6 +50,14 @@ bool is_deepseek(const Json& raw) {
   return type == "deepseek_v2" || type == "deepseek_v3" || type == "kimi_k2" || type == "glm4_moe_lite";
 }
 
+// Qwen3.5 (dense and MoE: the text models of the multimodal checkpoints) and
+// Qwen3-Next.
+bool is_qwen3_5(const Json& raw) {
+  const std::string type = model_type(raw);
+  return type == "qwen3_5" || type == "qwen3_5_text" || type == "qwen3_5_moe" || type == "qwen3_5_moe_text" ||
+         type == "qwen3_next";
+}
+
 bool flag(const Json& cfg, const char* key) {
   const Json* value = cfg.find(key);
   return value != nullptr && value->is_bool() && value->as_bool();
@@ -530,20 +538,144 @@ DecoderConfig deepseek_config(const Json& raw) {
   return c;
 }
 
+// Qwen3.5 and Qwen3-Next: Gated DeltaNet layers (see DecoderConfig) between
+// full attention layers, which gate their output, normalize q and k per head
+// and rotate halves within the first partial_rotary_factor of each head
+// (Qwen3.5's multimodal RoPE is plain RoPE for text, whose three position
+// axes coincide). RMSNorms are zero-centered, x * rms * (1 + w); the load
+// sets norm_offset from the checkpoint's layout, as MLX conversions store
+// 1 + w. Mixture-of-experts layers (every layer of Qwen3.5-MoE; Qwen3-Next's
+// by decoder_sparse_step and mlp_only_layers) take the top experts of a
+// softmax router plus a gated shared expert. Fields whose defaults
+// Transformers and MLX-LM disagree on are read without defaults, and layouts
+// they would read differently fail closed.
+DecoderConfig qwen3_5_config(const Json& raw) {
+  const Json& cfg = text_config(raw);
+  DecoderConfig c;
+  const std::string type = model_type(raw);
+  const bool next = type == "qwen3_next";
+  const bool moe = type == "qwen3_5_moe" || type == "qwen3_5_moe_text";
+  c.architecture = next ? "qwen3_next" : moe ? "qwen3_5_moe" : "qwen3_5";
+  const std::string& arch = c.architecture;
+  c.vocab_size = static_cast<int>(cfg.at("vocab_size").as_int());
+  c.hidden_size = static_cast<int>(cfg.at("hidden_size").as_int());
+  c.num_layers = static_cast<int>(cfg.at("num_hidden_layers").as_int());
+  c.num_heads = static_cast<int>(cfg.at("num_attention_heads").as_int());
+  c.num_kv_heads = static_cast<int>(cfg.int_or("num_key_value_heads", c.num_heads));
+  const Json* head_dim = cfg.find("head_dim");
+  c.head_dim = head_dim != nullptr && head_dim->is_number() ? static_cast<int>(head_dim->as_int())
+                                                             : c.hidden_size / c.num_heads;
+  c.rms_norm_eps = static_cast<float>(cfg.number_or("rms_norm_eps", 1e-6));
+  c.qk_norm = true;
+  c.attn_output_gate = true;
+  c.attn_scale = 1.0f / std::sqrt(static_cast<float>(c.head_dim));
+  const Json* gate = cfg.find("attn_output_gate");
+  LK_CHECK(gate == nullptr || (gate->is_bool() && gate->as_bool()), arch + ": attn_output_gate false is not supported");
+  const std::string activation = cfg.string_or("hidden_act", "silu");
+  LK_CHECK(activation == "silu", arch + ": unsupported activation " + activation);
+  LK_CHECK(!flag(cfg, "attention_bias"), arch + ": attention_bias is not supported");
+  LK_CHECK(!flag(cfg, "use_sliding_window"), arch + ": use_sliding_window is not supported");
+
+  // Qwen3.5 keeps its RoPE fields in rope_parameters, Qwen3-Next at the top.
+  const Json* params = cfg.find("rope_parameters");
+  const Json& rope = params != nullptr && params->is_object() ? *params : cfg;
+  const std::string kind = rope.string_or("rope_type", rope.string_or("type", "default"));
+  LK_CHECK(kind == "default", arch + ": rope type '" + kind + "' is not supported");
+  if (const Json* scaling = cfg.find("rope_scaling"); scaling != nullptr && scaling->is_object()) {
+    const std::string scaled = scaling->string_or("rope_type", scaling->string_or("type", "default"));
+    LK_CHECK(scaled == "default", arch + ": rope_scaling type '" + scaled + "' is not supported");
+  }
+  c.rope_theta = static_cast<float>(rope.at("rope_theta").as_number());
+  c.rotary_dim = static_cast<int>(c.head_dim * rope.number_or("partial_rotary_factor", 0.25));
+  LK_CHECK(c.rotary_dim > 0 && c.rotary_dim <= c.head_dim && c.rotary_dim % 2 == 0,
+           arch + ": partial_rotary_factor must rotate an even number of dimensions");
+
+  // Transformers reads layer_types, MLX-LM only full_attention_interval.
+  const int interval = static_cast<int>(cfg.int_or("full_attention_interval", 4));
+  LK_CHECK(interval > 0, arch + ": full_attention_interval must be positive");
+  for (int i = 0; i < c.num_layers; ++i) c.layer_linear.push_back((i + 1) % interval != 0);
+  if (const Json* types = cfg.find("layer_types"); types != nullptr && types->is_array()) {
+    LK_CHECK(static_cast<int>(types->as_array().size()) == c.num_layers, arch + ": layer_types length mismatch");
+    for (int i = 0; i < c.num_layers; ++i) {
+      const std::string layer = types->as_array()[static_cast<size_t>(i)].as_string();
+      LK_CHECK(layer == "linear_attention" || layer == "full_attention",
+               arch + ": layer_types entries must be linear_attention or full_attention");
+      LK_CHECK((layer == "linear_attention") == c.is_linear(i),
+               arch + ": layer_types must place full attention every full_attention_interval layers");
+    }
+  }
+  LK_CHECK(c.has_linear(), arch + ": expected Gated DeltaNet layers");
+  c.layer_is_sliding.assign(static_cast<size_t>(c.num_layers), false);
+  c.linear_k_heads = static_cast<int>(cfg.at("linear_num_key_heads").as_int());
+  c.linear_v_heads = static_cast<int>(cfg.at("linear_num_value_heads").as_int());
+  c.linear_k_dim = static_cast<int>(cfg.at("linear_key_head_dim").as_int());
+  c.linear_v_dim = static_cast<int>(cfg.at("linear_value_head_dim").as_int());
+  c.linear_conv = static_cast<int>(cfg.int_or("linear_conv_kernel_dim", 4));
+  LK_CHECK(c.linear_k_heads > 0 && c.linear_v_heads > 0 && c.linear_v_heads % c.linear_k_heads == 0 &&
+               c.linear_k_dim > 0 && c.linear_v_dim > 0,
+           arch + ": linear_num_value_heads must be a multiple of linear_num_key_heads");
+  // The load tells the checkpoint layouts apart by the conv's shape, which a
+  // single tap leaves ambiguous.
+  LK_CHECK(c.linear_conv >= 2, arch + ": linear_conv_kernel_dim must be at least 2");
+  c.eos_token_ids = eos_ids(raw, cfg);
+  c.intermediate_size = static_cast<int>(cfg.int_or("intermediate_size", 0));
+
+  // Qwen3.5's dense model has no experts (MLX-LM would make every layer one);
+  // Qwen3.5-MoE has them in every layer and always renormalizes.
+  const int experts = static_cast<int>(cfg.int_or("num_experts", 0));
+  LK_CHECK(next || moe || experts == 0, arch + ": num_experts needs qwen3_5_moe");
+  std::vector<bool> dense_only(static_cast<size_t>(c.num_layers), false);
+  if (const Json* only = cfg.find("mlp_only_layers"); only != nullptr && only->is_array()) {
+    LK_CHECK(next || only->as_array().empty(), arch + ": mlp_only_layers is not supported");
+    for (const Json& layer : only->as_array()) {
+      const int64_t index = layer.as_int();
+      LK_CHECK(index >= 0 && index < c.num_layers, arch + ": mlp_only_layers entry out of range");
+      dense_only[static_cast<size_t>(index)] = true;
+    }
+  }
+  const int step = static_cast<int>(cfg.int_or("decoder_sparse_step", 1));
+  LK_CHECK(step > 0 && (next || step == 1), arch + ": decoder_sparse_step other than 1 is not supported");
+  if (experts > 0) {
+    c.num_experts = experts;
+    c.experts_per_token = static_cast<int>(cfg.at("num_experts_per_tok").as_int());
+    c.moe_intermediate = static_cast<int>(cfg.at("moe_intermediate_size").as_int());
+    c.shared_intermediate = static_cast<int>(cfg.at("shared_expert_intermediate_size").as_int());
+    c.shared_expert_gate = true;
+    if (next) {
+      c.norm_topk_prob = cfg.at("norm_topk_prob").as_bool();
+    } else {
+      const Json* norm = cfg.find("norm_topk_prob");
+      LK_CHECK(norm == nullptr || (norm->is_bool() && norm->as_bool()), arch + ": norm_topk_prob false is not supported");
+      c.norm_topk_prob = true;
+    }
+    LK_CHECK(c.experts_per_token > 0 && c.experts_per_token <= c.num_experts && c.moe_intermediate > 0 &&
+                 c.shared_intermediate > 0,
+             arch + ": invalid expert configuration");
+    for (int i = 0; i < c.num_layers; ++i) {
+      c.layer_moe.push_back(!dense_only[static_cast<size_t>(i)] && (i + 1) % step == 0);
+    }
+  }
+  for (int i = 0; i < c.num_layers; ++i) {
+    LK_CHECK(c.is_moe(i) || c.intermediate_size > 0, arch + ": dense layers need intermediate_size");
+  }
+  return c;
+}
+
 }  // namespace
 
 bool is_supported_decoder(const Json& raw) {
-  return is_gemma3(raw) || is_gemma4(raw) || is_llama_family(raw) || is_deepseek(raw);
+  return is_gemma3(raw) || is_gemma4(raw) || is_llama_family(raw) || is_deepseek(raw) || is_qwen3_5(raw);
 }
 
 DecoderConfig DecoderConfig::from_json(const Json& raw) {
   LK_CHECK(is_supported_decoder(raw),
            "unsupported architecture '" + model_type(raw) +
                "'; this build supports gemma3, gemma4, llama, mistral, qwen2, qwen3, qwen3_moe, gpt_oss, glm4_moe, "
-               "glm4_moe_lite, deepseek_v2 and deepseek_v3 text models");
+               "glm4_moe_lite, deepseek_v2, deepseek_v3, qwen3_5, qwen3_5_moe and qwen3_next text models");
   DecoderConfig c = is_gemma3(raw)     ? gemma3_config(raw)
                     : is_gemma4(raw)   ? gemma4_config(raw)
                     : is_deepseek(raw) ? deepseek_config(raw)
+                    : is_qwen3_5(raw)  ? qwen3_5_config(raw)
                                        : llama_family_config(raw);
   LK_CHECK(static_cast<int>(c.layer_is_sliding.size()) == c.num_layers,
            c.architecture + ": layer_types length mismatch");
@@ -646,7 +778,7 @@ void bind_experts(const DecoderWeights& w, DecoderLayer& layer, const std::strin
     load_vector(ck, router + ".e_score_correction_bias", c.num_experts, layer.router_correction.data());
   }
   if (c.shared_intermediate > 0) {
-    const std::string shared = p + base + ".mlp.shared_experts.";
+    const std::string shared = p + base + (c.shared_expert_gate ? ".mlp.shared_expert." : ".mlp.shared_experts.");
     layer.shared_gate = bind_linear(ck, w.raw_config, shared + "gate_proj", shared + "gate_proj");
     layer.shared_up = bind_linear(ck, w.raw_config, shared + "up_proj", shared + "up_proj");
     layer.shared_down = bind_linear(ck, w.raw_config, shared + "down_proj", shared + "down_proj");
@@ -654,11 +786,33 @@ void bind_experts(const DecoderWeights& w, DecoderLayer& layer, const std::strin
                  layer.shared_up.rows == c.shared_intermediate && layer.shared_up.cols == c.hidden_size &&
                  layer.shared_down.rows == c.hidden_size && layer.shared_down.cols == c.shared_intermediate,
              base + ": shared expert shape");
+    if (c.shared_expert_gate) {
+      const std::string gate = p + base + ".mlp.shared_expert_gate";
+      layer.shared_expert_gate = bind_linear(ck, w.raw_config, gate, gate);
+      LK_CHECK(layer.shared_expert_gate.rows == 1 && layer.shared_expert_gate.cols == c.hidden_size,
+               base + ": shared_expert_gate shape");
+    }
+  }
+  // Transformers saves Qwen3.5-MoE's experts as fused parameters without a
+  // .weight suffix: gate_up_proj [experts, 2 * moe_intermediate, hidden], the
+  // gate rows first, and down_proj [experts, hidden, moe_intermediate].
+  const std::string fused = p + base + ".mlp.experts.gate_up_proj";
+  if (ck.contains(fused)) {
+    for (const Linear& both : bind_expert_linears(ck, w.raw_config, fused, fused, "")) {
+      LK_CHECK(both.rows == 2 * c.moe_intermediate, base + ": expert shape");
+      layer.expert_gate.push_back(row_slice(both, 0, c.moe_intermediate));
+      layer.expert_up.push_back(row_slice(both, c.moe_intermediate, c.moe_intermediate));
+    }
+    const std::string down = p + base + ".mlp.experts.down_proj";
+    layer.expert_down = bind_expert_linears(ck, w.raw_config, down, down, "");
+    LK_CHECK(static_cast<int>(layer.expert_gate.size()) == c.num_experts &&
+                 static_cast<int>(layer.expert_down.size()) == c.num_experts,
+             base + ": expected " + std::to_string(c.num_experts) + " experts");
   }
   std::vector<Linear>* stacks[] = {&layer.expert_gate, &layer.expert_up, &layer.expert_down};
   std::vector<float>* biases[] = {&layer.expert_gate_bias, &layer.expert_up_bias, &layer.expert_down_bias};
   const char* names[] = {"gate_proj", "up_proj", "down_proj"};
-  for (int k = 0; k < 3; ++k) {
+  for (int k = 0; k < 3 && !ck.contains(fused); ++k) {
     // Stacked [experts, rows, cols]: MLX-LM's switch_mlp (Qwen), experts
     // (GPT-OSS) or MLX-VLM's experts.switch_glu (Gemma 4); otherwise one
     // module per expert.
@@ -755,6 +909,56 @@ void bind_latent_attention(const DecoderWeights& w, DecoderLayer& layer, const s
   LK_CHECK(layer.o_proj.rows == c.hidden_size && layer.o_proj.cols == H * v, base + ": o_proj shape");
 }
 
+// Gated DeltaNet's weights: Qwen3.5's split input projections or Qwen3-Next's
+// grouped ones, the depthwise conv's taps ([channels, 1, taps] as
+// Transformers stores them, [channels, taps, 1] in MLX conversions: the same
+// order in memory), exp(A_log), dt_bias, the gated norm's weight and
+// out_proj. No projection takes a bias.
+void bind_linear_attention(const DecoderWeights& w, DecoderLayer& layer, const std::string& base, bool mlx_layout) {
+  const DecoderConfig& c = w.config;
+  const Checkpoint& ck = *w.checkpoint;
+  const std::string attn = c.weight_prefix + base + ".linear_attn.";
+  auto linear = [&](const char* name) { return bind_linear(ck, w.raw_config, attn + name, attn + name); };
+  auto vector = [&](const std::string& name, int64_t size) {
+    std::vector<float> out(static_cast<size_t>(size));
+    load_vector(ck, attn + name, size, out.data());
+    return out;
+  };
+  for (const char* name : {"in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a", "in_proj_qkvz", "in_proj_ba",
+                           "conv1d", "out_proj"}) {
+    LK_CHECK(!ck.contains(attn + name + ".bias"), base + ".linear_attn." + name + ": unexpected bias for " +
+                                                      c.architecture);
+  }
+  const int64_t hidden = c.hidden_size, channels = c.linear_channels(), taps = c.linear_conv;
+  const int64_t hv = c.linear_v_heads, values = hv * c.linear_v_dim;
+  if (ck.contains(attn + "in_proj_qkvz.weight")) {
+    layer.in_proj_qkvz = linear("in_proj_qkvz");
+    layer.in_proj_ba = linear("in_proj_ba");
+    LK_CHECK(layer.in_proj_qkvz.rows == channels + values && layer.in_proj_qkvz.cols == hidden &&
+                 layer.in_proj_ba.rows == 2 * hv && layer.in_proj_ba.cols == hidden,
+             base + ": in_proj_qkvz/in_proj_ba shape");
+  } else {
+    layer.in_proj_qkv = linear("in_proj_qkv");
+    layer.in_proj_z = linear("in_proj_z");
+    layer.in_proj_b = linear("in_proj_b");
+    layer.in_proj_a = linear("in_proj_a");
+    LK_CHECK(layer.in_proj_qkv.rows == channels && layer.in_proj_qkv.cols == hidden && layer.in_proj_z.rows == values &&
+                 layer.in_proj_z.cols == hidden && layer.in_proj_b.rows == hv && layer.in_proj_b.cols == hidden &&
+                 layer.in_proj_a.rows == hv && layer.in_proj_a.cols == hidden,
+             base + ": in_proj shape");
+  }
+  const std::vector<int64_t> conv_shape =
+      mlx_layout ? std::vector<int64_t>{channels, taps, 1} : std::vector<int64_t>{channels, 1, taps};
+  LK_CHECK(ck.get(attn + "conv1d.weight").shape == conv_shape, base + ": conv1d shape");
+  layer.conv = vector("conv1d.weight", channels * taps);
+  layer.decay_rate = vector("A_log", hv);
+  for (float& rate : layer.decay_rate) rate = static_cast<float>(std::exp(static_cast<double>(rate)));
+  layer.dt_bias = vector("dt_bias", hv);
+  layer.linear_norm = vector("norm.weight", c.linear_v_dim);
+  layer.out_proj = linear("out_proj");
+  LK_CHECK(layer.out_proj.rows == hidden && layer.out_proj.cols == values, base + ": out_proj shape");
+}
+
 }  // namespace
 
 std::shared_ptr<DecoderWeights> DecoderWeights::load(const std::string& directory) {
@@ -772,9 +976,23 @@ std::shared_ptr<DecoderWeights> DecoderWeights::load(const std::string& director
   w->checkpoint = std::make_shared<Checkpoint>(Checkpoint::open_directory(directory));
   const Checkpoint& ck = *w->checkpoint;
   if (ck.contains("language_model.model.embed_tokens.weight")) c.weight_prefix = "language_model.";
-
   const std::string& p = c.weight_prefix;
+  // Transformers saves multimodal models' decoders (Qwen3.5) under
+  // model.language_model.
+  const std::string stem = ck.contains(p + "model.language_model.embed_tokens.weight") ? "model.language_model." : "model.";
   const std::string& arch = c.architecture;
+  // Gated DeltaNet checkpoints: Transformers stores the zero-centered norms'
+  // w and its conv weights [channels, 1, taps]; MLX conversions store 1 + w
+  // and [channels, taps, 1].
+  bool mlx_layout = false;
+  for (int i = 0; i < c.num_layers; ++i) {
+    if (!c.is_linear(i)) continue;
+    const TensorView& conv = ck.get(p + stem + "layers." + std::to_string(i) + ".linear_attn.conv1d.weight");
+    LK_CHECK(conv.shape.size() == 3 && (conv.dim(1) == 1) != (conv.dim(2) == 1), arch + ": conv1d shape");
+    mlx_layout = conv.dim(2) == 1;
+    c.norm_offset = mlx_layout ? 0.0f : 1.0f;
+    break;
+  }
   auto linear = [&](const std::string& module) {
     return bind_linear(ck, w->raw_config, p + module, p + module);
   };
@@ -789,7 +1007,7 @@ std::shared_ptr<DecoderWeights> DecoderWeights::load(const std::string& director
     return out;
   };
 
-  w->embed = linear("model.embed_tokens");
+  w->embed = linear(stem + "embed_tokens");
   LK_CHECK(w->embed.rows == c.vocab_size && w->embed.cols == c.hidden_size, arch + ": embed_tokens shape mismatch");
   if (ck.contains(p + "lm_head.weight")) {
     w->lm_head = linear("lm_head");
@@ -803,13 +1021,13 @@ std::shared_ptr<DecoderWeights> DecoderWeights::load(const std::string& director
     w->lm_head = w->embed;
     w->tied_lm_head = true;
   }
-  w->final_norm = vec("model.norm", c.hidden_size);
+  w->final_norm = vec(stem + "norm", c.hidden_size);
   if (c.per_layer_input > 0) {
     const int64_t width = static_cast<int64_t>(c.num_layers) * c.per_layer_input;
     const Json& cfg = text_config(w->raw_config);
-    w->embed_per_layer = linear("model.embed_tokens_per_layer");
-    w->per_layer_model_proj = linear("model.per_layer_model_projection");
-    w->per_layer_proj_norm = vec("model.per_layer_projection_norm", c.per_layer_input);
+    w->embed_per_layer = linear(stem + "embed_tokens_per_layer");
+    w->per_layer_model_proj = linear(stem + "per_layer_model_projection");
+    w->per_layer_proj_norm = vec(stem + "per_layer_projection_norm", c.per_layer_input);
     LK_CHECK(w->embed_per_layer.rows == cfg.int_or("vocab_size_per_layer_input", c.vocab_size) &&
                  w->embed_per_layer.cols == width,
              arch + ": embed_tokens_per_layer shape mismatch");
@@ -817,7 +1035,7 @@ std::shared_ptr<DecoderWeights> DecoderWeights::load(const std::string& director
              arch + ": per_layer_model_projection shape mismatch");
   }
   for (int i = 0; i < c.num_layers; ++i) {
-    const std::string base = "model.layers." + std::to_string(i);
+    const std::string base = stem + "layers." + std::to_string(i);
     const int64_t dim = c.head_dim_of(i);
     const int64_t q_out = static_cast<int64_t>(c.num_heads) * dim;
     const int64_t kv_out = static_cast<int64_t>(c.kv_heads_of(i)) * dim;
@@ -835,7 +1053,9 @@ std::shared_ptr<DecoderWeights> DecoderWeights::load(const std::string& director
       // Pre-norm families name the norm before the MLP post_attention_layernorm.
       layer.mlp_norm = vec(base + ".post_attention_layernorm", c.hidden_size);
     }
-    if (c.mla()) {
+    if (c.is_linear(i)) {
+      bind_linear_attention(*w, layer, base, mlx_layout);
+    } else if (c.mla()) {
       bind_latent_attention(*w, layer, base);
     } else if (c.qk_norm) {
       layer.q_norm = vec(base + ".self_attn.q_norm", dim);
@@ -861,7 +1081,7 @@ std::shared_ptr<DecoderWeights> DecoderWeights::load(const std::string& director
       layer.sinks.resize(static_cast<size_t>(c.num_heads));
       load_vector(ck, p + base + ".self_attn.sinks", c.num_heads, layer.sinks.data());
     }
-    if (!c.mla()) {
+    if (!c.mla() && !c.is_linear(i)) {
       layer.q_proj = linear(base + ".self_attn.q_proj");
       if (own_kv) {
         layer.k_proj = linear(base + ".self_attn.k_proj");
@@ -871,7 +1091,9 @@ std::shared_ptr<DecoderWeights> DecoderWeights::load(const std::string& director
                  base + ": k/v shape");
       }
       layer.o_proj = linear(base + ".self_attn.o_proj");
-      LK_CHECK(layer.q_proj.rows == q_out && layer.q_proj.cols == c.hidden_size, base + ": q_proj shape");
+      // With an output gate, each head's query rows are followed by its gate's.
+      const int64_t q_rows = c.attn_output_gate ? 2 * q_out : q_out;
+      LK_CHECK(layer.q_proj.rows == q_rows && layer.q_proj.cols == c.hidden_size, base + ": q_proj shape");
       LK_CHECK(layer.o_proj.rows == c.hidden_size && layer.o_proj.cols == q_out, base + ": o_proj shape");
     }
     if (c.is_moe(i)) bind_experts(*w, layer, base);
@@ -918,7 +1140,9 @@ size_t DecoderWeights::matrix_bytes() const {
              l.down_proj.weight_bytes() + l.per_layer_gate.weight_bytes() + l.per_layer_proj.weight_bytes() +
              l.router.weight_bytes() + l.shared_gate.weight_bytes() + l.shared_up.weight_bytes() +
              l.shared_down.weight_bytes() + l.q_a_proj.weight_bytes() + l.kv_a_proj.weight_bytes() +
-             l.kv_b_proj.weight_bytes();
+             l.kv_b_proj.weight_bytes() + l.shared_expert_gate.weight_bytes() + l.in_proj_qkv.weight_bytes() +
+             l.in_proj_z.weight_bytes() + l.in_proj_b.weight_bytes() + l.in_proj_a.weight_bytes() +
+             l.in_proj_qkvz.weight_bytes() + l.in_proj_ba.weight_bytes() + l.out_proj.weight_bytes();
     for (const auto* experts : {&l.expert_gate, &l.expert_up, &l.expert_down, &l.embed_q}) {
       for (const Linear& expert : *experts) total += expert.weight_bytes();
     }
@@ -937,7 +1161,9 @@ bool DecoderWeights::dense_mxfp4() const {
   for (const auto& l : layers) {
     for (const Linear* m : {&l.q_proj, &l.k_proj, &l.v_proj, &l.o_proj, &l.gate_proj, &l.up_proj, &l.down_proj,
                             &l.per_layer_gate, &l.per_layer_proj, &l.router, &l.shared_gate, &l.shared_up,
-                            &l.shared_down, &l.q_a_proj, &l.kv_a_proj, &l.kv_b_proj}) {
+                            &l.shared_down, &l.q_a_proj, &l.kv_a_proj, &l.kv_b_proj, &l.shared_expert_gate,
+                            &l.in_proj_qkv, &l.in_proj_z, &l.in_proj_b, &l.in_proj_a, &l.in_proj_qkvz,
+                            &l.in_proj_ba, &l.out_proj}) {
       if (m->quant.mxfp4()) return true;
     }
     for (const auto* heads : {&l.embed_q, &l.unembed_out}) {
@@ -993,6 +1219,18 @@ double latent_out(const DecoderLayer& L, int n) {
   return bytes;
 }
 
+double linear_projections(const DecoderLayer& L, int n) {
+  if (L.in_proj_qkvz.rows > 0) return linear(L.in_proj_qkvz, n) + linear(L.in_proj_ba, n);
+  return linear(L.in_proj_qkv, n) + linear(L.in_proj_z, n) + linear(L.in_proj_b, n) + linear(L.in_proj_a, n);
+}
+
+double linear_recurrence(const DecoderConfig& c, int n) {
+  const double state = static_cast<double>(c.linear_v_heads) * c.linear_k_dim * c.linear_v_dim;
+  const double per_token = 2.0 * c.linear_k_heads * c.linear_k_dim + 2.0 * c.linear_v_heads * c.linear_v_dim +
+                           2.0 * c.linear_v_heads;
+  return 4.0 * (2.0 * state + n * per_token);
+}
+
 }  // namespace traffic
 
 Linear latent_absorption(const DecoderConfig& c, const DecoderLayer& L, int head) {
@@ -1024,6 +1262,8 @@ float gelu_tanh(float x) {
 
 float silu(float x) { return x / (1.0f + std::exp(-x)); }
 
+float sigmoid(float x) { return 1.0f / (1.0f + std::exp(-x)); }
+
 // Times the enclosing block into `profiler` as `name` (no-op without one).
 class Section {
  public:
@@ -1052,10 +1292,20 @@ class DecoderCpu final : public Model {
     kv_k_.resize(layers);
     kv_v_.resize(layers);
     capacity_.resize(layers);
+    conv_state_.resize(layers);
+    delta_state_.resize(layers);
     for (int l = 0; l < c_.num_layers; ++l) {
       max_q_ = std::max<size_t>(max_q_, static_cast<size_t>(c_.num_heads) * c_.head_dim_of(l));
       max_kv_ = std::max<size_t>(max_kv_, static_cast<size_t>(c_.kv_heads_of(l)) * c_.head_dim_of(l));
       max_inter_ = std::max<size_t>(max_inter_, static_cast<size_t>(c_.intermediate_of(l)));
+      if (c_.is_linear(l)) {
+        // A Gated DeltaNet layer keeps its conv's last inputs and one state
+        // per value head instead of keys and values.
+        conv_state_[static_cast<size_t>(l)].assign(static_cast<size_t>(c_.linear_conv - 1) * c_.linear_channels(), 0.0f);
+        delta_state_[static_cast<size_t>(l)].assign(
+            static_cast<size_t>(c_.linear_v_heads) * c_.linear_k_dim * c_.linear_v_dim, 0.0f);
+        continue;
+      }
       if (c_.mla()) {
         // One latent per position; the values are its prefix.
         max_q_ = std::max<size_t>(max_q_, static_cast<size_t>(c_.num_heads) * c_.v_head_dim);
@@ -1091,6 +1341,11 @@ class DecoderCpu final : public Model {
   void reset() override {
     position_ = 0;
     injection_ = {};
+    // Keys and values are rewritten before they are read; recurrent states
+    // are not.
+    for (auto* states : {&conv_state_, &delta_state_}) {
+      for (std::vector<float>& state : *states) std::fill(state.begin(), state.end(), 0.0f);
+    }
   }
 
   const float* prefill(const int32_t* tokens, int n) override {
@@ -1273,7 +1528,9 @@ class DecoderCpu final : public Model {
         Section section(profiler_, "norm", norm_bytes);
         for (int t = 0; t < n; ++t) norm(x_.data() + t * hidden, L.attn_norm, hidden, h_.data() + t * hidden);
       }
-      if (c_.mla()) {
+      if (c_.is_linear(l)) {
+        gated_delta_net(L, l, n);
+      } else if (c_.mla()) {
         latent_attention(L, l, start, n);
       } else {
         {
@@ -1282,7 +1539,20 @@ class DecoderCpu final : public Model {
                                           (own_kv ? traffic::linear(L.k_proj, n) : 0.0) +
                                           (own_kv && !c_.k_eq_v(l) ? traffic::linear(L.v_proj, n) : 0.0)
                                     : 0.0);
-          matmul(L.q_proj, h_.data(), n, q_.data(), pool_);
+          if (c_.attn_output_gate) {
+            // Each head's query, then its output gate.
+            const size_t width = static_cast<size_t>(H) * D;
+            q_gate_.resize(sn * 2 * width);
+            out_gate_.resize(sn * width);
+            matmul(L.q_proj, h_.data(), n, q_gate_.data(), pool_);
+            for (size_t row = 0; row < sn * H; ++row) {
+              const float* both = q_gate_.data() + row * 2 * D;
+              std::copy_n(both, D, q_.data() + row * D);
+              std::copy_n(both + D, D, out_gate_.data() + row * D);
+            }
+          } else {
+            matmul(L.q_proj, h_.data(), n, q_.data(), pool_);
+          }
           if (own_kv) {
             matmul(L.k_proj, h_.data(), n, k_.data(), pool_);
             if (c_.k_eq_v(l)) {
@@ -1328,7 +1598,13 @@ class DecoderCpu final : public Model {
           attend(l, start, n, sliding, c_.attention_sinks ? L.sinks.data() : nullptr);
         }
         {
-          Section section(profiler_, "o_proj", profiling ? traffic::linear(L.o_proj, n) : 0.0);
+          Section section(profiler_, "o_proj",
+                          profiling ? traffic::linear(L.o_proj, n) +
+                                          (c_.attn_output_gate ? traffic::rows(static_cast<int64_t>(H) * D, n, 3) : 0.0)
+                                    : 0.0);
+          if (c_.attn_output_gate) {
+            for (size_t i = 0; i < sn * H * D; ++i) attn_[i] *= sigmoid(out_gate_[i]);
+          }
           matmul(L.o_proj, attn_.data(), n, r_.data(), pool_);
           if (c_.o_bias) {
             for (int t = 0; t < n; ++t) add_bias(r_.data() + static_cast<size_t>(t) * hidden, L.o_bias);
@@ -1538,6 +1814,149 @@ class DecoderCpu final : public Model {
     });
   }
 
+  // Gated DeltaNet over the normed rows in h_, into r_ (see DecoderConfig).
+  // Each value head's recurrence runs token by token; the heads run in
+  // parallel.
+  void gated_delta_net(const DecoderLayer& L, int l, int n) {
+    const int Hk = c_.linear_k_heads, Hv = c_.linear_v_heads, dk = c_.linear_k_dim, dv = c_.linear_v_dim;
+    const int C = c_.linear_channels(), taps = c_.linear_conv, values = Hv * dv;
+    const size_t sn = static_cast<size_t>(n);
+    const bool profiling = profiler_ != nullptr;
+    mixed_.resize(sn * C);
+    z_.resize(sn * values);
+    beta_.resize(sn * Hv);
+    decay_.resize(sn * Hv);
+    {
+      Section section(profiler_, "qkv", profiling ? traffic::linear_projections(L, n) : 0.0);
+      if (L.in_proj_qkvz.rows > 0) {
+        // Qwen3-Next: each key head's [q, k, v, z] rows, then its [b, a] rows,
+        // into the [q | k | v] channels, z, b (in beta_) and a (in decay_).
+        const int r = Hv / Hk;
+        const size_t group = static_cast<size_t>(2 * dk + 2 * r * dv);
+        grouped_.resize(sn * Hk * group);
+        grouped_ba_.resize(sn * Hk * 2 * r);
+        matmul(L.in_proj_qkvz, h_.data(), n, grouped_.data(), pool_);
+        matmul(L.in_proj_ba, h_.data(), n, grouped_ba_.data(), pool_);
+        for (size_t t = 0; t < sn; ++t) {
+          float* channels = mixed_.data() + t * C;
+          for (int kh = 0; kh < Hk; ++kh) {
+            const float* src = grouped_.data() + (t * Hk + kh) * group;
+            std::copy_n(src, dk, channels + kh * dk);
+            std::copy_n(src + dk, dk, channels + (Hk + kh) * dk);
+            std::copy_n(src + 2 * dk, r * dv, channels + 2 * Hk * dk + kh * r * dv);
+            std::copy_n(src + 2 * dk + r * dv, r * dv, z_.data() + t * values + kh * r * dv);
+            const float* ba = grouped_ba_.data() + (t * Hk + kh) * 2 * r;
+            std::copy_n(ba, r, beta_.data() + t * Hv + kh * r);
+            std::copy_n(ba + r, r, decay_.data() + t * Hv + kh * r);
+          }
+        }
+      } else {
+        matmul(L.in_proj_qkv, h_.data(), n, mixed_.data(), pool_);
+        matmul(L.in_proj_z, h_.data(), n, z_.data(), pool_);
+        matmul(L.in_proj_b, h_.data(), n, beta_.data(), pool_);
+        matmul(L.in_proj_a, h_.data(), n, decay_.data(), pool_);
+      }
+    }
+    {
+      Section section(profiler_, "rope_kv",
+                      profiling ? traffic::rows(C, n, 2) + 4.0 * C * (2.0 * (taps - 1) + taps) + traffic::rows(Hv, n, 4)
+                                : 0.0);
+      // The causal depthwise conv over the pass's inputs, preceded by the
+      // layer's last taps - 1, then SiLU.
+      std::vector<float>& state = conv_state_[static_cast<size_t>(l)];
+      const size_t history = static_cast<size_t>(taps - 1) * C;
+      conv_in_.resize(history + sn * C);
+      std::copy(state.begin(), state.end(), conv_in_.begin());
+      std::copy_n(mixed_.data(), sn * C, conv_in_.data() + history);
+      for (size_t t = 0; t < sn; ++t) {
+        float* out = mixed_.data() + t * C;
+        for (int ch = 0; ch < C; ++ch) {
+          const float* tap = L.conv.data() + static_cast<size_t>(ch) * taps;
+          float sum = 0.0f;
+          for (int k = 0; k < taps; ++k) sum += tap[k] * conv_in_[(t + k) * C + ch];
+          out[ch] = silu(sum);
+        }
+      }
+      std::copy_n(conv_in_.data() + sn * C, history, state.data());
+      // q and k L2-normalized per key head, q also scaled by dk^-0.5.
+      const double q_scale = 1.0 / std::sqrt(static_cast<double>(dk));
+      auto l2_normalize = [&](float* vec, double scale) {
+        double sum = 0.0;
+        for (int i = 0; i < dk; ++i) sum += static_cast<double>(vec[i]) * vec[i];
+        const float inv = static_cast<float>(scale / std::sqrt(sum + 1e-6));
+        for (int i = 0; i < dk; ++i) vec[i] *= inv;
+      };
+      for (size_t t = 0; t < sn; ++t) {
+        for (int kh = 0; kh < Hk; ++kh) {
+          l2_normalize(mixed_.data() + t * C + kh * dk, q_scale);
+          l2_normalize(mixed_.data() + t * C + (Hk + kh) * dk, 1.0);
+        }
+      }
+      // beta = sigmoid(b); the decay exp(g), g = -exp(A_log) * softplus(a + dt_bias).
+      for (size_t t = 0; t < sn; ++t) {
+        for (int h = 0; h < Hv; ++h) {
+          const size_t i = t * Hv + h;
+          beta_[i] = sigmoid(beta_[i]);
+          const double x = static_cast<double>(decay_[i]) + L.dt_bias[static_cast<size_t>(h)];
+          const double softplus = x > 0.0 ? x + std::log1p(std::exp(-x)) : std::log1p(std::exp(x));
+          decay_[i] = static_cast<float>(std::exp(-static_cast<double>(L.decay_rate[static_cast<size_t>(h)]) * softplus));
+        }
+      }
+    }
+    linear_out_.resize(sn * values);
+    {
+      Section section(profiler_, "attention", profiling ? traffic::linear_recurrence(c_, n) : 0.0);
+      float* states = delta_state_[static_cast<size_t>(l)].data();
+      const int ratio = Hv / Hk;
+      pool_.parallel_for(static_cast<size_t>(Hv), [&](size_t begin, size_t end) {
+        std::vector<float> delta(static_cast<size_t>(dv));
+        for (size_t h = begin; h < end; ++h) {
+          float* S = states + h * dk * dv;  // [dk, dv]
+          const int kh = static_cast<int>(h) / ratio;
+          for (size_t t = 0; t < sn; ++t) {
+            const float* row = mixed_.data() + t * C;
+            const float* q = row + kh * dk;
+            const float* k = row + (Hk + kh) * dk;
+            const float* v = row + 2 * Hk * dk + h * dv;
+            const float decay = decay_[t * Hv + h], beta = beta_[t * Hv + h];
+            // S *= decay, and delta = (v - S^T k) * beta.
+            std::fill(delta.begin(), delta.end(), 0.0f);
+            for (int i = 0; i < dk; ++i) {
+              float* Si = S + static_cast<size_t>(i) * dv;
+              const float ki = k[i];
+              for (int j = 0; j < dv; ++j) {
+                Si[j] *= decay;
+                delta[static_cast<size_t>(j)] += Si[j] * ki;
+              }
+            }
+            for (int j = 0; j < dv; ++j) delta[static_cast<size_t>(j)] = (v[j] - delta[static_cast<size_t>(j)]) * beta;
+            // S += k delta^T, and the output S^T q.
+            float* out = linear_out_.data() + (t * Hv + h) * dv;
+            std::fill(out, out + dv, 0.0f);
+            for (int i = 0; i < dk; ++i) {
+              float* Si = S + static_cast<size_t>(i) * dv;
+              const float ki = k[i], qi = q[i];
+              for (int j = 0; j < dv; ++j) {
+                Si[j] += ki * delta[static_cast<size_t>(j)];
+                out[j] += Si[j] * qi;
+              }
+            }
+          }
+        }
+      });
+    }
+    Section section(profiler_, "o_proj",
+                    profiling ? traffic::linear(L.out_proj, n) + traffic::rows(values, n, 3) + 4.0 * dv : 0.0);
+    // The gated norm per value head: rms(o) * w * silu(z), with a plain weight.
+    for (size_t row = 0; row < sn * Hv; ++row) {
+      float* o = linear_out_.data() + row * dv;
+      const float* z = z_.data() + row * dv;
+      rms_norm(o, L.linear_norm.data(), dv, c_.rms_norm_eps, 0.0f, o);
+      for (int j = 0; j < dv; ++j) o[j] *= silu(z[j]);
+    }
+    matmul(L.out_proj, linear_out_.data(), n, r_.data(), pool_);
+  }
+
   // gate[i] = act(gate[i]) * up[i]
   void gated_activation(float* gate, const float* up, size_t count) const {
     if (c_.activation == Activation::GeluTanh) {
@@ -1726,7 +2145,8 @@ class DecoderCpu final : public Model {
     }
     if (profiler_ && c_.shared_intermediate > 0) {
       bytes += traffic::linear(L.shared_gate, n) + traffic::linear(L.shared_up, n) +
-               traffic::linear(L.shared_down, n) + traffic::rows(c_.shared_intermediate, n, 1);
+               traffic::linear(L.shared_down, n) + traffic::rows(c_.shared_intermediate, n, 1) +
+               (c_.shared_expert_gate ? traffic::linear(L.shared_expert_gate, n) : 0.0);
     }
     Section section(profiler_, "experts", bytes);
     std::fill(r_.begin(), r_.begin() + static_cast<std::ptrdiff_t>(sn * hidden), 0.0f);
@@ -1737,6 +2157,15 @@ class DecoderCpu final : public Model {
       matmul(L.shared_up, expert_in, n, expert_up_.data(), pool_);
       gated_activation(expert_gate_.data(), expert_up_.data(), sn * c_.shared_intermediate);
       matmul(L.shared_down, expert_gate_.data(), n, r_.data(), pool_);
+      if (c_.shared_expert_gate) {  // times sigmoid(shared_expert_gate(x))
+        shared_scale_.resize(sn);
+        matmul(L.shared_expert_gate, expert_in, n, shared_scale_.data(), pool_);
+        for (size_t t = 0; t < sn; ++t) {
+          const float scale = sigmoid(shared_scale_[t]);
+          float* row = r_.data() + t * hidden;
+          for (int64_t d = 0; d < hidden; ++d) row[d] *= scale;
+        }
+      }
     }
     for (int e = 0; e < E; ++e) {
       const auto& tokens = routed[static_cast<size_t>(e)];
@@ -1865,6 +2294,15 @@ class DecoderCpu final : public Model {
   // width], latent outputs [n, H, rank], and one head's gathered rows.
   std::vector<float> q_latent_, latent_q_, latent_out_, head_in_, head_out_;
   std::vector<int> chosen_;
+  // Gated attention: q_proj's [n, H, query | gate] rows and the gates [n, H * D].
+  std::vector<float> q_gate_, out_gate_;
+  std::vector<float> shared_scale_;  // the shared expert's gate logits [n]
+  // Gated DeltaNet: each layer's conv history [taps - 1, channels] and states
+  // [Hv, dk, dv] (empty for other layers); the pass's [q | k | v] channels,
+  // z, beta and decay; the conv's padded input; Qwen3-Next's grouped
+  // projections; the recurrence's outputs [n, Hv * dv].
+  std::vector<std::vector<float>> conv_state_, delta_state_;
+  std::vector<float> mixed_, z_, beta_, decay_, conv_in_, grouped_, grouped_ba_, linear_out_;
 };
 
 }  // namespace

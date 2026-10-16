@@ -108,9 +108,11 @@ def _tensor_f32(dtype: str, array: np.ndarray) -> np.ndarray:
 def load_dense_weights(model_dir: Path) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     """Load ``config.json`` and every safetensors shard as float32 matrices.
 
-    Returned names have the ``language_model.`` prefix and the quantization
-    triple suffixes removed, e.g. ``model.layers.0.mlp.up_proj``. Linear
-    biases keep their suffix, e.g. ``model.layers.0.self_attn.q_proj.bias``.
+    Returned names have the ``language_model.`` prefix (or Transformers'
+    multimodal ``model.language_model.`` stem, which becomes ``model.``) and
+    the quantization triple suffixes removed, e.g.
+    ``model.layers.0.mlp.up_proj``. Linear biases keep their suffix, e.g.
+    ``model.layers.0.self_attn.q_proj.bias``.
     """
 
     model_dir = Path(model_dir)
@@ -121,6 +123,8 @@ def load_dense_weights(model_dir: Path) -> tuple[dict[str, Any], dict[str, np.nd
         tensors.update(shard_tensors)
 
     def strip(name: str) -> str:
+        if name.startswith("model.language_model."):
+            return "model." + name[len("model.language_model.") :]
         return name[len("language_model.") :] if name.startswith("language_model.") else name
 
     dense: dict[str, np.ndarray] = {}

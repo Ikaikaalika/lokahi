@@ -1,0 +1,329 @@
+"""NumPy reference for Qwen3.5 and Qwen3-Next text: Gated DeltaNet layers between gated attention.
+
+Semantics follow Transformers' ``Qwen3_5ForCausalLM`` (the text model of
+``Qwen3_5ForConditionalGeneration``), ``Qwen3_5MoeForCausalLM`` and
+``Qwen3NextForCausalLM``:
+
+* RMSNorms are zero-centered, ``x * rsqrt(mean(x^2) + eps) * (1 + w)``: the
+  input, post-attention and final norms and the per-head q/k norms. MLX
+  conversions store ``1 + w`` (and their conv1d weights as [C, K, 1] rather
+  than [C, 1, K], which is how the reference tells the layouts apart);
+* ``layer_types`` lists each layer as ``linear_attention`` or
+  ``full_attention`` (by default every ``full_attention_interval``-th, 4, is
+  full);
+* full attention: ``q_proj`` gives each head its query and an output gate
+  (``head_dim`` each, in that order); q and k are RMS-normed per head; RoPE
+  rotates halves within the first ``partial_rotary_factor`` of each head
+  (Qwen3.5's multimodal RoPE reduces to this for text, whose three position
+  axes coincide); grouped-query softmax attention; the output times
+  ``sigmoid(gate)``; ``o_proj``;
+* Gated DeltaNet: ``in_proj_qkv``, ``in_proj_z``, ``in_proj_b`` and
+  ``in_proj_a`` (Qwen3.5), or Qwen3-Next's ``in_proj_qkvz`` and ``in_proj_ba``
+  grouped per key head; a depthwise causal conv1d (kernel
+  ``linear_conv_kernel_dim``, no bias) over the q, k and v channels, then
+  SiLU; ``beta = sigmoid(b)`` and ``g = -exp(A_log) * softplus(a + dt_bias)``;
+  q and k L2-normalized (``x * rsqrt(sum(x^2) + 1e-6)``) and q scaled by
+  ``dk^-0.5``; value head h reads key head ``h // (Hv / Hk)``; per token the
+  state S [dk, dv] decays by ``exp(g)``, takes ``k (beta (v - S^T k))^T`` and
+  outputs ``S^T q`` (the recurrent form, which Transformers' chunked prefill
+  computes in another order); a gated RMSNorm per value head,
+  ``rms(o) * w * silu(z)`` (a plain weight); ``out_proj``;
+* MLP: SiLU-gated; mixture-of-experts layers (every layer of Qwen3.5-MoE,
+  which always renormalizes; Qwen3-Next's by ``decoder_sparse_step`` and
+  ``mlp_only_layers``, renormalized with ``norm_topk_prob``) take the top
+  ``num_experts_per_tok`` of a softmax router plus a shared expert times
+  ``sigmoid(shared_expert_gate(x))``. Transformers saves Qwen3.5-MoE's
+  experts fused, ``gate_up_proj`` [E, 2I, H] with the gate rows first.
+
+Quantized MLX checkpoints are dequantized to float32 on load.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Mapping, Sequence
+
+import numpy as np
+
+from .gemma3 import load_dense_weights
+
+FAMILIES = ("qwen3_5", "qwen3_5_text", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next")
+L2_EPS = 1e-6
+
+
+@dataclass(frozen=True)
+class Qwen35Config:
+    model_type: str
+    vocab_size: int
+    hidden_size: int
+    intermediate_size: int
+    num_hidden_layers: int
+    num_attention_heads: int
+    num_key_value_heads: int
+    head_dim: int
+    rms_norm_eps: float
+    rope_theta: float
+    partial_rotary_factor: float
+    layer_types: tuple[str, ...]
+    linear_num_key_heads: int
+    linear_num_value_heads: int
+    linear_key_head_dim: int
+    linear_value_head_dim: int
+    linear_conv_kernel_dim: int
+    num_experts: int = 0
+    num_experts_per_tok: int = 0
+    moe_intermediate_size: int = 0
+    shared_expert_intermediate_size: int = 0
+    norm_topk_prob: bool = True
+    decoder_sparse_step: int = 1
+    mlp_only_layers: tuple[int, ...] = ()
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "Qwen35Config":
+        cfg = raw.get("text_config") or raw
+        model_type = cfg.get("model_type", raw.get("model_type"))
+        if model_type not in FAMILIES:
+            raise NotImplementedError(f"model_type {model_type!r}")
+        rope = cfg.get("rope_parameters") or {}
+        layers = int(cfg["num_hidden_layers"])
+        types = cfg.get("layer_types")
+        if types is None:
+            interval = int(cfg.get("full_attention_interval", 4))
+            types = ["linear_attention" if (i + 1) % interval else "full_attention" for i in range(layers)]
+        heads = int(cfg["num_attention_heads"])
+        moe = model_type.startswith("qwen3_5_moe")
+        if not cfg.get("attn_output_gate", True):
+            raise NotImplementedError("attn_output_gate false")
+        return cls(
+            model_type=model_type,
+            vocab_size=int(cfg["vocab_size"]),
+            hidden_size=int(cfg["hidden_size"]),
+            intermediate_size=int(cfg.get("intermediate_size") or 0),
+            num_hidden_layers=layers,
+            num_attention_heads=heads,
+            num_key_value_heads=int(cfg.get("num_key_value_heads", heads)),
+            head_dim=int(cfg.get("head_dim") or int(cfg["hidden_size"]) // heads),
+            rms_norm_eps=float(cfg.get("rms_norm_eps", 1e-6)),
+            rope_theta=float(rope.get("rope_theta", cfg.get("rope_theta", 10_000.0))),
+            partial_rotary_factor=float(rope.get("partial_rotary_factor", cfg.get("partial_rotary_factor", 0.25))),
+            layer_types=tuple(types),
+            linear_num_key_heads=int(cfg["linear_num_key_heads"]),
+            linear_num_value_heads=int(cfg["linear_num_value_heads"]),
+            linear_key_head_dim=int(cfg["linear_key_head_dim"]),
+            linear_value_head_dim=int(cfg["linear_value_head_dim"]),
+            linear_conv_kernel_dim=int(cfg.get("linear_conv_kernel_dim", 4)),
+            num_experts=int(cfg.get("num_experts") or 0),
+            num_experts_per_tok=int(cfg.get("num_experts_per_tok") or 0),
+            moe_intermediate_size=int(cfg.get("moe_intermediate_size") or 0),
+            shared_expert_intermediate_size=int(cfg.get("shared_expert_intermediate_size") or 0),
+            norm_topk_prob=True if moe else bool(cfg.get("norm_topk_prob", True)),
+            decoder_sparse_step=1 if moe else int(cfg.get("decoder_sparse_step") or 1),
+            mlp_only_layers=() if moe else tuple(cfg.get("mlp_only_layers") or ()),
+        )
+
+    @property
+    def rotary_dim(self) -> int:
+        return int(self.head_dim * self.partial_rotary_factor)
+
+    def sparse(self, layer: int) -> bool:
+        return (
+            self.num_experts > 0
+            and layer not in self.mlp_only_layers
+            and (layer + 1) % self.decoder_sparse_step == 0
+        )
+
+    def inv_freq(self) -> np.ndarray:
+        dim = self.rotary_dim
+        return 1.0 / (self.rope_theta ** (np.arange(0, dim, 2, dtype=np.float64) / dim))
+
+
+def _silu(x: np.ndarray) -> np.ndarray:
+    return x / (1.0 + np.exp(-x))
+
+
+def _rms(x: np.ndarray, eps: float) -> np.ndarray:
+    variance = np.mean(x.astype(np.float64) ** 2, axis=-1, keepdims=True)
+    return (x / np.sqrt(variance + eps)).astype(np.float32)
+
+
+class Qwen35Reference:
+    """Full-recompute float32 model for Qwen3.5 and Qwen3-Next text."""
+
+    def __init__(self, config: Qwen35Config, weights: Mapping[str, np.ndarray]):
+        self.config = config
+        self.w = dict(weights)
+        if "lm_head" not in self.w:
+            self.w["lm_head"] = self.w["model.embed_tokens"]
+        # MLX conversions store the zero-centered norms as 1 + w and their
+        # depthwise conv weights as [C, K, 1].
+        first = next(i for i, kind in enumerate(config.layer_types) if kind == "linear_attention")
+        conv = self.w[f"model.layers.{first}.linear_attn.conv1d"]
+        self.mlx_layout = conv.shape[-1] == 1 and config.linear_conv_kernel_dim != 1
+        self.norm_offset = 0.0 if self.mlx_layout else 1.0
+
+    @classmethod
+    def load(cls, model_dir: Path) -> "Qwen35Reference":
+        raw, weights = load_dense_weights(model_dir)
+        return cls(Qwen35Config.from_dict(raw), weights)
+
+    def _norm(self, name: str, x: np.ndarray) -> np.ndarray:
+        return _rms(x, self.config.rms_norm_eps) * (self.norm_offset + self.w[name])
+
+    def _attention(self, index: int, x: np.ndarray, positions: np.ndarray) -> np.ndarray:
+        cfg = self.config
+        prefix = f"model.layers.{index}.self_attn"
+        tokens, heads, kv_heads, dim = x.shape[0], cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
+        q_and_gate = (x @ self.w[f"{prefix}.q_proj"].T).reshape(tokens, heads, 2 * dim)
+        q, gate = q_and_gate[..., :dim], q_and_gate[..., dim:].reshape(tokens, heads * dim)
+        k = (x @ self.w[f"{prefix}.k_proj"].T).reshape(tokens, kv_heads, dim)
+        v = (x @ self.w[f"{prefix}.v_proj"].T).reshape(tokens, kv_heads, dim)
+        q = self._norm(f"{prefix}.q_norm", q)
+        k = self._norm(f"{prefix}.k_norm", k)
+        rot = cfg.rotary_dim
+        angles = positions[:, None].astype(np.float64) * cfg.inv_freq()[None, :]
+        cos = np.cos(angles).astype(np.float32)[:, None, :]
+        sin = np.sin(angles).astype(np.float32)[:, None, :]
+
+        def rope(t: np.ndarray) -> np.ndarray:
+            half = rot // 2
+            a, b = t[..., :half], t[..., half:rot]
+            return np.concatenate([a * cos - b * sin, b * cos + a * sin, t[..., rot:]], axis=-1)
+
+        q, k = rope(q), rope(k)
+        allowed = positions[None, :] <= positions[:, None]
+        group = heads // kv_heads
+        out = np.empty((tokens, heads, dim), dtype=np.float32)
+        for head in range(heads):
+            scores = (q[:, head] @ k[:, head // group].T).astype(np.float64) * dim**-0.5
+            scores = np.where(allowed, scores, -np.inf)
+            scores -= scores.max(axis=-1, keepdims=True)
+            probs = np.exp(scores)
+            probs /= probs.sum(axis=-1, keepdims=True)
+            out[:, head] = (probs @ v[:, head // group]).astype(np.float32)
+        out = out.reshape(tokens, heads * dim) * (1.0 / (1.0 + np.exp(-gate)))
+        return out @ self.w[f"{prefix}.o_proj"].T
+
+    def _linear_projections(self, prefix: str, x: np.ndarray) -> tuple[np.ndarray, ...]:
+        """``[q | k | v]`` channels, z [tokens, Hv * dv], b and a [tokens, Hv]."""
+
+        cfg = self.config
+        hk, hv, dk, dv = (cfg.linear_num_key_heads, cfg.linear_num_value_heads, cfg.linear_key_head_dim,
+                          cfg.linear_value_head_dim)
+        tokens = x.shape[0]
+        if f"{prefix}.in_proj_qkv" in self.w:
+            return (x @ self.w[f"{prefix}.in_proj_qkv"].T, x @ self.w[f"{prefix}.in_proj_z"].T,
+                    x @ self.w[f"{prefix}.in_proj_b"].T, x @ self.w[f"{prefix}.in_proj_a"].T)
+        # Qwen3-Next: each key head's [q, k, v, z] rows, then its [b, a].
+        r = hv // hk
+        qkvz = (x @ self.w[f"{prefix}.in_proj_qkvz"].T).reshape(tokens, hk, 2 * dk + 2 * r * dv)
+        ba = (x @ self.w[f"{prefix}.in_proj_ba"].T).reshape(tokens, hk, 2 * r)
+        q, k = qkvz[..., :dk], qkvz[..., dk:2 * dk]
+        v, z = qkvz[..., 2 * dk:2 * dk + r * dv], qkvz[..., 2 * dk + r * dv:]
+        mixed = np.concatenate([q.reshape(tokens, -1), k.reshape(tokens, -1), v.reshape(tokens, -1)], axis=-1)
+        return mixed, z.reshape(tokens, -1), ba[..., :r].reshape(tokens, -1), ba[..., r:].reshape(tokens, -1)
+
+    def _linear_attention(self, index: int, x: np.ndarray) -> np.ndarray:
+        cfg = self.config
+        prefix = f"model.layers.{index}.linear_attn"
+        hk, hv, dk, dv = (cfg.linear_num_key_heads, cfg.linear_num_value_heads, cfg.linear_key_head_dim,
+                          cfg.linear_value_head_dim)
+        kernel = cfg.linear_conv_kernel_dim
+        tokens = x.shape[0]
+        mixed, z, b, a = self._linear_projections(prefix, x)
+        weight = self.w[f"{prefix}.conv1d"]
+        weight = weight[..., 0] if self.mlx_layout else weight[:, 0, :]  # [C, K]
+        padded = np.concatenate([np.zeros((kernel - 1, mixed.shape[1]), np.float32), mixed], axis=0)
+        conv = np.stack([np.sum(padded[t:t + kernel] * weight.T, axis=0) for t in range(tokens)])
+        conv = _silu(conv)
+        q = conv[:, :hk * dk].reshape(tokens, hk, dk).astype(np.float64)
+        k = conv[:, hk * dk:2 * hk * dk].reshape(tokens, hk, dk).astype(np.float64)
+        v = conv[:, 2 * hk * dk:].reshape(tokens, hv, dv).astype(np.float64)
+        q = q / np.sqrt(np.sum(q * q, axis=-1, keepdims=True) + L2_EPS) * dk**-0.5
+        k = k / np.sqrt(np.sum(k * k, axis=-1, keepdims=True) + L2_EPS)
+        beta = 1.0 / (1.0 + np.exp(-b.astype(np.float64)))
+        A = np.exp(self.w[f"{prefix}.A_log"].astype(np.float64))
+        softplus = np.logaddexp(0.0, a.astype(np.float64) + self.w[f"{prefix}.dt_bias"])
+        decay = np.exp(-A * softplus)  # [tokens, Hv]
+        ratio = hv // hk
+        out = np.zeros((tokens, hv, dv))
+        for head in range(hv):
+            state = np.zeros((dk, dv))
+            kh = head // ratio
+            for t in range(tokens):
+                state *= decay[t, head]
+                delta = (v[t, head] - state.T @ k[t, kh]) * beta[t, head]
+                state += np.outer(k[t, kh], delta)
+                out[t, head] = state.T @ q[t, kh]
+        out = out.astype(np.float32)
+        gated = _rms(out, cfg.rms_norm_eps) * self.w[f"{prefix}.norm"] * _silu(z.reshape(tokens, hv, dv))
+        return gated.reshape(tokens, hv * dv) @ self.w[f"{prefix}.out_proj"].T
+
+    def _dense_mlp(self, prefix: str, x: np.ndarray) -> np.ndarray:
+        return (_silu(x @ self.w[f"{prefix}.gate_proj"].T) * (x @ self.w[f"{prefix}.up_proj"].T)) @ (
+            self.w[f"{prefix}.down_proj"].T)
+
+    def route(self, index: int, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Expert indices ``[tokens, k]`` and their weights for layer ``index``."""
+
+        logits = (x @ self.w[f"model.layers.{index}.mlp.gate"].T).astype(np.float64)
+        probs = np.exp(logits - logits.max(axis=-1, keepdims=True))
+        probs /= probs.sum(axis=-1, keepdims=True)
+        chosen = np.argsort(-probs, axis=-1, kind="stable")[:, : self.config.num_experts_per_tok]
+        weights = np.take_along_axis(probs, chosen, axis=-1)
+        if self.config.norm_topk_prob:
+            weights /= weights.sum(axis=-1, keepdims=True)
+        return chosen, weights
+
+    def _experts(self, index: int, x: np.ndarray) -> np.ndarray:
+        prefix = f"model.layers.{index}.mlp"
+        chosen, weights = self.route(index, x)
+
+        def stack(name: str) -> np.ndarray:
+            if f"{prefix}.switch_mlp.{name}" in self.w:
+                return self.w[f"{prefix}.switch_mlp.{name}"]
+            return np.stack([self.w[f"{prefix}.experts.{e}.{name}"] for e in range(self.config.num_experts)])
+
+        if f"{prefix}.experts.gate_up_proj" in self.w:  # Transformers' fused [E, 2I, H], gate first
+            gate, up = np.split(self.w[f"{prefix}.experts.gate_up_proj"], 2, axis=1)
+            down = self.w[f"{prefix}.experts.down_proj"]
+        else:
+            gate, up, down = stack("gate_proj"), stack("up_proj"), stack("down_proj")
+        out = np.zeros_like(x, dtype=np.float32)
+        for t in range(x.shape[0]):
+            for e, p in zip(chosen[t], weights[t]):
+                out[t] += np.float32(p) * (down[e] @ (_silu(gate[e] @ x[t]) * (up[e] @ x[t])))
+        if self.config.shared_expert_intermediate_size:
+            shared = self._dense_mlp(f"{prefix}.shared_expert", x)
+            gate_logit = x @ self.w[f"{prefix}.shared_expert_gate"].T  # [tokens, 1]
+            out = out + shared * (1.0 / (1.0 + np.exp(-gate_logit)))
+        return out
+
+    def logits(self, token_ids: Sequence[int]) -> np.ndarray:
+        """Return ``[len(token_ids), vocab]`` float32 logits."""
+
+        cfg = self.config
+        tokens = np.asarray(token_ids, dtype=np.int64)
+        positions = np.arange(tokens.shape[0])
+        x = self.w["model.embed_tokens"][tokens]
+        for index in range(cfg.num_hidden_layers):
+            prefix = f"model.layers.{index}"
+            h = self._norm(f"{prefix}.input_layernorm", x)
+            if cfg.layer_types[index] == "linear_attention":
+                x = x + self._linear_attention(index, h)
+            else:
+                x = x + self._attention(index, h, positions)
+            h = self._norm(f"{prefix}.post_attention_layernorm", x)
+            x = x + (self._experts(index, h) if cfg.sparse(index) else self._dense_mlp(f"{prefix}.mlp", h))
+        x = self._norm("model.norm", x)
+        return (x @ self.w["lm_head"].T).astype(np.float32)
+
+    def greedy(self, prompt: Sequence[int], steps: int) -> list[int]:
+        """Greedy continuation by full recomputation (no cache)."""
+
+        tokens = list(prompt)
+        generated: list[int] = []
+        for _ in range(steps):
+            next_token = int(np.argmax(self.logits(tokens)[-1]))
+            generated.append(next_token)
+            tokens.append(next_token)
+        return generated

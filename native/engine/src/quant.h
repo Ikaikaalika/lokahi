@@ -53,9 +53,11 @@ Linear bind_linear(const Checkpoint& checkpoint, const Json& config, const std::
                    const std::string& quant_module);
 
 // Binds a stack of expert matrices stored as one [experts, rows, cols]
-// tensor (MLX switch layers), as one zero-copy view per expert.
+// tensor (MLX switch layers), as one zero-copy view per expert. The codes are
+// `module` + `suffix`: Transformers' fused expert parameters have no
+// ".weight".
 std::vector<Linear> bind_expert_linears(const Checkpoint& checkpoint, const Json& config, const std::string& module,
-                                        const std::string& quant_module);
+                                        const std::string& quant_module, const std::string& suffix = ".weight");
 
 // Rows [first, first + count) of `linear` as a zero-copy view.
 Linear row_slice(const Linear& linear, int64_t first, int64_t count);

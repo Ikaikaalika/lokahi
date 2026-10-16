@@ -100,8 +100,8 @@ Linear bind_linear(const Checkpoint& checkpoint, const Json& config, const std::
 }
 
 std::vector<Linear> bind_expert_linears(const Checkpoint& checkpoint, const Json& config, const std::string& module,
-                                        const std::string& quant_module) {
-  const TensorView& weight = checkpoint.get(module + ".weight");
+                                        const std::string& quant_module, const std::string& suffix) {
+  const TensorView& weight = checkpoint.get(module + suffix);
   const TensorView* scales = checkpoint.find(module + ".scales");
   LK_CHECK(weight.shape.size() == 3, module + ": expert weights must be 3-D");
   const int64_t experts = weight.dim(0);
