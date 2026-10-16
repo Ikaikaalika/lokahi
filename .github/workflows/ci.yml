@@ -105,7 +105,7 @@ jobs:
           # 0.4.4 predates; the newer release replaces it for this test only.
           .venv-mlx/bin/pip install --no-deps mlx-vlm==0.7.8
           .venv-mlx/bin/python -c 'import mlx_vlm.speculative.drafters.qwen3_5_mtp'
-          PYTHONPATH=src .venv-mlx/bin/python -m pytest -q -rs tests/test_mlx_vlm_mtp_crosscheck.py
+          PYTHONPATH=src:. .venv-mlx/bin/python -m pytest -q -rs tests/test_mlx_vlm_mtp_crosscheck.py tests/test_mlx_vlm_speculative_control.py
       - name: Wire v1 service across a real XPC boundary (gate B, CPU backend)
         run: |
           PYTHONPATH=src .venv/bin/python -c 'import sys; from lokahi.fixtures import write_tiny_chat_model; write_tiny_chat_model(sys.argv[1])' build/xpc-model
