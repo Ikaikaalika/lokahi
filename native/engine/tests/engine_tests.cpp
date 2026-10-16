@@ -1066,6 +1066,51 @@ void test_qwen2_5_vl_config() {
   EXPECT(Qwen35VisionConfig::from_json(Json::parse(wider), &processor).window == 4);
 }
 
+// Qwen35VisionEncoder's geometry reads only the config; this encoder runs nothing.
+class GeometryEncoder final : public Qwen35VisionEncoder {
+ public:
+  explicit GeometryEncoder(Qwen35VisionConfig c) : Qwen35VisionEncoder(weights(std::move(c))) {}
+  const char* backend() const override { return "test"; }
+  ImageFeatures encode_features(const Image&) override { return {}; }
+  using Qwen35VisionEncoder::run_order;
+
+ private:
+  static std::shared_ptr<const Qwen35VisionWeights> weights(Qwen35VisionConfig c) {
+    auto w = std::make_shared<Qwen35VisionWeights>();
+    w->config = std::move(c);
+    return w;
+  }
+};
+
+void test_qwen2_5_vl_window_order() {
+  // A 6 x 10 patch grid (3 x 5 merged tokens) in windows of 2 x 2 tokens, as
+  // Transformers' get_vision_window_index orders it: merged tokens 0 1 5 6 |
+  // 2 3 7 8 | 4 9 | 10 11 | 12 13 | 14, each token's four patches together.
+  Qwen35VisionConfig c;
+  c.qwen2_5 = true;
+  c.merge = 2;
+  c.window = 2;
+  std::vector<int32_t> bounds;
+  const std::vector<int> order = GeometryEncoder(c).run_order(6, 10, &bounds);
+  std::vector<int> expected;
+  for (int token : {0, 1, 5, 6, 2, 3, 7, 8, 4, 9, 10, 11, 12, 13, 14}) {
+    for (int i = 0; i < 4; ++i) expected.push_back(token * 4 + i);
+  }
+  EXPECT(order == expected);
+  std::vector<int32_t> windows;
+  int begin = 0;
+  for (int length : {16, 16, 8, 8, 8, 4}) {
+    for (int i = 0; i < length; ++i) windows.insert(windows.end(), {begin, begin + length});
+    begin += length;
+  }
+  EXPECT(bounds == windows);
+  // Outside Qwen2.5-VL, patches keep merge-block order and see the whole image.
+  c.qwen2_5 = false;
+  const std::vector<int> identity = GeometryEncoder(c).run_order(2, 4, &bounds);
+  EXPECT(identity == std::vector<int>({0, 1, 2, 3, 4, 5, 6, 7}) && bounds.size() == 16 && bounds[6] == 0 &&
+         bounds[7] == 8);
+}
+
 void test_mrope_injection_plan() {
   // Two images in a 20-token prefill at position 10, after earlier images
   // moved RoPE positions 5 ahead: a 2x3 grid at 12 and a 4x2 grid at 20.
@@ -1161,6 +1206,7 @@ int main() {
   test_mrope_injection_plan();
   test_qwen3_vl_config();
   test_qwen2_5_vl_config();
+  test_qwen2_5_vl_window_order();
   test_qwen3_5_vision_config();
   if (g_failures) {
     std::fprintf(stderr, "%d expectation(s) failed\n", g_failures);

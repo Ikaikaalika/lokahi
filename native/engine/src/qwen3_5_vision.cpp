@@ -308,6 +308,29 @@ std::vector<std::vector<int>> Qwen35VisionEncoder::windows(int rows, int cols) c
   return out;
 }
 
+std::vector<int> Qwen35VisionEncoder::run_order(int rows, int cols, std::vector<int32_t>* bounds) const {
+  const std::vector<std::vector<int>> groups =
+      config().qwen2_5 ? windows(rows, cols) : std::vector<std::vector<int>>{};
+  std::vector<int> order;
+  order.reserve(static_cast<size_t>(rows) * static_cast<size_t>(cols));
+  if (bounds != nullptr) bounds->clear();
+  if (groups.empty()) {
+    for (int t = 0; t < rows * cols; ++t) order.push_back(t);
+    if (bounds != nullptr) {
+      for (int t = 0; t < rows * cols; ++t) bounds->insert(bounds->end(), {0, rows * cols});
+    }
+    return order;
+  }
+  for (const std::vector<int>& members : groups) {
+    const int begin = static_cast<int>(order.size()), end = begin + static_cast<int>(members.size());
+    order.insert(order.end(), members.begin(), members.end());
+    if (bounds != nullptr) {
+      for (size_t i = 0; i < members.size(); ++i) bounds->insert(bounds->end(), {begin, end});
+    }
+  }
+  return order;
+}
+
 std::vector<float> Qwen35VisionEncoder::patches(const Image& image) const {
   const Qwen35VisionConfig& c = config();
   const int p = c.patch_size, rows = image.height / p, cols = image.width / p, width = 3 * p * p;
