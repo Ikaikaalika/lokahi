@@ -40,6 +40,12 @@ InjectionPlan plan_injection(const PromptInjection& injection, int base, int n, 
   LK_CHECK(injection.rows.size() == injection.positions.size() * static_cast<size_t>(width),
            "injected rows must be hidden_size wide");
   LK_CHECK(rules.mrope || injection.grids.empty(), "this model's positions do not follow image grids");
+  LK_CHECK(static_cast<int>(injection.layer_rows.size()) <= rules.deepstack_layers,
+           "this model takes deepstack rows for at most " + std::to_string(rules.deepstack_layers) + " layers, not " +
+               std::to_string(injection.layer_rows.size()));
+  for (const std::vector<float>& layer : injection.layer_rows) {
+    LK_CHECK(layer.size() == injection.rows.size(), "each layer's deepstack rows must match the injected rows");
+  }
   LK_CHECK(!rules.mrope || injection.grids.size() == injection.blocks.size(),
            "this model's positions follow each image's grid: give one grid per image block");
   plan.row.assign(static_cast<size_t>(n), -1);

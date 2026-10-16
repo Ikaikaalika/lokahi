@@ -81,8 +81,11 @@ struct DecoderConfig {
   // axis rope_axes[i] (0, 1 or 2). Empty: one position per token. Text
   // tokens' three positions coincide, so text alone sees plain RoPE.
   std::vector<int> rope_axes;
+  // Qwen3-VL's deepstack: injected images also add rows to the hidden states
+  // after the first layers.
+  bool deepstack = false;
   InjectionRules injection_rules(int rope_offset) const {
-    return {image_blocks != ImageBlocks::None, !rope_axes.empty(), rope_offset};
+    return {image_blocks != ImageBlocks::None, !rope_axes.empty(), rope_offset, deepstack ? num_layers : 0};
   }
   std::vector<int32_t> eos_token_ids;
   std::string weight_prefix;  // "" or "language_model."

@@ -12,6 +12,7 @@ from .gemma4_vision import Gemma4VisionConfig, Gemma4VisionReference
 from .llama import LlamaFamilyConfig, LlamaFamilyReference
 from .qwen3_5 import Qwen35Config, Qwen35Reference
 from .qwen3_5_vision import Qwen35VisionConfig, Qwen35VisionReference
+from .qwen3_vl import Qwen3VLReference
 from .sampling import SamplingParams
 from .siglip import Gemma3VisionReference, SiglipConfig
 
@@ -31,6 +32,7 @@ __all__ = [
     "Qwen35Reference",
     "Qwen35VisionConfig",
     "Qwen35VisionReference",
+    "Qwen3VLReference",
     "SamplingParams",
     "SiglipConfig",
 ]

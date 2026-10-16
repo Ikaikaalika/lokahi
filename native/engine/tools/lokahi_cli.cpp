@@ -202,7 +202,7 @@ std::vector<std::string> split_list(const std::string& text) {
 // Each --images file through the vision tower, in order, with the token
 // grids the decoder's positions follow (models with M-RoPE only).
 struct EncodedImages {
-  std::vector<std::vector<float>> features;
+  std::vector<ImageFeatures> features;
   std::vector<std::pair<int, int>> grids;
 };
 
@@ -210,7 +210,7 @@ EncodedImages encode_images(const Args& args, VisionEncoder& encoder) {
   EncodedImages out;
   for (const std::string& path : split_list(args.get("images"))) {
     const Image image = read_image(path, encoder.fixed_size());
-    out.features.push_back(encoder.encode(image));
+    out.features.push_back(encoder.encode_features(image));
     const auto grid = encoder.token_grid(image.width, image.height);
     if (grid.first > 0) out.grids.push_back(grid);
   }
@@ -235,19 +235,30 @@ void inject_images(const Args& args, Model& model, const std::vector<int32_t>& t
                             images.features, images.grids));
 }
 
+// Writes every image's rows, then (Qwen3-VL) each deepstack layer's rows for
+// every image, as float32.
 int cmd_image_features(const Args& args) {
   LK_CHECK(args.has("images") && args.has("out"), "image-features needs --images and --out");
   auto encoder = load_vision(args);
   const auto features = encode_images(args, *encoder).features;
   std::ofstream out(args.get("out"), std::ios::binary);
   LK_CHECK(out.good(), "cannot write " + args.get("out"));
+  auto write = [&](const std::vector<float>& rows) {
+    out.write(reinterpret_cast<const char*>(rows.data()), static_cast<std::streamsize>(sizeof(float) * rows.size()));
+  };
   std::string tokens;
-  for (const auto& image : features) {
-    out.write(reinterpret_cast<const char*>(image.data()), static_cast<std::streamsize>(sizeof(float) * image.size()));
-    tokens += (tokens.empty() ? "" : ",") + std::to_string(image.size() / static_cast<size_t>(encoder->text_hidden_size()));
+  for (const ImageFeatures& image : features) {
+    write(image.rows);
+    tokens += (tokens.empty() ? "" : ",") +
+              std::to_string(image.rows.size() / static_cast<size_t>(encoder->text_hidden_size()));
   }
-  std::printf("{\"backend\":\"%s\",\"tokens\":[%s],\"width\":%d}\n", encoder->backend(), tokens.c_str(),
-              encoder->text_hidden_size());
+  const size_t layers = features.front().deepstack.size();
+  for (size_t l = 0; l < layers; ++l) {
+    for (const ImageFeatures& image : features) write(image.deepstack[l]);
+  }
+  const std::string deepstack = layers > 0 ? ",\"deepstack\":" + std::to_string(layers) : "";
+  std::printf("{\"backend\":\"%s\",\"tokens\":[%s],\"width\":%d%s}\n", encoder->backend(), tokens.c_str(),
+              encoder->text_hidden_size(), deepstack.c_str());
   return 0;
 }
 

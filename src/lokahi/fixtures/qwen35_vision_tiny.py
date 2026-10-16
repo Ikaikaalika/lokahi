@@ -77,19 +77,10 @@ class TinyQwen35VisionSpec:
         }
 
 
-def write_tiny_qwen35_vision(directory: Path, spec: TinyQwen35VisionSpec = TinyQwen35VisionSpec()) -> Path:
-    """Write ``config.json``, ``preprocessor_config.json`` and ``model.safetensors``."""
+def write_tower(tensors: dict, spec: TinyQwen35VisionSpec, mlx: bool, out_hidden: int,
+                deepstack: tuple[int, ...] = ()) -> None:
+    """Add the tower's BF16 tensors (and deepstack mergers after the blocks in ``deepstack``)."""
 
-    directory = Path(directory)
-    if spec.text.model_type == "qwen3_next":
-        raise ValueError("Qwen3-Next has no vision tower")
-    if max(spec.image_token_id, spec.vision_start_token_id, spec.vision_end_token_id) >= spec.text.vocab_size:
-        raise ValueError("the image tokens must be inside the vocabulary")
-    write_tiny_qwen35(directory, spec.text)
-    tensors, metadata = read_safetensors(directory / "model.safetensors")
-    config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
-    config.update(image_token_id=spec.image_token_id, vision_start_token_id=spec.vision_start_token_id,
-                  vision_end_token_id=spec.vision_end_token_id, vision_config=spec.vision_config())
     rng = np.random.default_rng(spec.seed)
 
     def bf16(name: str, array: np.ndarray) -> None:
@@ -103,10 +94,10 @@ def write_tiny_qwen35_vision(directory: Path, spec: TinyQwen35VisionSpec = TinyQ
         bf16(f"{name}.weight", rng.normal(1.0, 0.2, size))
         bf16(f"{name}.bias", rng.normal(0.0, 0.1, size))
 
-    t = "vision_tower" if spec.text.mlx else "model.visual"
+    t = "vision_tower" if mlx else "model.visual"
     hidden, inter, p, frames = spec.hidden_size, spec.intermediate_size, spec.patch_size, spec.temporal_patch_size
     kernel = rng.normal(0.0, (3 * frames * p * p) ** -0.5, (hidden, 3, frames, p, p))
-    bf16(f"{t}.patch_embed.proj.weight", kernel.transpose(0, 2, 3, 4, 1) if spec.text.mlx else kernel)
+    bf16(f"{t}.patch_embed.proj.weight", kernel.transpose(0, 2, 3, 4, 1) if mlx else kernel)
     bf16(f"{t}.patch_embed.proj.bias", rng.normal(0.0, 0.1, hidden))
     bf16(f"{t}.pos_embed.weight", rng.normal(0.0, 0.5, (spec.num_position_embeddings, hidden)))
     for index in range(spec.depth):
@@ -120,7 +111,28 @@ def write_tiny_qwen35_vision(directory: Path, spec: TinyQwen35VisionSpec = TinyQ
     merged = hidden * spec.spatial_merge_size**2
     norm(f"{t}.merger.norm", hidden)
     linear(f"{t}.merger.linear_fc1", merged, merged)
-    linear(f"{t}.merger.linear_fc2", spec.text.hidden_size, merged)
+    linear(f"{t}.merger.linear_fc2", out_hidden, merged)
+    for which in range(len(deepstack)):  # these norm the concatenated square
+        name = f"{t}.deepstack_merger_list.{which}"
+        norm(f"{name}.norm", merged)
+        linear(f"{name}.linear_fc1", merged, merged)
+        linear(f"{name}.linear_fc2", out_hidden, merged)
+
+
+def write_tiny_qwen35_vision(directory: Path, spec: TinyQwen35VisionSpec = TinyQwen35VisionSpec()) -> Path:
+    """Write ``config.json``, ``preprocessor_config.json`` and ``model.safetensors``."""
+
+    directory = Path(directory)
+    if spec.text.model_type == "qwen3_next":
+        raise ValueError("Qwen3-Next has no vision tower")
+    if max(spec.image_token_id, spec.vision_start_token_id, spec.vision_end_token_id) >= spec.text.vocab_size:
+        raise ValueError("the image tokens must be inside the vocabulary")
+    write_tiny_qwen35(directory, spec.text)
+    tensors, metadata = read_safetensors(directory / "model.safetensors")
+    config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+    config.update(image_token_id=spec.image_token_id, vision_start_token_id=spec.vision_start_token_id,
+                  vision_end_token_id=spec.vision_end_token_id, vision_config=spec.vision_config())
+    write_tower(tensors, spec, spec.text.mlx, spec.text.hidden_size)
 
     (directory / "config.json").write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
     (directory / "preprocessor_config.json").write_text(json.dumps(spec.processor_config(), indent=2) + "\n",

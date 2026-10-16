@@ -133,6 +133,20 @@ kernel void replace_rows(const device float* rows [[buffer(0)]],
   if (r >= 0) x[t * p.cols + c] = rows[r * p.cols + c];
 }
 
+// x[t, :] += rows[index[t], :] wherever index[t] >= 0: a layer's deepstack
+// rows (Qwen3-VL) onto the hidden states of the image tokens.
+kernel void add_rows_at(const device float* rows [[buffer(0)]],
+                        const device int* index [[buffer(1)]],
+                        device float* x [[buffer(2)]],
+                        constant ReplaceParams& p [[buffer(3)]],
+                        uint2 gid [[thread_position_in_grid]]) {
+  const int c = int(gid.x);
+  const int t = int(gid.y);
+  if (c >= p.cols || t >= p.n) return;
+  const int r = index[t];
+  if (r >= 0) x[t * p.cols + c] += rows[r * p.cols + c];
+}
+
 // ---------------------------------------------------------------------------
 // RMSNorm scaled by (offset + w): Gemma's offset is 1, most families use 0.
 // One threadgroup per row.

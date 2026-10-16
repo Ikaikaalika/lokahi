@@ -32,20 +32,32 @@ int positive(const Json& object, const char* key, int fallback) {
 bool is_qwen3_5_vision(const Json& config) {
   const std::string type = config.string_or("model_type", "");
   const Json* vision = config.find("vision_config");
-  return (type == "qwen3_5" || type == "qwen3_5_moe") && vision != nullptr && vision->is_object();
+  return (type == "qwen3_5" || type == "qwen3_5_moe" || type == "qwen3_vl" || type == "qwen3_vl_moe") &&
+         vision != nullptr && vision->is_object();
 }
 
 Qwen35VisionConfig Qwen35VisionConfig::from_json(const Json& config, const Json* preprocessor) {
-  LK_CHECK(is_qwen3_5_vision(config), "config.json has no Qwen3.5 vision_config");
+  LK_CHECK(is_qwen3_5_vision(config), "config.json has no Qwen3.5 or Qwen3-VL vision_config");
   const Json& v = config.at("vision_config");
-  const Json* deepstack = v.find("deepstack_visual_indexes");
-  LK_CHECK(deepstack == nullptr || deepstack->is_null() || (deepstack->is_array() && deepstack->as_array().empty()),
-           "qwen3_5 vision: deepstack visual features are not supported");
   LK_CHECK(v.string_or("hidden_act", "gelu_pytorch_tanh") == "gelu_pytorch_tanh",
            "qwen3_5 vision: unsupported activation " + v.string_or("hidden_act", ""));
   LK_CHECK(v.int_or("in_channels", 3) == 3, "qwen3_5 vision: images must have 3 channels");
   Qwen35VisionConfig c;
   c.depth = positive(v, "depth", 0);
+  // Transformers takes the i-th deepstack merger for the i-th listed block
+  // but emits features in block order; increasing indexes keep them aligned.
+  if (const Json* deepstack = v.find("deepstack_visual_indexes"); deepstack != nullptr && !deepstack->is_null()) {
+    LK_CHECK(deepstack->is_array(), "qwen3_5 vision: deepstack_visual_indexes must be a list");
+    for (const Json& index : deepstack->as_array()) {
+      const int block = static_cast<int>(index.as_int());
+      LK_CHECK(block >= 0 && block < c.depth && (c.deepstack.empty() || block > c.deepstack.back()),
+               "qwen3_5 vision: deepstack_visual_indexes must be increasing blocks of the tower");
+      c.deepstack.push_back(block);
+    }
+  }
+  const std::string type = config.string_or("model_type", "");
+  LK_CHECK(c.deepstack.empty() || type == "qwen3_vl" || type == "qwen3_vl_moe",
+           "qwen3_5 vision: deepstack features are Qwen3-VL's, not " + type + "'s");
   c.hidden_size = positive(v, "hidden_size", 0);
   c.intermediate_size = positive(v, "intermediate_size", 0);
   c.num_heads = positive(v, "num_heads", 0);
@@ -175,10 +187,20 @@ std::shared_ptr<Qwen35VisionWeights> Qwen35VisionWeights::load(const std::string
   }
   LK_CHECK(!ck.contains(t + ".blocks." + std::to_string(c.depth) + ".norm1.weight"),
            "qwen3_5 vision: the checkpoint has more blocks than depth");
-  w->merger_norm_weight = vector_of(ck, t + ".merger.norm.weight", hidden);
-  w->merger_norm_bias = vector_of(ck, t + ".merger.norm.bias", hidden);
-  w->merger_fc1 = linear(t + ".merger.linear_fc1", merged, merged, &w->merger_fc1_bias);
-  w->merger_fc2 = linear(t + ".merger.linear_fc2", c.text_hidden_size, merged, &w->merger_fc2_bias);
+  auto merger = [&](const std::string& name, int64_t norm_size) {
+    Qwen35VisionWeights::Merger m;
+    m.norm_weight = vector_of(ck, name + ".norm.weight", norm_size);
+    m.norm_bias = vector_of(ck, name + ".norm.bias", norm_size);
+    m.fc1 = linear(name + ".linear_fc1", merged, merged, &m.fc1_bias);
+    m.fc2 = linear(name + ".linear_fc2", c.text_hidden_size, merged, &m.fc2_bias);
+    return m;
+  };
+  w->merger = merger(t + ".merger", hidden);
+  for (size_t i = 0; i < c.deepstack.size(); ++i) {
+    w->deepstack.push_back(merger(t + ".deepstack_merger_list." + std::to_string(i), merged));
+  }
+  LK_CHECK(!ck.contains(t + ".deepstack_merger_list." + std::to_string(c.deepstack.size()) + ".norm.weight"),
+           "qwen3_5 vision: the checkpoint has more deepstack mergers than deepstack_visual_indexes");
   return w;
 }
 
@@ -295,14 +317,38 @@ class Qwen35VisionCpu final : public Qwen35VisionEncoder {
   }
 
   const char* backend() const override { return "cpu"; }
-  std::vector<float> encode(const Image& image) override;
+  ImageFeatures encode_features(const Image& image) override;
 
  private:
+  // A merger over the patch rows x [N, hidden], into the text width.
+  std::vector<float> merge(const Qwen35VisionWeights::Merger& m, const std::vector<float>& x, int64_t N,
+                           bool per_patch);
+
   ThreadPool pool_;
   Linear patch_;
 };
 
-std::vector<float> Qwen35VisionCpu::encode(const Image& image) {
+std::vector<float> Qwen35VisionCpu::merge(const Qwen35VisionWeights::Merger& m, const std::vector<float>& x,
+                                          int64_t N, bool per_patch) {
+  // Each merge x merge square's patches are consecutive, so the rows read as
+  // [tokens, merge^2 * hidden]; the norm covers a patch or the whole square.
+  const Qwen35VisionConfig& c = config();
+  const int64_t hidden = c.hidden_size, tokens = N / (int64_t{c.merge} * c.merge), merged = hidden * c.merge * c.merge;
+  const int64_t width = per_patch ? hidden : merged;
+  std::vector<float> h(x.size()), f(static_cast<size_t>(tokens * merged));
+  for (int64_t row = 0; row < N * hidden / width; ++row) {
+    layer_norm(x.data() + row * width, m.norm_weight, m.norm_bias, width, kLayerNormEps, h.data() + row * width);
+  }
+  matmul(m.fc1, h.data(), tokens, f.data(), pool_);
+  add_rows(f.data(), m.fc1_bias, tokens);
+  for (float& value : f) value = static_cast<float>(0.5 * value * (1.0 + std::erf(value / std::sqrt(2.0))));
+  std::vector<float> features(static_cast<size_t>(tokens) * c.text_hidden_size);
+  matmul(m.fc2, f.data(), tokens, features.data(), pool_);
+  add_rows(features.data(), m.fc2_bias, tokens);
+  return features;
+}
+
+ImageFeatures Qwen35VisionCpu::encode_features(const Image& image) {
   const Qwen35VisionConfig& c = config();
   const Qwen35VisionWeights& w = *weights_;
   const auto [token_rows, token_cols] = token_grid(image.width, image.height);
@@ -332,7 +378,9 @@ std::vector<float> Qwen35VisionCpu::encode(const Image& image) {
   };
 
   const float scale = 1.0f / std::sqrt(static_cast<float>(D));
-  for (const Qwen35VisionWeights::Layer& L : w.layers) {
+  ImageFeatures out;
+  for (size_t block = 0; block < w.layers.size(); ++block) {
+    const Qwen35VisionWeights::Layer& L = w.layers[block];
     for (int64_t t = 0; t < N; ++t) {
       layer_norm(x.data() + t * hidden, L.norm1_weight, L.norm1_bias, hidden, kLayerNormEps, h.data() + t * hidden);
     }
@@ -384,23 +432,13 @@ std::vector<float> Qwen35VisionCpu::encode(const Image& image) {
     matmul(L.fc2, f.data(), N, r.data(), pool_);
     add_rows(r.data(), L.fc2_bias, N);
     for (size_t i = 0; i < x.size(); ++i) x[i] += r[i];
+    const auto deep = std::find(c.deepstack.begin(), c.deepstack.end(), static_cast<int>(block));
+    if (deep != c.deepstack.end()) {
+      out.deepstack.push_back(merge(w.deepstack[static_cast<size_t>(deep - c.deepstack.begin())], x, N, false));
+    }
   }
-
-  // The merger: LayerNorm per patch; each merge x merge square's patches are
-  // consecutive, so the normed rows read as [tokens, merge^2 * hidden].
-  for (int64_t t = 0; t < N; ++t) {
-    layer_norm(x.data() + t * hidden, w.merger_norm_weight, w.merger_norm_bias, hidden, kLayerNormEps,
-               h.data() + t * hidden);
-  }
-  const int64_t tokens = N / (int64_t{c.merge} * c.merge), merged = hidden * c.merge * c.merge;
-  std::vector<float> m(static_cast<size_t>(tokens * merged));
-  matmul(w.merger_fc1, h.data(), tokens, m.data(), pool_);
-  add_rows(m.data(), w.merger_fc1_bias, tokens);
-  for (float& value : m) value = static_cast<float>(0.5 * value * (1.0 + std::erf(value / std::sqrt(2.0))));
-  std::vector<float> features(static_cast<size_t>(tokens) * c.text_hidden_size);
-  matmul(w.merger_fc2, m.data(), tokens, features.data(), pool_);
-  add_rows(features.data(), w.merger_fc2_bias, tokens);
-  return features;
+  out.rows = merge(w.merger, x, N, true);
+  return out;
 }
 
 }  // namespace

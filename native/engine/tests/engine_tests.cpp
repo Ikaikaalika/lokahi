@@ -918,6 +918,77 @@ void test_qwen3_5_configs() {
          small.injection_rules(7).rope_offset == 7);
 }
 
+// Qwen/Qwen3-VL-2B-Instruct's config.json, as published.
+static const char* kQwen3VL2BConfig = R"({
+  "architectures": ["Qwen3VLForConditionalGeneration"], "image_token_id": 151655, "model_type": "qwen3_vl",
+  "text_config": {
+    "attention_bias": false, "attention_dropout": 0.0, "bos_token_id": 151643, "dtype": "bfloat16",
+    "eos_token_id": 151645, "head_dim": 128, "hidden_act": "silu", "hidden_size": 2048, "initializer_range": 0.02,
+    "intermediate_size": 6144, "max_position_embeddings": 262144, "model_type": "qwen3_vl_text",
+    "num_attention_heads": 16, "num_hidden_layers": 28, "num_key_value_heads": 8, "rms_norm_eps": 1e-06,
+    "rope_scaling": {"mrope_interleaved": true, "mrope_section": [24, 20, 20], "rope_type": "default"},
+    "rope_theta": 5000000, "tie_word_embeddings": true, "use_cache": true, "vocab_size": 151936},
+  "tie_word_embeddings": true, "transformers_version": "4.57.0.dev0", "video_token_id": 151656,
+  "vision_config": {
+    "deepstack_visual_indexes": [5, 11, 17], "depth": 24, "hidden_act": "gelu_pytorch_tanh", "hidden_size": 1024,
+    "in_channels": 3, "initializer_range": 0.02, "intermediate_size": 4096, "model_type": "qwen3_vl",
+    "num_heads": 16, "num_position_embeddings": 2304, "out_hidden_size": 2048, "patch_size": 16,
+    "spatial_merge_size": 2, "temporal_patch_size": 2},
+  "vision_end_token_id": 151653, "vision_start_token_id": 151652
+})";
+
+void test_qwen3_vl_config() {
+  // Sections [temporal 24, rows 20, columns 20] over 64 frequencies: rows at
+  // 1, 4, ..., 58, columns at 2, 5, ..., 59, the rest temporal.
+  auto sections = [](const DecoderConfig& c) {
+    if (c.rope_axes.size() != 64) return false;
+    for (int i = 0; i < 64; ++i) {
+      const int expected = i % 3 == 1 && i < 60 ? 1 : i % 3 == 2 && i < 60 ? 2 : 0;
+      if (c.rope_axes[static_cast<size_t>(i)] != expected) return false;
+    }
+    return true;
+  };
+  const DecoderConfig c = DecoderConfig::from_json(Json::parse(kQwen3VL2BConfig));
+  EXPECT(c.architecture == "qwen3_vl" && c.num_layers == 28 && c.hidden_size == 2048 && c.head_dim == 128);
+  EXPECT(c.qk_norm && c.num_kv_heads == 8 && c.rotary_dim == 0 && sections(c) && c.deepstack);
+  EXPECT(std::fabs(c.rope_theta - 5e6f) < 1.0f && c.eos_token_ids == std::vector<int32_t>({151645}));
+  EXPECT(c.injection_rules(0).deepstack_layers == 28 && c.injection_rules(0).mrope);
+  // Transformers 5 writes rope_parameters, with rope_theta inside, which
+  // wins over the rope_theta beside it.
+  std::string v5 = kQwen3VL2BConfig;
+  const std::string scaling =
+      R"("rope_scaling": {"mrope_interleaved": true, "mrope_section": [24, 20, 20], "rope_type": "default"},)";
+  const std::string parameters =
+      R"("rope_parameters": {"mrope_interleaved": true, "mrope_section": [24, 20, 20], "rope_type": "default", "rope_theta": 4000000},)";
+  v5.replace(v5.find(scaling), scaling.size(), parameters);
+  const DecoderConfig five = DecoderConfig::from_json(Json::parse(v5));
+  EXPECT(sections(five) && std::fabs(five.rope_theta - 4e6f) < 1.0f);
+  // Beside rope_scaling, Transformers ignores rope_parameters entirely: the
+  // sections and theta come from rope_scaling and the rope_theta beside it.
+  std::string both = kQwen3VL2BConfig;
+  std::string other = parameters;
+  other.replace(other.find("[24, 20, 20]"), 12, "[32, 16, 16]");
+  both.insert(both.find(scaling), other);
+  const DecoderConfig legacy = DecoderConfig::from_json(Json::parse(both));
+  EXPECT(sections(legacy) && std::fabs(legacy.rope_theta - 5e6f) < 1.0f);
+  // Without any rope_theta, Transformers' Qwen3-VL default is 500000.
+  std::string untheta = kQwen3VL2BConfig;
+  const std::string theta = R"("rope_theta": 5000000, )";
+  untheta.erase(untheta.find(theta), theta.size());
+  EXPECT(std::fabs(DecoderConfig::from_json(Json::parse(untheta)).rope_theta - 5e5f) < 1.0f);
+  // Without mrope_section, Transformers and MLX-VLM use [24, 20, 20].
+  std::string unsectioned = kQwen3VL2BConfig;
+  const std::string section = R"("mrope_section": [24, 20, 20], )";
+  unsectioned.erase(unsectioned.find(section), section.size());
+  EXPECT(sections(DecoderConfig::from_json(Json::parse(unsectioned))));
+  // Text-only families take no deepstack rows.
+  EXPECT(DecoderConfig::from_json(Json::parse(kQwen35_08BConfig)).injection_rules(0).deepstack_layers == 0);
+
+  const Json processor = Json::parse(R"({"size": {"longest_edge": 16777216, "shortest_edge": 65536}})");
+  const Qwen35VisionConfig vision = Qwen35VisionConfig::from_json(Json::parse(kQwen3VL2BConfig), &processor);
+  EXPECT(vision.deepstack == std::vector<int>({5, 11, 17}) && vision.depth == 24 && vision.text_hidden_size == 2048);
+}
+
 void test_mrope_injection_plan() {
   // Two images in a 20-token prefill at position 10, after earlier images
   // moved RoPE positions 5 ahead: a 2x3 grid at 12 and a 4x2 grid at 20.
@@ -959,6 +1030,14 @@ void test_mrope_injection_plan() {
   EXPECT(fails(injection, InjectionRules{false, false, 0}));  // grids for a model without M-RoPE
   EXPECT(fails(no_grids, InjectionRules{true, false, 0}));    // a bidirectional block must fit a chunk of 4
   EXPECT(!throws([&] { plan_injection(no_grids, 10, 20, 1, 8, InjectionRules{true, false, 0}); }));
+
+  // Deepstack rows: as many as the injected rows, for no more layers than allowed.
+  PromptInjection deep = injection;
+  deep.layer_rows.assign(2, injection.rows);
+  EXPECT(!fails(deep, InjectionRules{false, true, 5, 2}));
+  EXPECT(fails(deep, InjectionRules{false, true, 5, 1}) && fails(deep, mrope));
+  deep.layer_rows[1].pop_back();
+  EXPECT(fails(deep, InjectionRules{false, true, 5, 2}));
 }
 
 void test_qwen3_5_vision_config() {
@@ -1003,6 +1082,7 @@ int main() {
   test_deepseek_configs();
   test_qwen3_5_configs();
   test_mrope_injection_plan();
+  test_qwen3_vl_config();
   test_qwen3_5_vision_config();
   if (g_failures) {
     std::fprintf(stderr, "%d expectation(s) failed\n", g_failures);

@@ -9,6 +9,7 @@ from .gemma4_tiny import TinyGemma4Spec, write_tiny_gemma4
 from .gemma4_vision_tiny import TinyGemma4VisionSpec, write_tiny_gemma4_vision
 from .qwen35_tiny import TinyQwen35Spec, write_tiny_qwen35
 from .qwen35_vision_tiny import TinyQwen35VisionSpec, write_tiny_qwen35_vision
+from .qwen3_vl_tiny import TinyQwen3VLSpec, write_tiny_qwen3_vl
 
 __all__ = [
     "TinyDeepseekSpec",
@@ -19,6 +20,7 @@ __all__ = [
     "TinyGemma4VisionSpec",
     "TinyQwen35Spec",
     "TinyQwen35VisionSpec",
+    "TinyQwen3VLSpec",
     "write_tiny_chat_model",
     "write_tiny_deepseek",
     "write_tiny_dense",
@@ -28,4 +30,5 @@ __all__ = [
     "write_tiny_gemma4_vision",
     "write_tiny_qwen35",
     "write_tiny_qwen35_vision",
+    "write_tiny_qwen3_vl",
 ]
