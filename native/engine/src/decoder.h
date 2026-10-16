@@ -199,12 +199,12 @@ struct DecoderLayer {
   // RoPE key, and kv_a_norm normalizes the latent. Per head, embed_q
   // [kv_lora_rank, qk_nope_dim] absorbs the query into the latent and
   // unembed_out [v_head_dim, kv_lora_rank] expands the latent output: MLX's
-  // tensors of those names, or views of kv_b_proj (whose key rows are
-  // transposed into embed_q_storage, float32).
-  Linear q_a_proj, kv_a_proj;
+  // tensors of those names, or with kv_b_proj [heads * (nope + v), rank]
+  // instead, views of its value rows; its key rows then absorb the query
+  // applied transposed, and embed_q is empty.
+  Linear q_a_proj, kv_a_proj, kv_b_proj;
   std::vector<float> q_a_norm, kv_a_norm;
   std::vector<Linear> embed_q, unembed_out;
-  std::vector<float> embed_q_storage;
   // Per-layer inputs (Gemma 4): gate [P, hidden], projection [hidden, P].
   Linear per_layer_gate, per_layer_proj;
   std::vector<float> per_layer_norm;

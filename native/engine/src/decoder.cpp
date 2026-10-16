@@ -687,8 +687,8 @@ void bind_experts(const DecoderWeights& w, DecoderLayer& layer, const std::strin
 // Multi-head latent attention's weights. MLX's absorbed conversions store
 // embed_q [heads, rank, nope] and unembed_out [heads, v, rank]; others store
 // kv_b_proj [heads * (nope + v), rank], whose value rows are unembed_out's
-// views and whose key rows, transposed, become embed_q (owned float32, so a
-// float checkpoint's are exact). No projection takes a bias.
+// views and whose key rows absorb the query transposed, read in place. No
+// projection takes a bias.
 void bind_latent_attention(const DecoderWeights& w, DecoderLayer& layer, const std::string& base) {
   const DecoderConfig& c = w.config;
   const Checkpoint& ck = *w.checkpoint;
@@ -722,33 +722,17 @@ void bind_latent_attention(const DecoderWeights& w, DecoderLayer& layer, const s
   if (ck.contains(attn + "embed_q.weight")) {
     layer.embed_q = bind_expert_linears(ck, w.raw_config, attn + "embed_q", attn + "embed_q");
     layer.unembed_out = bind_expert_linears(ck, w.raw_config, attn + "unembed_out", attn + "unembed_out");
+    LK_CHECK(static_cast<int64_t>(layer.embed_q.size()) == H, base + ": expected " + std::to_string(H) +
+                                                                   " heads of embed_q");
+    for (const Linear& e : layer.embed_q) LK_CHECK(e.rows == rank && e.cols == nope, base + ": embed_q shape");
   } else {
-    const Linear kv_b = linear("kv_b_proj");
-    LK_CHECK(kv_b.rows == H * (nope + v) && kv_b.cols == rank, base + ": kv_b_proj shape");
-    layer.embed_q_storage.resize(static_cast<size_t>(H * rank * nope));
-    std::vector<float> row(static_cast<size_t>(rank));
-    for (int64_t h = 0; h < H; ++h) {
-      float* keys = layer.embed_q_storage.data() + h * rank * nope;
-      for (int64_t d = 0; d < nope; ++d) {
-        dequantize_row(kv_b, h * (nope + v) + d, row.data());
-        for (int64_t r = 0; r < rank; ++r) keys[r * nope + d] = row[static_cast<size_t>(r)];
-      }
-      Linear embed;
-      embed.name = attn + "kv_b_proj (head " + std::to_string(h) + " keys, transposed)";
-      embed.rows = rank;
-      embed.cols = nope;
-      embed.dense = keys;
-      layer.embed_q.push_back(embed);
-      layer.unembed_out.push_back(row_slice(kv_b, h * (nope + v) + nope, v));
-    }
+    layer.kv_b_proj = linear("kv_b_proj");
+    LK_CHECK(layer.kv_b_proj.rows == H * (nope + v) && layer.kv_b_proj.cols == rank, base + ": kv_b_proj shape");
+    for (int64_t h = 0; h < H; ++h) layer.unembed_out.push_back(row_slice(layer.kv_b_proj, h * (nope + v) + nope, v));
   }
-  LK_CHECK(static_cast<int64_t>(layer.embed_q.size()) == H && static_cast<int64_t>(layer.unembed_out.size()) == H,
-           base + ": expected " + std::to_string(H) + " heads of embed_q and unembed_out");
-  for (int64_t h = 0; h < H; ++h) {
-    const Linear& e = layer.embed_q[static_cast<size_t>(h)];
-    const Linear& u = layer.unembed_out[static_cast<size_t>(h)];
-    LK_CHECK(e.rows == rank && e.cols == nope && u.rows == v && u.cols == rank, base + ": embed_q/unembed_out shape");
-  }
+  LK_CHECK(static_cast<int64_t>(layer.unembed_out.size()) == H, base + ": expected " + std::to_string(H) +
+                                                                    " heads of unembed_out");
+  for (const Linear& u : layer.unembed_out) LK_CHECK(u.rows == v && u.cols == rank, base + ": unembed_out shape");
   layer.o_proj = linear("o_proj");
   LK_CHECK(layer.o_proj.rows == c.hidden_size && layer.o_proj.cols == H * v, base + ": o_proj shape");
 }
@@ -814,8 +798,6 @@ std::shared_ptr<DecoderWeights> DecoderWeights::load(const std::string& director
     LK_CHECK(w->per_layer_model_proj.rows == width && w->per_layer_model_proj.cols == c.hidden_size,
              arch + ": per_layer_model_projection shape mismatch");
   }
-  // MLA layers point into their own storage, which moving keeps in place.
-  w->layers.reserve(static_cast<size_t>(c.num_layers));
   for (int i = 0; i < c.num_layers; ++i) {
     const std::string base = "model.layers." + std::to_string(i);
     const int64_t dim = c.head_dim_of(i);
@@ -917,9 +899,13 @@ size_t DecoderWeights::matrix_bytes() const {
              l.o_proj.weight_bytes() + l.gate_proj.weight_bytes() + l.up_proj.weight_bytes() +
              l.down_proj.weight_bytes() + l.per_layer_gate.weight_bytes() + l.per_layer_proj.weight_bytes() +
              l.router.weight_bytes() + l.shared_gate.weight_bytes() + l.shared_up.weight_bytes() +
-             l.shared_down.weight_bytes() + l.q_a_proj.weight_bytes() + l.kv_a_proj.weight_bytes();
-    for (const auto* experts : {&l.expert_gate, &l.expert_up, &l.expert_down, &l.embed_q, &l.unembed_out}) {
+             l.shared_down.weight_bytes() + l.q_a_proj.weight_bytes() + l.kv_a_proj.weight_bytes() +
+             l.kv_b_proj.weight_bytes();
+    for (const auto* experts : {&l.expert_gate, &l.expert_up, &l.expert_down, &l.embed_q}) {
       for (const Linear& expert : *experts) total += expert.weight_bytes();
+    }
+    if (l.kv_b_proj.rows == 0) {  // otherwise views of kv_b_proj, counted above
+      for (const Linear& head : l.unembed_out) total += head.weight_bytes();
     }
   }
   return total;
@@ -933,7 +919,7 @@ bool DecoderWeights::dense_mxfp4() const {
   for (const auto& l : layers) {
     for (const Linear* m : {&l.q_proj, &l.k_proj, &l.v_proj, &l.o_proj, &l.gate_proj, &l.up_proj, &l.down_proj,
                             &l.per_layer_gate, &l.per_layer_proj, &l.router, &l.shared_gate, &l.shared_up,
-                            &l.shared_down, &l.q_a_proj, &l.kv_a_proj}) {
+                            &l.shared_down, &l.q_a_proj, &l.kv_a_proj, &l.kv_b_proj}) {
       if (m->quant.mxfp4()) return true;
     }
     for (const auto* heads : {&l.embed_q, &l.unembed_out}) {
@@ -1415,7 +1401,7 @@ class DecoderCpu final : public Model {
       if (profiling) {
         bytes = traffic::linear(L.q_proj, n) + traffic::linear(L.kv_a_proj, n) +
                 (c_.q_lora_rank > 0 ? traffic::linear(L.q_a_proj, n) : 0.0);
-        for (const Linear& e : L.embed_q) bytes += traffic::linear(e, n);
+        for (int hh = 0; hh < H; ++hh) bytes += traffic::linear(absorption(L, hh), n);
       }
       Section section(profiler_, "qkv", bytes);
       if (c_.q_lora_rank > 0) {
@@ -1431,10 +1417,14 @@ class DecoderCpu final : public Model {
         matmul(L.q_proj, h_.data(), n, q_.data(), pool_);
       }
       matmul(L.kv_a_proj, h_.data(), n, k_.data(), pool_);
-      for (int hh = 0; hh < H; ++hh) {
-        gather(q_.data(), static_cast<size_t>(H) * Dq, static_cast<size_t>(hh) * Dq, nope);
-        matmul(L.embed_q[static_cast<size_t>(hh)], head_in_.data(), n, head_out_.data(), pool_);
-        scatter(latent_q_.data(), static_cast<size_t>(H) * W, static_cast<size_t>(hh) * W, rank);
+      if (L.embed_q.empty()) {
+        absorb_transposed(L, n);
+      } else {
+        for (int hh = 0; hh < H; ++hh) {
+          gather(q_.data(), static_cast<size_t>(H) * Dq, static_cast<size_t>(hh) * Dq, nope);
+          matmul(L.embed_q[static_cast<size_t>(hh)], head_in_.data(), n, head_out_.data(), pool_);
+          scatter(latent_q_.data(), static_cast<size_t>(H) * W, static_cast<size_t>(hh) * W, rank);
+        }
       }
     }
     {
@@ -1467,6 +1457,36 @@ class DecoderCpu final : public Model {
       scatter(attn_.data(), static_cast<size_t>(H) * V, static_cast<size_t>(hh) * V, V);
     }
     matmul(L.o_proj, attn_.data(), n, r_.data(), pool_);
+  }
+
+  // Head h's query absorption: embed_q, or the key rows of kv_b_proj
+  // (applied transposed).
+  Linear absorption(const DecoderLayer& L, int h) const {
+    if (!L.embed_q.empty()) return L.embed_q[static_cast<size_t>(h)];
+    return row_slice(L.kv_b_proj, static_cast<int64_t>(h) * (c_.qk_nope_dim + c_.v_head_dim), c_.qk_nope_dim);
+  }
+
+  // latent_q_[t, h, :rank] = sum over d of q_nope[t, h, d] * keys_h[d, :],
+  // keys_h being head h's key rows of kv_b_proj: each row is dequantized
+  // once per pass and accumulated into every token's query.
+  void absorb_transposed(const DecoderLayer& L, int n) {
+    const int H = c_.num_heads, nope = c_.qk_nope_dim, rank = c_.kv_lora_rank;
+    const size_t Dq = static_cast<size_t>(c_.head_dim), W = static_cast<size_t>(c_.latent_width());
+    pool_.parallel_for(static_cast<size_t>(H), [&](size_t begin, size_t end) {
+      std::vector<float> row(static_cast<size_t>(rank));
+      for (size_t hh = begin; hh < end; ++hh) {
+        const Linear keys = absorption(L, static_cast<int>(hh));
+        for (int t = 0; t < n; ++t) std::fill_n(latent_q_.data() + (t * H + hh) * W, rank, 0.0f);
+        for (int d = 0; d < nope; ++d) {
+          dequantize_row(keys, d, row.data());
+          for (int t = 0; t < n; ++t) {
+            const float x = q_[(t * H + hh) * Dq + static_cast<size_t>(d)];
+            float* out = latent_q_.data() + (t * H + hh) * W;
+            for (int r = 0; r < rank; ++r) out[r] += x * row[static_cast<size_t>(r)];
+          }
+        }
+      }
+    });
   }
 
   // Causal attention of the pass's absorbed queries (latent_q_) over layer

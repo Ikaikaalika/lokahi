@@ -90,9 +90,9 @@ query is absorbed into the latent (`embed_q`, the transposed key rows of
 `kv_b_proj`), attention runs over the cache as one key head whose first
 `kv_lora_rank` dimensions are also the value, and each head's latent output
 is expanded by its value rows (`unembed_out`) before `o_proj`. MLX's recent
-conversions store `embed_q` and `unembed_out` as such; for `kv_b_proj` the
-engine views the value rows in place and transposes the key rows into owned
-float32 at load. RoPE covers only the rope dimensions, as interleaved pairs
+conversions store `embed_q` and `unembed_out` as such; `kv_b_proj` is read in
+place, its value rows as `unembed_out` and its key rows applied transposed to
+absorb the query. RoPE covers only the rope dimensions, as interleaved pairs
 (V2, and V3 unless `rope_interleave` is false) or halves; YaRN's attention
 factor scales those dimensions alone, and `mscale_all_dim` squared scales the
 softmax. The latent norms use epsilon 1e-6 whatever `rms_norm_eps` says.
