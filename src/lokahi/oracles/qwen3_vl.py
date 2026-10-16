@@ -28,11 +28,13 @@ def text_config(raw: Mapping[str, Any]) -> LlamaFamilyConfig:
         raise NotImplementedError(f"model_type {raw.get('model_type')!r}")
     text = dict(raw["text_config"])
     text["model_type"] = TEXT_TYPES[raw["model_type"]]
+    # Transformers reads rope_scaling when present, else rope_parameters, and
+    # rope_theta from inside it, else beside it, else 500000.
     scaling = text.get("rope_scaling") or text.get("rope_parameters") or {}
     if not scaling.get("mrope_interleaved", True):
         raise NotImplementedError("chunked (non-interleaved) M-RoPE")
     text["rope_scaling"] = {**scaling, "mrope_section": scaling.get("mrope_section", [24, 20, 20])}
-    text.setdefault("rope_theta", scaling.get("rope_theta", 10_000.0))
+    text["rope_theta"] = scaling.get("rope_theta", text.get("rope_theta", 500_000.0))
     return LlamaFamilyConfig.from_dict(text)
 
 

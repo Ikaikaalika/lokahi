@@ -257,7 +257,8 @@ def test_unsupported_vision_configurations_fail_closed(native_cli, tmp_path, cha
         (_set_rope("mrope_interleaved", False), "qwen3_vl: only interleaved M-RoPE is supported"),
         (_set_rope("mrope_section", [8, 8]), "qwen3_vl: mrope_section must have 3 entries"),
         (_set_rope("rope_type", "longrope"), "rope_scaling type 'longrope' is not supported"),
-        (lambda data: data["text_config"].pop("rope_scaling"), "qwen3_vl: text_config has no rope_scaling"),
+        (lambda data: data["text_config"].pop("rope_scaling"),
+         "qwen3_vl: the text config has no rope_scaling or rope_parameters"),
     ],
 )
 def test_unsupported_text_configurations_fail_closed(native_cli, tmp_path, change, message):

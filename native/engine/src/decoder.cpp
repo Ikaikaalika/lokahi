@@ -699,24 +699,32 @@ DecoderConfig qwen3_5_config(const Json& raw) {
 
 }  // namespace
 
+// A Qwen VL text model's M-RoPE parameters as Transformers reads them:
+// rope_scaling when present, else Transformers 5's rope_parameters, whole;
+// rope_theta from inside that object, else beside it, else default_theta.
+static const Json& vl_rope_parameters(const Json& cfg, const std::string& arch, double default_theta,
+                                      DecoderConfig& c) {
+  const Json* scaling = cfg.find("rope_scaling");
+  const Json* params = cfg.find("rope_parameters");
+  const Json* rope = scaling != nullptr && scaling->is_object() ? scaling
+                     : params != nullptr && params->is_object() ? params
+                                                                : nullptr;
+  LK_CHECK(rope != nullptr, arch + ": the text config has no rope_scaling or rope_parameters");
+  c.rope_theta = static_cast<float>(rope->number_or("rope_theta", cfg.number_or("rope_theta", default_theta)));
+  return *rope;
+}
+
 // Qwen3-VL's text model: Qwen 3 (or Qwen 3 MoE) from text_config, with
-// interleaved M-RoPE (sections [24, 20, 20] by default) from rope_scaling, or
-// Transformers 5's rope_parameters, and deepstack.
+// interleaved M-RoPE (sections [24, 20, 20] by default) and deepstack.
 DecoderConfig qwen3_vl_config(const Json& raw) {
   const Json& cfg = text_config(raw);
   const bool moe = model_type(raw) == "qwen3_vl_moe_text";
   DecoderConfig c = llama_family_config(cfg, moe ? "qwen3_moe" : "qwen3");
   const std::string arch = moe ? "qwen3_vl_moe" : "qwen3_vl";
-  const Json* params = cfg.find("rope_parameters");
-  const Json* scaling = cfg.find("rope_scaling");
-  const Json* rope = params != nullptr && params->is_object() ? params
-                     : scaling != nullptr && scaling->is_object() ? scaling
-                                                                  : nullptr;
-  LK_CHECK(rope != nullptr, arch + ": text_config has no rope_scaling or rope_parameters");
-  const std::string kind = rope->string_or("rope_type", rope->string_or("type", "default"));
+  const Json& rope = vl_rope_parameters(cfg, arch, 5e5, c);
+  const std::string kind = rope.string_or("rope_type", rope.string_or("type", "default"));
   LK_CHECK(kind == "default", arch + ": rope type '" + kind + "' is not supported");
-  if (rope == params) c.rope_theta = static_cast<float>(params->at("rope_theta").as_number());
-  c.rope_axes = interleaved_mrope_axes(*rope, arch, c.head_dim, {24, 20, 20});
+  c.rope_axes = interleaved_mrope_axes(rope, arch, c.head_dim, {24, 20, 20});
   c.deepstack = true;
   c.architecture = arch;
   return c;

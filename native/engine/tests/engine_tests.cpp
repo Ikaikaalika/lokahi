@@ -953,20 +953,29 @@ void test_qwen3_vl_config() {
   EXPECT(c.qk_norm && c.num_kv_heads == 8 && c.rotary_dim == 0 && sections(c) && c.deepstack);
   EXPECT(std::fabs(c.rope_theta - 5e6f) < 1.0f && c.eos_token_ids == std::vector<int32_t>({151645}));
   EXPECT(c.injection_rules(0).deepstack_layers == 28 && c.injection_rules(0).mrope);
-  // Transformers 5 writes rope_parameters, with rope_theta inside; it is the
-  // canonical field, so it wins over a legacy rope_scaling beside it.
+  // Transformers 5 writes rope_parameters, with rope_theta inside, which
+  // wins over the rope_theta beside it.
   std::string v5 = kQwen3VL2BConfig;
   const std::string scaling =
       R"("rope_scaling": {"mrope_interleaved": true, "mrope_section": [24, 20, 20], "rope_type": "default"},)";
   const std::string parameters =
       R"("rope_parameters": {"mrope_interleaved": true, "mrope_section": [24, 20, 20], "rope_type": "default", "rope_theta": 4000000},)";
-  std::string both = v5;
-  both.insert(both.find(scaling), parameters);
   v5.replace(v5.find(scaling), scaling.size(), parameters);
-  for (const std::string& text : {v5, both}) {
-    const DecoderConfig five = DecoderConfig::from_json(Json::parse(text));
-    EXPECT(sections(five) && std::fabs(five.rope_theta - 4e6f) < 1.0f);
-  }
+  const DecoderConfig five = DecoderConfig::from_json(Json::parse(v5));
+  EXPECT(sections(five) && std::fabs(five.rope_theta - 4e6f) < 1.0f);
+  // Beside rope_scaling, Transformers ignores rope_parameters entirely: the
+  // sections and theta come from rope_scaling and the rope_theta beside it.
+  std::string both = kQwen3VL2BConfig;
+  std::string other = parameters;
+  other.replace(other.find("[24, 20, 20]"), 12, "[32, 16, 16]");
+  both.insert(both.find(scaling), other);
+  const DecoderConfig legacy = DecoderConfig::from_json(Json::parse(both));
+  EXPECT(sections(legacy) && std::fabs(legacy.rope_theta - 5e6f) < 1.0f);
+  // Without any rope_theta, Transformers' Qwen3-VL default is 500000.
+  std::string untheta = kQwen3VL2BConfig;
+  const std::string theta = R"("rope_theta": 5000000, )";
+  untheta.erase(untheta.find(theta), theta.size());
+  EXPECT(std::fabs(DecoderConfig::from_json(Json::parse(untheta)).rope_theta - 5e5f) < 1.0f);
   // Without mrope_section, Transformers and MLX-VLM use [24, 20, 20].
   std::string unsectioned = kQwen3VL2BConfig;
   const std::string section = R"("mrope_section": [24, 20, 20], )";
