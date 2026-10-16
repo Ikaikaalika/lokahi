@@ -149,9 +149,10 @@ Transformers saves Qwen3.5 under `model.language_model.` with fused
 carry across prefill passes and decode steps until `reset`.
 
 Qwen3-VL (`qwen3_vl`, `qwen3_vl_moe`) is Qwen 3 or Qwen 3 MoE from
-`text_config` with the same interleaved M-RoPE: sections from
-`rope_scaling` or Transformers 5's `rope_parameters` (which also carries
-`rope_theta` and wins when both are present), `[24, 20, 20]` by default.
+`text_config` with the same interleaved M-RoPE, `[24, 20, 20]` by default.
+As in Transformers, the sections come from `rope_scaling`, or without it
+from Transformers 5's `rope_parameters`, and `rope_theta` from inside that
+object, else beside it, else 500000.
 Its images add deepstack rows (`PromptInjection::layer_rows`): layer l's
 rows are added to the hidden states at the image tokens after decoder layer
 l. On Metal, a deepstack layer's residual runs without the fused next-layer
