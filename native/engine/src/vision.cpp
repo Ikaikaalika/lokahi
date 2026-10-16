@@ -73,6 +73,10 @@ bool has_vision(const Json& config) {
   return vision != nullptr && vision->is_object();
 }
 
+bool vision_supported(const Json& config) {
+  return is_gemma4_vision(config) || is_qwen3_5_vision(config) || is_siglip(config);
+}
+
 std::unique_ptr<VisionEncoder> VisionEncoder::load(const std::string& directory, const std::string& requested,
                                                    unsigned threads) {
   const Json config = Json::parse(read_text_file(directory + "/config.json"));

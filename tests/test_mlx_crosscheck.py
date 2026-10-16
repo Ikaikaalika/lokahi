@@ -69,6 +69,27 @@ def test_affine_layout_matches_mx_dequantize(bits, group):
     assert np.abs(np.array(scale)).min() > 1e-3  # a misread code moves a value by at least one scale step
 
 
+def test_gemma4_unified_defaults_match_transformers():
+    # Gemma 4 12B's text config without the fields that have defaults: the
+    # oracle (and the engine, pinned in engine_tests) take Transformers'
+    # Gemma4UnifiedTextConfig's window, layer pattern, full-layer head size
+    # and image attention. MLX-LM has no gemma4_unified to check against.
+    from transformers.models.gemma4_unified.configuration_gemma4_unified import Gemma4UnifiedTextConfig
+
+    from lokahi.oracles.gemma4 import Gemma4Config
+
+    bare = {"hidden_size": 128, "num_hidden_layers": 12, "intermediate_size": 128, "vocab_size": 512,
+            "head_dim": 64, "num_attention_heads": 4, "num_key_value_heads": 2}
+    theirs = Gemma4UnifiedTextConfig(**bare)
+    ours = Gemma4Config.from_dict({"model_type": "gemma4_unified",
+                                   "text_config": {"model_type": "gemma4_unified_text", **bare}})
+    assert list(ours.layer_types) == theirs.layer_types
+    assert ours.sliding_window == theirs.sliding_window == 1024
+    assert ours.bidirectional_vision and theirs.use_bidirectional_attention == "vision"
+    assert ours.global_head_dim == theirs.per_layer_config["full_attention"].head_dim == 512
+    assert ours.head_dim == theirs.per_layer_config["sliding_attention"].head_dim
+
+
 def test_mxfp4_layout_matches_mx_dequantize():
     import mlx.core as mx
 

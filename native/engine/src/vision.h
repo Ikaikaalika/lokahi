@@ -38,8 +38,10 @@ struct ImageFeatures {
 // side `raw_side` (0: raw files are refused).
 Image read_image(const std::string& path, int raw_side);
 
-// Whether config.json describes a vision tower.
+// Whether config.json describes a vision tower, and whether it is one the
+// engine runs (SigLIP, Gemma 4's, or the Qwen family's).
 bool has_vision(const Json& config);
+bool vision_supported(const Json& config);
 
 class VisionEncoder {
  public:

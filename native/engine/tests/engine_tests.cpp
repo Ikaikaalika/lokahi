@@ -527,6 +527,38 @@ static const char* kGemma4E2BConfig = R"({
     "vocab_size_per_layer_input": 262144}
 })";
 
+// The text configuration of google/gemma-4-12B-it (gemma4_unified), as
+// published with its QAT checkpoints; the vision and audio configs omitted.
+static const char* kGemma4_12BConfig = R"({
+  "architectures": ["Gemma4UnifiedForConditionalGeneration"], "model_type": "gemma4_unified",
+  "eos_token_id": [1, 106], "tie_word_embeddings": true,
+  "text_config": {
+    "attention_bias": false, "attention_dropout": 0.0, "attention_k_eq_v": true, "bos_token_id": 2,
+    "dtype": "bfloat16", "enable_moe_block": false, "eos_token_id": 1, "final_logit_softcapping": 30.0,
+    "global_head_dim": 512, "head_dim": 256, "hidden_activation": "gelu_pytorch_tanh", "hidden_size": 3840,
+    "hidden_size_per_layer_input": 0, "initializer_range": 0.02, "intermediate_size": 15360,
+    "layer_types": [
+      "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention",
+      "full_attention", "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention",
+      "sliding_attention", "full_attention", "sliding_attention", "sliding_attention", "sliding_attention",
+      "sliding_attention", "sliding_attention", "full_attention", "sliding_attention", "sliding_attention",
+      "sliding_attention", "sliding_attention", "sliding_attention", "full_attention", "sliding_attention",
+      "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+      "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention",
+      "full_attention", "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention",
+      "sliding_attention", "full_attention", "sliding_attention", "sliding_attention", "sliding_attention",
+      "sliding_attention", "sliding_attention", "full_attention"],
+    "max_position_embeddings": 262144, "model_type": "gemma4_unified_text", "moe_intermediate_size": null,
+    "num_attention_heads": 16, "num_experts": null, "num_global_key_value_heads": 1, "num_hidden_layers": 48,
+    "num_key_value_heads": 8, "num_kv_shared_layers": 0, "pad_token_id": 0, "rms_norm_eps": 1e-06,
+    "rope_parameters": {
+      "full_attention": {"partial_rotary_factor": 0.25, "rope_theta": 1000000.0, "rope_type": "proportional"},
+      "sliding_attention": {"rope_theta": 10000.0, "rope_type": "default"}},
+    "sliding_window": 1024, "tie_word_embeddings": true, "top_k_experts": null,
+    "use_bidirectional_attention": "vision", "use_cache": true, "use_double_wide_mlp": false,
+    "vocab_size": 262144, "vocab_size_per_layer_input": 0}
+})";
+
 // mlx-community/gemma-3-4b-it-4bit's config: the text fields not listed take
 // Transformers' Gemma3TextConfig defaults.
 static const char* kGemma3_4BConfig = R"({
@@ -594,6 +626,46 @@ void test_gemma4_config() {
       DecoderConfig::from_json(with({{"attention_k_eq_v", "true"}, {"num_global_key_value_heads", "4"}}));
   EXPECT(keqv.k_eq_v(4) && !keqv.k_eq_v(3) && keqv.kv_heads_of(4) == 4 && keqv.kv_heads_of(3) == 1);
   EXPECT(keqv.kv_heads_of(34) == 4 && keqv.kv_source(34) == 14);
+  // Without global_head_dim, full layers are 512 wide, as Transformers and
+  // MLX-LM default it.
+  std::string no_global = kGemma4E2BConfig;
+  const std::string global_field = "\"global_head_dim\": 512, ";
+  no_global.erase(no_global.find(global_field), global_field.size());
+  EXPECT(DecoderConfig::from_json(Json::parse(no_global)).head_dim_of(4) == 512);
+  EXPECT(throws([&] { DecoderConfig::from_json(with({{"use_bidirectional_attention", "\"all\""}})); }));
+
+  // Gemma 4 12B: 48 layers, every sixth full; 16 query heads over 8 KV heads
+  // of 256 on sliding layers, and over one 512-wide head whose values are its
+  // keys on full layers; no per-layer inputs, KV sharing or experts.
+  const DecoderConfig g12 = DecoderConfig::from_json(Json::parse(kGemma4_12BConfig));
+  EXPECT(g12.architecture == "gemma4_unified" && g12.num_layers == 48 && g12.hidden_size == 3840);
+  EXPECT(g12.num_heads == 16 && g12.per_layer_input == 0 && g12.num_experts == 0 && g12.sliding_window == 1024);
+  EXPECT(g12.final_logit_softcapping == 30.0f && g12.eos_token_ids == std::vector<int32_t>({1, 106}));
+  EXPECT(g12.image_blocks == DecoderConfig::ImageBlocks::SlidingLayers);
+  for (int l = 0; l < g12.num_layers; ++l) {
+    const bool full = l % 6 == 5;
+    EXPECT(g12.layer_is_sliding[static_cast<size_t>(l)] == !full && g12.kv_source(l) == l);
+    EXPECT(g12.head_dim_of(l) == (full ? 512 : 256) && g12.kv_heads_of(l) == (full ? 1 : 8));
+    EXPECT(g12.k_eq_v(l) == full && g12.intermediate_of(l) == 15360);
+  }
+  // A text_config without its own model_type takes the document's.
+  std::string untyped = kGemma4_12BConfig;
+  const std::string text_type = "\"model_type\": \"gemma4_unified_text\", ";
+  untyped.erase(untyped.find(text_type), text_type.size());
+  EXPECT(DecoderConfig::from_json(Json::parse(untyped)).architecture == "gemma4_unified");
+  // Its defaults are Transformers' Gemma4UnifiedTextConfig's: a 1024-token
+  // window, "vision" attention and every sixth layer full.
+  std::string bare = kGemma4_12BConfig;
+  for (const char* field : {"\"sliding_window\": 1024, ", "\"use_bidirectional_attention\": \"vision\", "}) {
+    bare.erase(bare.find(field), std::string(field).size());
+  }
+  const size_t types = bare.find("\"layer_types\": [");
+  bare.erase(types, bare.find("],", types) + 2 - types);
+  const DecoderConfig defaults = DecoderConfig::from_json(Json::parse(bare));
+  EXPECT(defaults.sliding_window == 1024 && defaults.image_blocks == DecoderConfig::ImageBlocks::SlidingLayers);
+  for (int l = 0; l < defaults.num_layers; ++l) {
+    EXPECT(defaults.layer_is_sliding[static_cast<size_t>(l)] == (l % 6 != 5));
+  }
 }
 
 // The text fields of openai/gpt-oss-20b's config as mlx-community publishes it.
