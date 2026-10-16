@@ -80,6 +80,30 @@ def _rename(name: str, mlx: bool) -> str:
     return "model.language_model." + name[len("model."):] if name.startswith("model.") else name
 
 
+def text_tensors(source: dict, quant: dict, mlx: bool, rename) -> dict[str, tuple[str, np.ndarray]]:
+    """``write_tiny_dense``'s tensors renamed by ``rename(name)``: as written
+    (affine-quantized) when ``mlx``, else dequantized to BF16."""
+
+    tensors: dict[str, tuple[str, np.ndarray]] = {}
+    for name, (dtype, array) in source.items():
+        if mlx:
+            tensors[rename(name)] = (dtype, array)
+        elif name.endswith(".scales") or name.endswith(".biases"):
+            continue
+        elif name.endswith(".weight") and dtype == "U32":  # dequantize to BF16
+            module = name[: -len(".weight")]
+            override = quant.get(module)
+            source_spec = override if isinstance(override, dict) else quant
+            qspec = QuantSpec(group_size=source_spec["group_size"], bits=source_spec["bits"])
+            scales = source[f"{module}.scales"]
+            biases = source[f"{module}.biases"]
+            dense = dequantize_affine(array, bf16_to_f32(scales[1]), bf16_to_f32(biases[1]), qspec)
+            tensors[rename(name)] = ("BF16", f32_to_bf16(dense.astype(np.float32)))
+        else:
+            tensors[rename(name)] = (dtype, array)
+    return tensors
+
+
 def write_tiny_qwen3_vl(directory: Path, spec: TinyQwen3VLSpec = TinyQwen3VLSpec()) -> Path:
     """Write ``config.json``, ``preprocessor_config.json`` and ``model.safetensors``."""
 
@@ -95,25 +119,9 @@ def write_tiny_qwen3_vl(directory: Path, spec: TinyQwen3VLSpec = TinyQwen3VLSpec
     text = json.loads((directory / "config.json").read_text(encoding="utf-8"))
     source, _ = read_safetensors(directory / "model.safetensors")
 
-    tensors: dict[str, tuple[str, np.ndarray]] = {}
     quant = text.pop("quantization")
     text.pop("quantization_config")
-    for name, (dtype, array) in source.items():
-        if spec.mlx:
-            tensors[_rename(name, True)] = (dtype, array)
-        elif name.endswith(".scales") or name.endswith(".biases"):
-            continue
-        elif name.endswith(".weight") and dtype == "U32":  # dequantize to BF16
-            module = name[: -len(".weight")]
-            override = quant.get(module)
-            source_spec = override if isinstance(override, dict) else quant
-            qspec = QuantSpec(group_size=source_spec["group_size"], bits=source_spec["bits"])
-            scales = source[f"{module}.scales"]
-            biases = source[f"{module}.biases"]
-            dense = dequantize_affine(array, bf16_to_f32(scales[1]), bf16_to_f32(biases[1]), qspec)
-            tensors[_rename(name, False)] = ("BF16", f32_to_bf16(dense.astype(np.float32)))
-        else:
-            tensors[_rename(name, False)] = (dtype, array)
+    tensors = text_tensors(source, quant, spec.mlx, lambda name: _rename(name, spec.mlx))
     write_tower(tensors, t, spec.mlx, spec.text.hidden_size, spec.deepstack_visual_indexes)
 
     for key in ("architectures", "quantization", "quantization_config", "torch_dtype"):

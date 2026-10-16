@@ -10,6 +10,7 @@ from .gemma3 import Gemma3Config, Gemma3Reference
 from .gemma4 import Gemma4Config, Gemma4Reference
 from .gemma4_vision import Gemma4VisionConfig, Gemma4VisionReference
 from .llama import LlamaFamilyConfig, LlamaFamilyReference
+from .qwen2_5_vl import Qwen25VisionConfig, Qwen25VLReference
 from .qwen3_5 import Qwen35Config, Qwen35Reference
 from .qwen3_5_vision import Qwen35VisionConfig, Qwen35VisionReference
 from .qwen3_vl import Qwen3VLReference
@@ -28,6 +29,8 @@ __all__ = [
     "Gemma4VisionReference",
     "LlamaFamilyConfig",
     "LlamaFamilyReference",
+    "Qwen25VLReference",
+    "Qwen25VisionConfig",
     "Qwen35Config",
     "Qwen35Reference",
     "Qwen35VisionConfig",

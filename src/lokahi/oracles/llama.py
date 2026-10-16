@@ -37,7 +37,11 @@ Semantics follow the Hugging Face ``LlamaForCausalLM``, ``MistralForCausalLM``,
   position when ``i % 3 == 2`` and ``i < 3 * section[2]``, and its temporal
   one otherwise; ``logits`` takes the three positions per token, injected
   embeddings, and deepstack rows added to the hidden states after each of
-  the first layers.
+  the first layers;
+* Qwen2.5-VL's text model (Qwen 2) uses chunked M-RoPE
+  (``mrope_interleaved`` false): the first ``section[0]`` frequencies read
+  the temporal position, the next ``section[1]`` the row and the last
+  ``section[2]`` the column; the sections cover every frequency.
 
 Quantized MLX checkpoints are dequantized to float32 on load.
 """
@@ -85,7 +89,8 @@ class LlamaFamilyConfig:
     topk_group: int = 1
     routed_scaling_factor: float = 1.0
     n_shared_experts: int = 0
-    mrope_section: tuple[int, ...] = ()  # interleaved M-RoPE (Qwen3-VL); empty: one position per token
+    mrope_section: tuple[int, ...] = ()  # M-RoPE (Qwen3-VL, Qwen2.5-VL); empty: one position per token
+    mrope_interleaved: bool = True  # Qwen3-VL's layout; False: Qwen2.5-VL's chunked sections
 
     @classmethod
     def from_dict(cls, cfg: Mapping[str, Any]) -> "LlamaFamilyConfig":
@@ -133,12 +138,20 @@ class LlamaFamilyConfig:
             routed_scaling_factor=float(cfg.get("routed_scaling_factor") or 1.0),
             n_shared_experts=int(cfg.get("n_shared_experts") or 0),
             mrope_section=tuple(int(s) for s in (scaling or {}).get("mrope_section") or ()),
+            mrope_interleaved=bool((scaling or {}).get("mrope_interleaved", True)),
         )
 
     def rope_axes(self) -> np.ndarray:
         """The position axis (0 temporal, 1 row, 2 column) each rotation frequency reads."""
 
         axes = np.zeros((self.rotary_dim or self.head_dim) // 2, dtype=np.int64)
+        if self.mrope_section and not self.mrope_interleaved:
+            temporal, rows, columns = self.mrope_section
+            if temporal + rows + columns != axes.size:
+                raise ValueError(f"chunked mrope_section {self.mrope_section} must cover {axes.size} frequencies")
+            axes[temporal : temporal + rows] = 1
+            axes[temporal + rows :] = 2
+            return axes
         for axis in (1, 2) if self.mrope_section else ():
             axes[axis : 3 * self.mrope_section[axis] : 3] = axis
         return axes
