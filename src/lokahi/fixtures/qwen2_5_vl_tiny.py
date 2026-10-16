@@ -1,8 +1,9 @@
-"""Write a tiny, randomly initialized Qwen2.5-VL checkpoint.
+"""Write a tiny, randomly initialized Qwen2.5-VL or Qwen2-VL checkpoint.
 
 The text model is ``dense_tiny``'s Qwen 2 (q/k/v biases) with chunked M-RoPE;
 the tower is Qwen2.5-VL's window-attention ViT with RMSNorms, SwiGLU MLPs
-and an ``ln_q`` merger, in BF16. Three layouts:
+and an ``ln_q`` merger, or (``family="qwen2_vl"``) Qwen2-VL's global one with
+LayerNorms and QuickGELU ``fc1`` / ``fc2`` MLPs, in BF16. Three layouts:
 
 * ``mlx`` (mlx-community's conversions): a flat ``config.json`` (the text
   fields at the top level), the affine-quantized text model under
@@ -66,12 +67,31 @@ class TinyQwen25VLSpec:
     text: TinyDenseSpec = VL25_TEXT
     tower: TinyQwen25VisionSpec = field(default_factory=TinyQwen25VisionSpec)
     layout: str = "mlx"
+    family: str = "qwen2_5_vl"  # or "qwen2_vl" (the tower's window fields unused)
     # 32 frequencies, as Qwen2.5-VL's [16, 24, 24] is for 64: 8 temporal, then
     # 12 on rows and 12 on columns.
     mrope_section: tuple[int, ...] = (8, 12, 12)
 
     def vision_config(self) -> dict:
         t = self.tower
+        if self.family == "qwen2_vl":  # as Qwen/Qwen2-VL-2B-Instruct names its fields
+            config = {
+                "depth": t.depth,
+                "embed_dim": t.hidden_size,
+                "mlp_ratio": t.intermediate_size // t.hidden_size,
+                "num_heads": t.num_heads,
+                "hidden_size": self.text.hidden_size,
+                "patch_size": t.patch_size,
+                "spatial_merge_size": t.spatial_merge_size,
+                "spatial_patch_size": t.patch_size,
+                "temporal_patch_size": t.temporal_patch_size,
+            }
+            if self.layout == "hf5":
+                config.update(model_type="qwen2_vl_vision", in_channels=3, hidden_act="quick_gelu",
+                              rope_parameters={"rope_theta": 10000.0, "rope_type": "axial"})
+            else:
+                config["in_chans"] = 3
+            return config
         config = {
             "depth": t.depth,
             "hidden_act": "silu",
@@ -105,7 +125,7 @@ class TinyQwen25VLSpec:
             "image_mean": CLIP_MEAN,
             "image_std": CLIP_STD,
             "image_processor_type": "Qwen2VLImageProcessor",
-            "processor_class": "Qwen2_5_VLProcessor",
+            "processor_class": "Qwen2_5_VLProcessor" if self.family == "qwen2_5_vl" else "Qwen2VLProcessor",
         }
 
 
@@ -122,21 +142,31 @@ def write_tower(tensors: dict, spec: TinyQwen25VLSpec) -> None:
         bf16(f"{name}.weight", rng.normal(0.0, cols**-0.5, (rows, cols)))
         bf16(f"{name}.bias", rng.normal(0.0, 0.1, rows))
 
+    def norm(name: str, size: int) -> None:
+        bf16(f"{name}.weight", rng.normal(1.0, 0.2, size))
+        if qwen2:  # LayerNorms
+            bf16(f"{name}.bias", rng.normal(0.0, 0.1, size))
+
+    qwen2 = spec.family == "qwen2_vl"
     prefix = {"mlx": "vision_tower", "hf": "visual", "hf5": "model.visual"}[spec.layout]
     hidden, inter, p, frames = t.hidden_size, t.intermediate_size, t.patch_size, t.temporal_patch_size
     kernel = rng.normal(0.0, (3 * frames * p * p) ** -0.5, (hidden, 3, frames, p, p))
     bf16(f"{prefix}.patch_embed.proj.weight", kernel.transpose(0, 2, 3, 4, 1) if spec.layout == "mlx" else kernel)
     for index in range(t.depth):
         block = f"{prefix}.blocks.{index}"
-        bf16(f"{block}.norm1.weight", rng.normal(1.0, 0.2, hidden))
-        bf16(f"{block}.norm2.weight", rng.normal(1.0, 0.2, hidden))
+        norm(f"{block}.norm1", hidden)
+        norm(f"{block}.norm2", hidden)
         linear(f"{block}.attn.qkv", 3 * hidden, hidden)
         linear(f"{block}.attn.proj", hidden, hidden)
-        linear(f"{block}.mlp.gate_proj", inter, hidden)
-        linear(f"{block}.mlp.up_proj", inter, hidden)
-        linear(f"{block}.mlp.down_proj", hidden, inter)
+        if qwen2:
+            linear(f"{block}.mlp.fc1", inter, hidden)
+            linear(f"{block}.mlp.fc2", hidden, inter)
+        else:
+            linear(f"{block}.mlp.gate_proj", inter, hidden)
+            linear(f"{block}.mlp.up_proj", inter, hidden)
+            linear(f"{block}.mlp.down_proj", hidden, inter)
     merged = hidden * t.spatial_merge_size**2
-    bf16(f"{prefix}.merger.ln_q.weight", rng.normal(1.0, 0.2, hidden))
+    norm(f"{prefix}.merger.ln_q", hidden)
     linear(f"{prefix}.merger.mlp.0", merged, merged)
     linear(f"{prefix}.merger.mlp.2", out_hidden, merged)
 
@@ -157,6 +187,10 @@ def write_tiny_qwen2_5_vl(directory: Path, spec: TinyQwen25VLSpec = TinyQwen25VL
         raise ValueError("Qwen2.5-VL's text model is Qwen 2, with hidden_size / num_attention_heads per head")
     if spec.layout not in LAYOUTS:
         raise ValueError(f"layout must be one of {LAYOUTS}")
+    if spec.family not in ("qwen2_5_vl", "qwen2_vl"):
+        raise ValueError("family must be qwen2_5_vl or qwen2_vl")
+    if spec.family == "qwen2_vl" and spec.tower.intermediate_size % spec.tower.hidden_size:
+        raise ValueError("Qwen2-VL sizes its MLP by a whole mlp_ratio")
     t = spec.tower
     if max(t.image_token_id, t.vision_start_token_id, t.vision_end_token_id) >= spec.text.vocab_size:
         raise ValueError("the image tokens must be inside the vocabulary")
@@ -174,16 +208,17 @@ def write_tiny_qwen2_5_vl(directory: Path, spec: TinyQwen25VLSpec = TinyQwen25VL
     ids = {"image_token_id": t.image_token_id, "video_token_id": t.image_token_id + 1,
            "vision_start_token_id": t.vision_start_token_id, "vision_end_token_id": t.vision_end_token_id}
     section = list(spec.mrope_section)
+    architecture = {"qwen2_5_vl": "Qwen2_5_VLForConditionalGeneration", "qwen2_vl": "Qwen2VLForConditionalGeneration"}[
+        spec.family]
     if spec.layout == "hf5":
-        text["model_type"] = "qwen2_5_vl_text"
+        text["model_type"] = spec.family + "_text"
         text["rope_parameters"] = {"type": "mrope", "rope_type": "default", "mrope_section": section,
                                    "rope_theta": text.pop("rope_theta")}
         text["layer_types"] = ["full_attention"] * spec.text.num_hidden_layers
-        config = {"architectures": ["Qwen2_5_VLForConditionalGeneration"], "model_type": "qwen2_5_vl",
-                  "text_config": text, "vision_config": spec.vision_config(),
-                  "tie_word_embeddings": spec.text.tie_word_embeddings, **ids}
+        config = {"architectures": [architecture], "model_type": spec.family, "text_config": text,
+                  "vision_config": spec.vision_config(), "tie_word_embeddings": spec.text.tie_word_embeddings, **ids}
     else:
-        config = {**text, "architectures": ["Qwen2_5_VLForConditionalGeneration"], "model_type": "qwen2_5_vl",
+        config = {**text, "architectures": [architecture], "model_type": spec.family,
                   "rope_scaling": {"type": "mrope", "mrope_section": section}, "vision_config": spec.vision_config(),
                   **ids}
     if mlx:

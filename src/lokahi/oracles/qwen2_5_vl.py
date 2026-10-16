@@ -1,4 +1,4 @@
-"""NumPy reference for Qwen2.5-VL: its window-attention tower and merger, and its Qwen 2 text model.
+"""NumPy reference for Qwen2.5-VL and Qwen2-VL: their towers and mergers, and their Qwen 2 text model.
 
 Semantics follow Transformers' ``Qwen2_5_VisionTransformerPretrainedModel``,
 ``get_vision_window_index`` and ``Qwen2_5_VLModel.get_rope_index``:
@@ -25,6 +25,14 @@ Semantics follow Transformers' ``Qwen2_5_VisionTransformerPretrainedModel``,
   ``[16, 24, 24]`` by default), and image tokens take Qwen3.5's positions
   (``rope_positions``).
 
+Qwen2-VL (``Qwen2VisionTransformerPretrainedModel``) has the same processor,
+patch embedding, RoPE, positions and text model, but every block attends
+globally, its norms are LayerNorms with biases, its MLP is
+``fc2(quick_gelu(fc1(.)))`` (``x * sigmoid(1.702 x)``) and its merger's
+``ln_q`` is a LayerNorm. Its ``vision_config`` names the tower's width
+``embed_dim``, sizes the MLP by ``mlp_ratio`` and calls the text width
+``hidden_size``.
+
 Checkpoints come in three layouts: MLX's (``vision_tower.*``,
 ``language_model.*``), Qwen's published one (Transformers 4: ``visual.*``,
 ``model.*``, ``lm_head``) and Transformers 5's (``model.visual.*``,
@@ -43,15 +51,16 @@ import numpy as np
 
 from .gemma3 import load_dense_weights
 from .llama import LlamaFamilyConfig, LlamaFamilyReference, _rms_norm
-from .qwen3_5_vision import Qwen35VisionConfig, Qwen35VisionReference, _gelu, merged_order, patchify, processor_fields
+from .qwen3_5_vision import (Qwen35VisionConfig, Qwen35VisionReference, _gelu, _layer_norm, merged_order, patchify,
+                             processor_fields)
 
 DEFAULT_SECTION = (16, 24, 24)
 
 
 def text_config(raw: Mapping[str, Any]) -> LlamaFamilyConfig:
-    """The Llama-family configuration of a Qwen2.5-VL checkpoint's text model."""
+    """The Llama-family configuration of a Qwen2.5-VL or Qwen2-VL checkpoint's text model."""
 
-    if raw.get("model_type") != "qwen2_5_vl":
+    if raw.get("model_type") not in ("qwen2_5_vl", "qwen2_vl"):
         raise NotImplementedError(f"model_type {raw.get('model_type')!r}")
     text = dict(raw.get("text_config") or {key: value for key, value in raw.items() if key != "vision_config"})
     if text.get("use_sliding_window") or any(t != "full_attention" for t in text.get("layer_types") or ()):
@@ -190,3 +199,81 @@ class Qwen25VLReference(Qwen35VisionReference):
         h = _gelu(self._linear(f"{t}.merger.mlp.0", h))
         merged = self._linear(f"{t}.merger.mlp.2", h).astype(np.float32)
         return merged[np.argsort(order)], []
+
+
+@dataclass(frozen=True)
+class Qwen2VisionConfig(Qwen25VisionConfig):
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any], processor: Mapping[str, Any] | None = None) -> "Qwen2VisionConfig":
+        v = raw["vision_config"]
+        if v.get("hidden_act", "quick_gelu") != "quick_gelu":
+            raise NotImplementedError(f"vision activation {v.get('hidden_act')!r}")
+        rope = v.get("rope_parameters") or {}
+        if rope.get("rope_type", "axial") != "axial" or float(rope.get("rope_theta", 10000.0)) != 10000.0:
+            raise NotImplementedError(f"vision rope {rope!r}")
+        width = int(v["embed_dim"])
+        ratio = float(v.get("mlp_ratio", 4))
+        if width * ratio != int(width * ratio):
+            raise NotImplementedError("embed_dim * mlp_ratio must be a whole number")
+        return cls(
+            depth=int(v["depth"]),
+            hidden_size=width,
+            intermediate_size=int(width * ratio),
+            num_heads=int(v["num_heads"]),
+            patch_size=int(v.get("patch_size", 14)),
+            temporal_patch_size=int(v.get("temporal_patch_size", 2)),
+            spatial_merge_size=int(v.get("spatial_merge_size", 2)),
+            in_channels=int(v.get("in_channels", v.get("in_chans", 3))),
+            out_hidden_size=int(v["hidden_size"]),
+            num_position_embeddings=0,
+            image_token_id=int(raw["image_token_id"]),
+            vision_start_token_id=int(raw["vision_start_token_id"]),
+            vision_end_token_id=int(raw["vision_end_token_id"]),
+            fullatt_block_indexes=tuple(range(int(v["depth"]))),  # every block global
+            **processor_fields(processor),
+        )
+
+
+class Qwen2VLReference(Qwen25VLReference):
+    """Float32 Qwen2-VL: the global-attention tower and merger, then the Qwen 2 text model."""
+
+    @classmethod
+    def load(cls, model_dir: Path, processor: Mapping[str, Any] | None = None) -> "Qwen2VLReference":
+        import json
+
+        model_dir = Path(model_dir)
+        raw, weights = load_dense_weights(model_dir)
+        if processor is None and (model_dir / "preprocessor_config.json").exists():
+            processor = json.loads((model_dir / "preprocessor_config.json").read_text(encoding="utf-8"))
+        return cls(Qwen2VisionConfig.from_dict(raw, processor), weights, LlamaFamilyReference(text_config(raw), weights))
+
+    def _norm(self, name: str, x: np.ndarray) -> np.ndarray:
+        return _layer_norm(x, self.w[name], self.w[f"{name}.bias"])
+
+    def encode_all(self, rgb: np.ndarray) -> tuple[np.ndarray, list[np.ndarray]]:
+        """The features (and no deepstack features)."""
+
+        cfg, t = self.config, self.tower
+        rows, cols = cfg.grid(*rgb.shape[:2])
+        x = (patchify(rgb, cfg) @ self._patch_weight().T).astype(np.float32)
+        n, heads, dim = x.shape[0], cfg.num_heads, cfg.head_dim
+        for index in range(cfg.depth):
+            block = f"{t}.blocks.{index}"
+            h = self._norm(f"{block}.norm1", x)
+            qkv = self._linear(f"{block}.attn.qkv", h).reshape(n, 3, heads, dim)
+            q, k, v = self._rope(qkv[:, 0], rows, cols), self._rope(qkv[:, 1], rows, cols), qkv[:, 2]
+            out = np.empty_like(q)
+            for head in range(heads):
+                scores = (q[:, head] @ k[:, head].T).astype(np.float64) * dim**-0.5
+                scores -= scores.max(axis=-1, keepdims=True)
+                probs = np.exp(scores)
+                probs /= probs.sum(axis=-1, keepdims=True)
+                out[:, head] = (probs @ v[:, head]).astype(np.float32)
+            x = x + self._linear(f"{block}.attn.proj", out.reshape(n, heads * dim))
+            h = self._linear(f"{block}.mlp.fc1", self._norm(f"{block}.norm2", x))
+            h = h / (1.0 + np.exp(-1.702 * h))
+            x = (x + self._linear(f"{block}.mlp.fc2", h)).astype(np.float32)
+        square = cfg.spatial_merge_size**2
+        h = self._norm(f"{t}.merger.ln_q", x).reshape(-1, x.shape[1] * square)
+        h = _gelu(self._linear(f"{t}.merger.mlp.0", h))
+        return self._linear(f"{t}.merger.mlp.2", h).astype(np.float32), []

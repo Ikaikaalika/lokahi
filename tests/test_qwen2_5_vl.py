@@ -1,4 +1,4 @@
-"""Qwen2.5-VL: the fixture's guards, and the native engine against the oracle.
+"""Qwen2.5-VL and Qwen2-VL: the fixtures' guards, and the native engine against the oracle.
 
 The oracle is pinned to MLX-VLM and Transformers in
 test_mlx_vlm_crosscheck.py. Correctness evidence only: generated fixtures,
@@ -16,15 +16,24 @@ import numpy as np
 import pytest
 
 from lokahi.fixtures import TinyQwen25VLSpec, write_tiny_qwen2_5_vl
-from lokahi.oracles import Qwen25VisionConfig, Qwen25VLReference
+from lokahi.oracles import Qwen2VisionConfig, Qwen2VLReference, Qwen25VisionConfig, Qwen25VLReference
 from lokahi.oracles.qwen2_5_vl import text_config, window_index
 
 SPEC = TinyQwen25VLSpec()
+# Qwen2-VL's tower: mlp_ratio 2, and a seed whose greedy continuations vary.
+QWEN2_SPEC = replace(SPEC, family="qwen2_vl", tower=replace(SPEC.tower, intermediate_size=128, seed=335))
 VARIANTS = {
     "qwen2.5-vl-mlx": SPEC,
     "qwen2.5-vl-hf": replace(SPEC, layout="hf"),
     "qwen2.5-vl-hf5": replace(SPEC, layout="hf5"),
+    "qwen2-vl-mlx": QWEN2_SPEC,
+    "qwen2-vl-hf": replace(QWEN2_SPEC, layout="hf"),
+    "qwen2-vl-hf5": replace(QWEN2_SPEC, layout="hf5"),
 }
+
+
+def _load(directory: Path, spec: TinyQwen25VLSpec) -> Qwen25VLReference:
+    return (Qwen2VLReference if spec.family == "qwen2_vl" else Qwen25VLReference).load(directory)
 # Images of 48x80 and 64x32 pixels: merged grids of 3x5 tokens (windows of
 # 2x2 tokens: two whole, four cut by the right and bottom edges) and 4x2
 # tokens (two whole windows; Transformers pads a whole empty row of them).
@@ -102,19 +111,19 @@ def test_window_index_follows_transformers_padding():
     assert order.tolist() == list(range(6)) and lengths == [6]
 
 
-def test_layouts_agree(tmp_path):
+@pytest.mark.parametrize("family", ["qwen2.5-vl", "qwen2-vl"])
+def test_layouts_agree(tmp_path, family):
     images = _images()
-    oracles = {name: Qwen25VLReference.load(write_tiny_qwen2_5_vl(tmp_path / name, spec))
-               for name, spec in VARIANTS.items()}
+    names = [f"{family}-{layout}" for layout in ("mlx", "hf", "hf5")]
+    oracles = {name: _load(write_tiny_qwen2_5_vl(tmp_path / name, VARIANTS[name]), VARIANTS[name]) for name in names}
     assert [o.tower for o in oracles.values()] == ["vision_tower", "visual", "model.visual"]
     features = {name: [o.encode(image) for image in images] for name, o in oracles.items()}
-    for name in VARIANTS:  # the tower's BF16 weights are the same in every layout
-        for got, want in zip(features[name], features["qwen2.5-vl-mlx"]):
+    for name in names:  # the tower's BF16 weights are the same in every layout
+        for got, want in zip(features[name], features[names[0]]):
             np.testing.assert_array_equal(got, want)
     # Transformers 4's flat config and Transformers 5's text_config describe
     # the same text model (both store the dequantized BF16 weights).
-    np.testing.assert_array_equal(oracles["qwen2.5-vl-hf"].logits(PROMPT, images),
-                                  oracles["qwen2.5-vl-hf5"].logits(PROMPT, images))
+    np.testing.assert_array_equal(oracles[names[1]].logits(PROMPT, images), oracles[names[2]].logits(PROMPT, images))
 
 
 def test_fixture_windows_and_each_rope_axis_matter(reference):
@@ -148,6 +157,45 @@ def test_fixture_windows_and_each_rope_axis_matter(reference):
                         ("swapped", moved(positions[[0, 2, 1]])), ("interleaved", moved(language=interleaved))]:
         assert value > 0.03, name
     # Greedy continuations vary, and with the images.
+    greedy = reference.greedy(PROMPT, images, 10)
+    assert len(set(greedy)) >= 4 and greedy != reference.greedy(PROMPT, _images(1), 10)
+
+
+# Qwen/Qwen2-VL-2B-Instruct's config.json, as published (text fields trimmed
+# to those the reference reads).
+CONFIG_QWEN2_2B = {
+    "model_type": "qwen2_vl", "image_token_id": 151655, "vision_start_token_id": 151652,
+    "vision_end_token_id": 151653, "hidden_act": "silu", "hidden_size": 1536, "intermediate_size": 8960,
+    "num_attention_heads": 12, "num_hidden_layers": 28, "num_key_value_heads": 2, "rms_norm_eps": 1e-06,
+    "rope_theta": 1000000.0, "sliding_window": 32768, "tie_word_embeddings": True, "use_sliding_window": False,
+    "vision_config": {
+        "depth": 32, "embed_dim": 1280, "mlp_ratio": 4, "num_heads": 16, "in_chans": 3, "hidden_size": 1536,
+        "patch_size": 14, "spatial_merge_size": 2, "spatial_patch_size": 14, "temporal_patch_size": 2,
+    },
+    "rope_scaling": {"type": "mrope", "mrope_section": [16, 24, 24]},
+    "vocab_size": 151936,
+}
+
+
+def test_config_reads_the_published_qwen2_vl_2b_fields():
+    text = text_config(CONFIG_QWEN2_2B)
+    assert (text.model_type, text.num_hidden_layers, text.head_dim, text.mrope_section) == ("qwen2", 28, 128,
+                                                                                           (16, 24, 24))
+    vision = Qwen2VisionConfig.from_dict(CONFIG_QWEN2_2B, PREPROCESSOR_3B)
+    assert (vision.hidden_size, vision.intermediate_size, vision.out_hidden_size) == (1280, 5120, 1536)
+    assert vision.fullatt_block_indexes == tuple(range(32)) and vision.factor == 28
+
+
+def test_qwen2_vl_fixture_each_rope_axis_matters(tmp_path):
+    reference = _load(write_tiny_qwen2_5_vl(tmp_path / "model", QWEN2_SPEC), QWEN2_SPEC)
+    images = _images()
+    injected, positions, _, _ = reference._inputs(PROMPT, images)
+    expected = reference.language.logits(PROMPT, injected, positions)
+    scale = np.abs(expected).max()
+    no_rows, no_columns = positions.copy(), positions.copy()
+    no_rows[1], no_columns[2] = positions[0], positions[0]
+    for name, other in [("rows", no_rows), ("columns", no_columns), ("swapped", positions[[0, 2, 1]])]:
+        assert np.abs(reference.language.logits(PROMPT, injected, other) - expected).max() / scale > 0.03, name
     greedy = reference.greedy(PROMPT, images, 10)
     assert len(set(greedy)) >= 4 and greedy != reference.greedy(PROMPT, _images(1), 10)
 
@@ -192,7 +240,7 @@ def _skip_unsupported(directory: Path, backend: str) -> None:
 def vlm(request, tmp_path_factory):
     directory = write_tiny_qwen2_5_vl(tmp_path_factory.mktemp(request.param) / "model", VARIANTS[request.param])
     images = _images(seed=3)
-    return directory, Qwen25VLReference.load(directory), images, _image_files(directory, images)
+    return directory, _load(directory, VARIANTS[request.param]), images, _image_files(directory, images)
 
 
 # 7 query rows per Metal attention pass divides none of the images' patch
@@ -260,7 +308,8 @@ def test_text_alone_matches_oracle(native_cli, vlm, backend, tmp_path):
     tolerance = 2e-4 if backend == "cpu" else 2e-2
     np.testing.assert_allclose(got, expected, atol=tolerance * np.abs(expected).max(), rtol=0)
     np.testing.assert_array_equal(got.argmax(axis=1), expected.argmax(axis=1))
-    assert _run(native_cli, "info", "--model", str(directory), "--backend", backend)["architecture"] == "qwen2_5_vl"
+    family = json.loads((directory / "config.json").read_text())["model_type"]  # qwen2_5_vl or qwen2_vl
+    assert _run(native_cli, "info", "--model", str(directory), "--backend", backend)["architecture"] == family
 
 
 def _edit(path: Path, change) -> None:
@@ -334,3 +383,21 @@ def test_negative_attention_rows_fail_closed(native_cli, tmp_path):
     assert "--vision-attention-rows must not be negative" in _fails(
         native_cli, "image-features", "--model", str(directory), "--images", files, "--out", str(tmp_path / "x.bin"),
         "--vision-attention-rows", "-1")
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        (_set_vision("hidden_act", "gelu"), "qwen2_vl vision: unsupported activation gelu"),
+        (_set_vision("mlp_ratio", 2.01), "qwen2_vl vision: embed_dim * mlp_ratio must be a whole number"),
+        (_set_vision("hidden_size", 64), "out_hidden_size must be the text model's hidden_size"),
+        (_set_vision("deepstack_visual_indexes", [0]), "deepstack features are Qwen3-VL's, not qwen2_vl's"),
+        (_set_vision("in_chans", 1), "qwen2_vl vision: images must have 3 channels"),
+    ],
+)
+def test_unsupported_qwen2_vl_vision_configurations_fail_closed(native_cli, tmp_path, change, message):
+    directory = write_tiny_qwen2_5_vl(tmp_path / "model", QWEN2_SPEC)
+    _edit(directory / "config.json", change)
+    files = _image_files(tmp_path, _images()[:1])
+    assert message in _fails(native_cli, "image-features", "--model", str(directory), "--images", files,
+                             "--out", str(tmp_path / "x.bin"))

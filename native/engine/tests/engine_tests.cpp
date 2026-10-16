@@ -1055,7 +1055,7 @@ void test_qwen2_5_vl_config() {
   const Json processor = Json::parse(R"({"min_pixels": 3136, "max_pixels": 12845056, "patch_size": 14,
     "temporal_patch_size": 2, "merge_size": 2})");
   const Qwen35VisionConfig vision = Qwen35VisionConfig::from_json(Json::parse(kQwen25VL3BConfig), &processor);
-  EXPECT(vision.qwen2_5 && vision.depth == 32 && vision.hidden_size == 1280 && vision.patch_size == 14);
+  EXPECT(vision.qwen2_5() && vision.depth == 32 && vision.hidden_size == 1280 && vision.patch_size == 14);
   EXPECT(vision.window == 4 && vision.full_attention == std::vector<int>({7, 15, 23, 31}) && vision.deepstack.empty());
   EXPECT(vision.position_side == 0 && vision.text_hidden_size == 2048 && vision.factor() == 28);
   EXPECT(vision.min_pixels == 3136 && vision.max_pixels == 12845056 && std::fabs(vision.mean[0] - 0.48145466f) < 1e-7f);
@@ -1064,6 +1064,40 @@ void test_qwen2_5_vl_config() {
   std::string wider = kQwen25VL3BConfig;
   wider.replace(wider.find("\"window_size\": 112"), 18, "\"window_size\": 120");
   EXPECT(Qwen35VisionConfig::from_json(Json::parse(wider), &processor).window == 4);
+}
+
+// Qwen/Qwen2-VL-2B-Instruct's config.json, as published.
+static const char* kQwen2VL2BConfig = R"({
+  "architectures": ["Qwen2VLForConditionalGeneration"], "attention_dropout": 0.0, "bos_token_id": 151643,
+  "eos_token_id": 151645, "vision_start_token_id": 151652, "vision_end_token_id": 151653,
+  "vision_token_id": 151654, "image_token_id": 151655, "video_token_id": 151656, "hidden_act": "silu",
+  "hidden_size": 1536, "initializer_range": 0.02, "intermediate_size": 8960, "max_position_embeddings": 32768,
+  "max_window_layers": 28, "model_type": "qwen2_vl", "num_attention_heads": 12, "num_hidden_layers": 28,
+  "num_key_value_heads": 2, "rms_norm_eps": 1e-06, "rope_theta": 1000000.0, "sliding_window": 32768,
+  "tie_word_embeddings": true, "torch_dtype": "bfloat16", "transformers_version": "4.41.2", "use_cache": true,
+  "use_sliding_window": false,
+  "vision_config": {
+    "depth": 32, "embed_dim": 1280, "mlp_ratio": 4, "num_heads": 16, "in_chans": 3, "hidden_size": 1536,
+    "patch_size": 14, "spatial_merge_size": 2, "spatial_patch_size": 14, "temporal_patch_size": 2},
+  "rope_scaling": {"type": "mrope", "mrope_section": [16, 24, 24]},
+  "vocab_size": 151936
+})";
+
+void test_qwen2_vl_config() {
+  const DecoderConfig c = DecoderConfig::from_json(Json::parse(kQwen2VL2BConfig));
+  EXPECT(c.architecture == "qwen2_vl" && c.num_layers == 28 && c.hidden_size == 1536 && c.head_dim == 128);
+  EXPECT(c.qkv_bias && c.num_kv_heads == 2 && c.rope_axes.size() == 64 && c.rope_axes[15] == 0 &&
+         c.rope_axes[16] == 1 && c.rope_axes[39] == 1 && c.rope_axes[40] == 2 && c.rope_axes[63] == 2);
+  EXPECT(std::fabs(c.rope_theta - 1e6f) < 1.0f && c.injection_rules(0).mrope &&
+         c.injection_rules(0).deepstack_layers == 0);
+  const Json processor = Json::parse(R"({"min_pixels": 3136, "max_pixels": 12845056, "patch_size": 14,
+    "temporal_patch_size": 2, "merge_size": 2})");
+  const Qwen35VisionConfig vision = Qwen35VisionConfig::from_json(Json::parse(kQwen2VL2BConfig), &processor);
+  // embed_dim is the tower's width, mlp_ratio sizes its MLP, hidden_size is the text width.
+  EXPECT(vision.tower == Qwen35VisionConfig::Tower::Qwen2 && vision.hidden_size == 1280 &&
+         vision.intermediate_size == 5120 && vision.text_hidden_size == 1536);
+  EXPECT(!vision.qwen2_5() && !vision.qwen3_5() && vision.window == 0 && vision.full_attention.empty() &&
+         vision.position_side == 0 && vision.factor() == 28 && vision.head_dim() == 80);
 }
 
 // Qwen35VisionEncoder's geometry reads only the config; this encoder runs nothing.
@@ -1087,7 +1121,7 @@ void test_qwen2_5_vl_window_order() {
   // Transformers' get_vision_window_index orders it: merged tokens 0 1 5 6 |
   // 2 3 7 8 | 4 9 | 10 11 | 12 13 | 14, each token's four patches together.
   Qwen35VisionConfig c;
-  c.qwen2_5 = true;
+  c.tower = Qwen35VisionConfig::Tower::Qwen2_5;
   c.merge = 2;
   c.window = 2;
   std::vector<int32_t> bounds;
@@ -1105,7 +1139,7 @@ void test_qwen2_5_vl_window_order() {
   }
   EXPECT(bounds == windows);
   // Outside Qwen2.5-VL, patches keep merge-block order and see the whole image.
-  c.qwen2_5 = false;
+  c.tower = Qwen35VisionConfig::Tower::Qwen3_5;
   const std::vector<int> identity = GeometryEncoder(c).run_order(2, 4, &bounds);
   EXPECT(identity == std::vector<int>({0, 1, 2, 3, 4, 5, 6, 7}) && bounds.size() == 16 && bounds[6] == 0 &&
          bounds[7] == 8);
@@ -1206,6 +1240,7 @@ int main() {
   test_mrope_injection_plan();
   test_qwen3_vl_config();
   test_qwen2_5_vl_config();
+  test_qwen2_vl_config();
   test_qwen2_5_vl_window_order();
   test_qwen3_5_vision_config();
   if (g_failures) {

@@ -58,12 +58,12 @@ bool is_qwen3_vl(const Json& raw) {
   return type == "qwen3_vl_text" || type == "qwen3_vl_moe_text";
 }
 
-// Qwen2.5-VL: Qwen 2 with chunked M-RoPE; its config keeps the text fields
-// at the top level (model_type qwen2_5_vl) or, from Transformers 5, in
-// text_config (qwen2_5_vl_text).
+// Qwen2.5-VL and Qwen2-VL: Qwen 2 with chunked M-RoPE; their configs keep
+// the text fields at the top level (model_type qwen2_5_vl, qwen2_vl) or,
+// from Transformers 5, in text_config (qwen2_5_vl_text, qwen2_vl_text).
 bool is_qwen2_5_vl(const Json& raw) {
   const std::string type = model_type(raw);
-  return type == "qwen2_5_vl" || type == "qwen2_5_vl_text";
+  return type == "qwen2_5_vl" || type == "qwen2_5_vl_text" || type == "qwen2_vl" || type == "qwen2_vl_text";
 }
 
 // `rope`'s mrope_section (temporal, rows, columns), or `section`, the
@@ -765,14 +765,15 @@ DecoderConfig qwen3_vl_config(const Json& raw) {
   return c;
 }
 
-// Qwen2.5-VL's text model: Qwen 2 (q/k/v biases) with chunked M-RoPE
-// (sections [16, 24, 24] by default) from rope_scaling ({"type": "mrope"})
-// or Transformers 5's rope_parameters. Transformers splits hidden_size
-// evenly across the heads whatever head_dim says, so another head_dim fails
-// closed, as do sliding-window layers.
+// Qwen2.5-VL's and Qwen2-VL's text model: Qwen 2 (q/k/v biases) with
+// chunked M-RoPE (sections [16, 24, 24] by default) from rope_scaling
+// ({"type": "mrope"}) or Transformers 5's rope_parameters. Transformers
+// splits hidden_size evenly across the heads whatever head_dim says, so
+// another head_dim fails closed, as do sliding-window layers.
 DecoderConfig qwen2_5_vl_config(const Json& raw) {
   const Json& cfg = text_config(raw);
-  const std::string arch = "qwen2_5_vl";
+  const std::string type = model_type(raw);
+  const std::string arch = type.ends_with("_text") ? type.substr(0, type.size() - 5) : type;  // qwen2_5_vl, qwen2_vl
   DecoderConfig c = llama_family_config(cfg, "qwen2", true);
   LK_CHECK(c.hidden_size % c.num_heads == 0 && c.head_dim == c.hidden_size / c.num_heads,
            arch + ": head_dim must be hidden_size / num_attention_heads");
@@ -799,8 +800,8 @@ DecoderConfig DecoderConfig::from_json(const Json& raw) {
   LK_CHECK(is_supported_decoder(raw),
            "unsupported architecture '" + model_type(raw) +
                "'; this build supports gemma3, gemma4, llama, mistral, qwen2, qwen3, qwen3_moe, gpt_oss, glm4_moe, "
-               "glm4_moe_lite, deepseek_v2, deepseek_v3, qwen3_5, qwen3_5_moe, qwen3_next, qwen3_vl, qwen3_vl_moe and "
-               "qwen2_5_vl text models");
+               "glm4_moe_lite, deepseek_v2, deepseek_v3, qwen3_5, qwen3_5_moe, qwen3_next, qwen3_vl, qwen3_vl_moe, "
+               "qwen2_5_vl and qwen2_vl text models");
   DecoderConfig c = is_gemma3(raw)       ? gemma3_config(raw)
                     : is_gemma4(raw)     ? gemma4_config(raw)
                     : is_deepseek(raw)   ? deepseek_config(raw)

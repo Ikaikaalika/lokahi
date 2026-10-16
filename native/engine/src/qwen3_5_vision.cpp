@@ -47,21 +47,23 @@ bool is_qwen3_5_vision(const Json& config) {
   const std::string type = config.string_or("model_type", "");
   const Json* vision = config.find("vision_config");
   return (type == "qwen3_5" || type == "qwen3_5_moe" || type == "qwen3_vl" || type == "qwen3_vl_moe" ||
-          type == "qwen2_5_vl") &&
+          type == "qwen2_5_vl" || type == "qwen2_vl") &&
          vision != nullptr && vision->is_object();
 }
 
 Qwen35VisionConfig Qwen35VisionConfig::from_json(const Json& config, const Json* preprocessor) {
-  LK_CHECK(is_qwen3_5_vision(config), "config.json has no Qwen3.5, Qwen3-VL or Qwen2.5-VL vision_config");
+  LK_CHECK(is_qwen3_5_vision(config),
+           "config.json has no Qwen3.5, Qwen3-VL, Qwen2.5-VL or Qwen2-VL vision_config");
   const Json& v = config.at("vision_config");
   const std::string type = config.string_or("model_type", "");
   Qwen35VisionConfig c;
-  c.qwen2_5 = type == "qwen2_5_vl";
-  const std::string who = c.qwen2_5 ? "qwen2_5_vl vision" : "qwen3_5 vision";
-  const std::string activation = c.qwen2_5 ? "silu" : "gelu_pytorch_tanh";
+  using Tower = Qwen35VisionConfig::Tower;
+  c.tower = type == "qwen2_5_vl" ? Tower::Qwen2_5 : type == "qwen2_vl" ? Tower::Qwen2 : Tower::Qwen3_5;
+  const std::string who = c.qwen3_5() ? "qwen3_5 vision" : type + " vision";
+  const std::string activation = c.qwen2_5() ? "silu" : c.qwen3_5() ? "gelu_pytorch_tanh" : "quick_gelu";
   LK_CHECK(v.string_or("hidden_act", activation) == activation,
            who + ": unsupported activation " + v.string_or("hidden_act", ""));
-  // Qwen's published Qwen2.5-VL configs say in_chans.
+  // Qwen's published Qwen2-VL and Qwen2.5-VL configs say in_chans.
   LK_CHECK(v.int_or("in_channels", v.int_or("in_chans", 3)) == 3, who + ": images must have 3 channels");
   c.depth = positive(v, "depth", 0, who);
   // Transformers takes the i-th deepstack merger for the i-th listed block
@@ -70,18 +72,27 @@ Qwen35VisionConfig Qwen35VisionConfig::from_json(const Json& config, const Json*
                            who + ": deepstack_visual_indexes must be increasing blocks of the tower");
   LK_CHECK(c.deepstack.empty() || type == "qwen3_vl" || type == "qwen3_vl_moe",
            who + ": deepstack features are Qwen3-VL's, not " + type + "'s");
-  c.hidden_size = positive(v, "hidden_size", 0, who);
-  c.intermediate_size = positive(v, "intermediate_size", 0, who);
+  if (c.tower == Tower::Qwen2) {  // embed_dim wide, mlp_ratio times that inside the MLP
+    c.hidden_size = positive(v, "embed_dim", 0, who);
+    const double inner = c.hidden_size * v.number_or("mlp_ratio", 4.0);
+    LK_CHECK(inner >= 1.0 && inner == std::floor(inner), who + ": embed_dim * mlp_ratio must be a whole number");
+    c.intermediate_size = static_cast<int>(inner);
+  } else {
+    c.hidden_size = positive(v, "hidden_size", 0, who);
+    c.intermediate_size = positive(v, "intermediate_size", 0, who);
+  }
   c.num_heads = positive(v, "num_heads", 0, who);
-  c.patch_size = positive(v, "patch_size", c.qwen2_5 ? 14 : 16, who);
+  c.patch_size = positive(v, "patch_size", c.qwen3_5() ? 16 : 14, who);
   c.temporal_patch_size = positive(v, "temporal_patch_size", 2, who);
   c.merge = positive(v, "spatial_merge_size", 2, who);
-  if (c.qwen2_5) {
+  if (c.qwen2_5()) {
     // Transformers floors window_size // spatial_merge_size // patch_size.
     c.window = positive(v, "window_size", 112, who) / (c.merge * c.patch_size);
     LK_CHECK(c.window > 0, who + ": window_size must cover a merged token");
     c.full_attention = block_list(v.find("fullatt_block_indexes"), c.depth,
                                   who + ": fullatt_block_indexes must be increasing blocks of the tower");
+  }
+  if (!c.qwen3_5()) {
     if (const Json* rope = v.find("rope_parameters"); rope != nullptr && rope->is_object()) {
       LK_CHECK(rope->string_or("rope_type", "axial") == "axial" && rope->number_or("rope_theta", 1e4) == 1e4,
                who + ": only axial 2-D RoPE with theta 10000 is supported");
@@ -93,10 +104,10 @@ Qwen35VisionConfig Qwen35VisionConfig::from_json(const Json& config, const Json*
   }
   // 2-D RoPE splits half of each head between rows and columns.
   LK_CHECK(c.hidden_size % c.num_heads == 0 && c.head_dim() % 4 == 0, who + ": the head size must be a multiple of 4");
-  c.text_hidden_size = positive(v, "out_hidden_size", 0, who);
-  // Qwen2.5-VL's text fields may sit at the top level.
+  c.text_hidden_size = positive(v, c.tower == Tower::Qwen2 ? "hidden_size" : "out_hidden_size", 0, who);
+  // Qwen2-VL's and Qwen2.5-VL's text fields may sit at the top level.
   const Json* text = config.find("text_config");
-  const Json* text_fields = text != nullptr && text->is_object() ? text : c.qwen2_5 ? &config : nullptr;
+  const Json* text_fields = text != nullptr && text->is_object() ? text : c.qwen3_5() ? nullptr : &config;
   LK_CHECK(text_fields != nullptr && text_fields->at("hidden_size").as_int() == c.text_hidden_size,
            who + ": out_hidden_size must be the text model's hidden_size");
   c.image_token_id = static_cast<int>(config.at("image_token_id").as_int());
@@ -160,7 +171,7 @@ std::shared_ptr<Qwen35VisionWeights> Qwen35VisionWeights::load(const std::string
   const std::string t = ck.contains("vision_tower.patch_embed.proj.weight")   ? "vision_tower"
                         : ck.contains("model.visual.patch_embed.proj.weight") ? "model.visual"
                                                                                : "visual";
-  const std::string who = c.qwen2_5 ? "qwen2_5_vl vision" : "qwen3_5 vision";
+  const std::string who = c.qwen3_5() ? "qwen3_5 vision" : config.string_or("model_type", "") + " vision";
   const int64_t hidden = c.hidden_size, inter = c.intermediate_size, P = c.patch_size, T = c.temporal_patch_size;
   const int64_t merged = hidden * c.merge * c.merge;
   auto linear = [&](const std::string& module, int64_t rows, int64_t cols, std::vector<float>* bias) {
@@ -195,7 +206,7 @@ std::shared_ptr<Qwen35VisionWeights> Qwen35VisionWeights::load(const std::string
       }
     }
   }
-  if (!c.qwen2_5) {  // Qwen2.5-VL has neither
+  if (c.qwen3_5()) {  // Qwen2-VL and Qwen2.5-VL have neither
     w->patch_bias = vector_of(ck, t + ".patch_embed.proj.bias", hidden);
     w->positions = vector_of(ck, t + ".pos_embed.weight", int64_t{c.position_side} * c.position_side * hidden);
     LK_CHECK(ck.get(t + ".pos_embed.weight").shape ==
@@ -210,15 +221,16 @@ std::shared_ptr<Qwen35VisionWeights> Qwen35VisionWeights::load(const std::string
     L.norm2_weight = vector_of(ck, base + ".norm2.weight", hidden);
     L.qkv = linear(base + ".attn.qkv", 3 * hidden, hidden, &L.qkv_bias);
     L.proj = linear(base + ".attn.proj", hidden, hidden, &L.proj_bias);
-    if (c.qwen2_5) {
+    if (c.qwen2_5()) {
       L.gate = linear(base + ".mlp.gate_proj", inter, hidden, &L.gate_bias);
       L.up = linear(base + ".mlp.up_proj", inter, hidden, &L.up_bias);
       L.down = linear(base + ".mlp.down_proj", hidden, inter, &L.down_bias);
     } else {
       L.norm1_bias = vector_of(ck, base + ".norm1.bias", hidden);
       L.norm2_bias = vector_of(ck, base + ".norm2.bias", hidden);
-      L.fc1 = linear(base + ".mlp.linear_fc1", inter, hidden, &L.fc1_bias);
-      L.fc2 = linear(base + ".mlp.linear_fc2", hidden, inter, &L.fc2_bias);
+      const std::string mlp = base + (c.qwen3_5() ? ".mlp.linear_fc" : ".mlp.fc");
+      L.fc1 = linear(mlp + "1", inter, hidden, &L.fc1_bias);
+      L.fc2 = linear(mlp + "2", hidden, inter, &L.fc2_bias);
     }
     w->layers.push_back(std::move(L));
   }
@@ -232,8 +244,11 @@ std::shared_ptr<Qwen35VisionWeights> Qwen35VisionWeights::load(const std::string
     m.fc2 = linear(name + ".linear_fc2", c.text_hidden_size, merged, &m.fc2_bias);
     return m;
   };
-  if (c.qwen2_5) {  // ln_q, then mlp.0 and mlp.2 around the GELU
+  if (!c.qwen3_5()) {  // ln_q (Qwen2-VL's a LayerNorm), then mlp.0 and mlp.2 around the GELU
     w->merger.norm_weight = vector_of(ck, t + ".merger.ln_q.weight", hidden);
+    if (c.tower == Qwen35VisionConfig::Tower::Qwen2) {
+      w->merger.norm_bias = vector_of(ck, t + ".merger.ln_q.bias", hidden);
+    }
     w->merger.fc1 = linear(t + ".merger.mlp.0", merged, merged, &w->merger.fc1_bias);
     w->merger.fc2 = linear(t + ".merger.mlp.2", c.text_hidden_size, merged, &w->merger.fc2_bias);
   } else {
@@ -310,7 +325,7 @@ std::vector<std::vector<int>> Qwen35VisionEncoder::windows(int rows, int cols) c
 
 std::vector<int> Qwen35VisionEncoder::run_order(int rows, int cols, std::vector<int32_t>* bounds) const {
   const std::vector<std::vector<int>> groups =
-      config().qwen2_5 ? windows(rows, cols) : std::vector<std::vector<int>>{};
+      config().qwen2_5() ? windows(rows, cols) : std::vector<std::vector<int>>{};
   std::vector<int> order;
   order.reserve(static_cast<size_t>(rows) * static_cast<size_t>(cols));
   if (bounds != nullptr) bounds->clear();
@@ -405,7 +420,7 @@ class Qwen35VisionCpu final : public Qwen35VisionEncoder {
   // The tower's norm of `width` values: Qwen2.5-VL's RMSNorm, else a LayerNorm.
   void norm(const float* in, const std::vector<float>& weight, const std::vector<float>& bias, int64_t width,
             float* out) const {
-    if (config().qwen2_5) {
+    if (config().qwen2_5()) {
       rms_norm(in, weight.data(), width, kLayerNormEps, out);
     } else {
       layer_norm(in, weight, bias, width, kLayerNormEps, out);
@@ -447,7 +462,7 @@ ImageFeatures Qwen35VisionCpu::encode_features(const Image& image) {
 
   const std::vector<float> patch_rows = patches(image);
   std::vector<float> x(sn * hidden), h(sn * hidden), qkv(sn * 3 * hidden), attn(sn * hidden), r(sn * hidden),
-      f(sn * inter), g(c.qwen2_5 ? sn * inter : 0);
+      f(sn * inter), g(c.qwen2_5() ? sn * inter : 0);
   matmul(patch_, patch_rows.data(), N, x.data(), pool_);
   if (!w.patch_bias.empty()) add_rows(x.data(), w.patch_bias, N);
   if (c.position_side > 0) {
@@ -457,7 +472,7 @@ ImageFeatures Qwen35VisionCpu::encode_features(const Image& image) {
   // full-attention blocks) the patches of its window.
   std::vector<int> everyone(sn);
   for (size_t t = 0; t < sn; ++t) everyone[t] = static_cast<int>(t);
-  const std::vector<std::vector<int>> groups = c.qwen2_5 ? windows(rows, cols) : std::vector<std::vector<int>>{};
+  const std::vector<std::vector<int>> groups = c.qwen2_5() ? windows(rows, cols) : std::vector<std::vector<int>>{};
   std::vector<size_t> group_of(sn, 0);
   for (size_t i = 0; i < groups.size(); ++i) {
     for (int t : groups[i]) group_of[static_cast<size_t>(t)] = i;
@@ -480,7 +495,7 @@ ImageFeatures Qwen35VisionCpu::encode_features(const Image& image) {
   ImageFeatures out;
   for (size_t block = 0; block < w.layers.size(); ++block) {
     const Qwen35VisionWeights::Layer& L = w.layers[block];
-    const bool global = !c.qwen2_5 || std::binary_search(c.full_attention.begin(), c.full_attention.end(),
+    const bool global = !c.qwen2_5() || std::binary_search(c.full_attention.begin(), c.full_attention.end(),
                                                          static_cast<int>(block));
     for (int64_t t = 0; t < N; ++t) {
       norm(x.data() + t * hidden, L.norm1_weight, L.norm1_bias, hidden, h.data() + t * hidden);
@@ -528,7 +543,7 @@ ImageFeatures Qwen35VisionCpu::encode_features(const Image& image) {
     for (int64_t t = 0; t < N; ++t) {
       norm(x.data() + t * hidden, L.norm2_weight, L.norm2_bias, hidden, h.data() + t * hidden);
     }
-    if (c.qwen2_5) {  // down(silu(gate(h)) * up(h))
+    if (c.qwen2_5()) {  // down(silu(gate(h)) * up(h))
       matmul(L.gate, h.data(), N, f.data(), pool_);
       add_rows(f.data(), L.gate_bias, N);
       matmul(L.up, h.data(), N, g.data(), pool_);
@@ -539,7 +554,11 @@ ImageFeatures Qwen35VisionCpu::encode_features(const Image& image) {
     } else {
       matmul(L.fc1, h.data(), N, f.data(), pool_);
       add_rows(f.data(), L.fc1_bias, N);
-      for (float& value : f) value = gelu_tanh(value);
+      if (c.qwen3_5()) {
+        for (float& value : f) value = gelu_tanh(value);
+      } else {  // Qwen2-VL's QuickGELU
+        for (float& value : f) value = value / (1.0f + std::exp(-1.702f * value));
+      }
       matmul(L.fc2, f.data(), N, r.data(), pool_);
       add_rows(r.data(), L.fc2_bias, N);
     }

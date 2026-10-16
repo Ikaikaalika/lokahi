@@ -2152,6 +2152,13 @@ inline float erf_approx(float x) {
   return x >= 0.0f ? 1.0f - erfc_z : erfc_z - 1.0f;
 }
 
+// Qwen2-VL's QuickGELU, x * sigmoid(1.702 x).
+kernel void quick_gelu_inplace(device float* x [[buffer(0)]],
+                               constant ElementwiseParams& p [[buffer(1)]],
+                               uint gid [[thread_position_in_grid]]) {
+  if (int(gid) < p.count) x[gid] = x[gid] / (1.0f + precise::exp(-1.702f * x[gid]));
+}
+
 kernel void gelu_erf_inplace(device float* x [[buffer(0)]],
                              constant ElementwiseParams& p [[buffer(1)]],
                              uint gid [[thread_position_in_grid]]) {
