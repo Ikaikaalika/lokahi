@@ -54,10 +54,19 @@ struct DecoderConfig {
   float norm_offset = 0.0f;
   // Gemma also normalizes each sublayer's output before the residual add.
   bool sandwich_norms = false;
-  bool qk_norm = false;   // per-head RMSNorm on q and k before RoPE
-  bool qkv_bias = false;  // biases on the q, k and v projections (Qwen 2)
+  float post_norm_eps = 0.0f;  // those output norms' epsilon; 0 for rms_norm_eps
+  bool qk_norm = false;        // per-head RMSNorm on q and k before RoPE
+  bool qk_norm_scale = true;   // false: the Q/K norms are scale-free (no weights)
+  bool qkv_bias = false;       // biases on the q, k and v projections (Qwen 2)
   Activation activation = Activation::Silu;
   float embed_scale = 1.0f;
+  bool embed_norm = false;  // a scale-free RMSNorm on the token embeddings, after embed_scale
+  // The final norm scales by its weight even when the block norms use
+  // norm_offset 1, and the logits are multiplied by logit_multiplier before
+  // the soft-cap (Muse Glimmer). The loader folds both into final_norm, so
+  // the backends apply it like the block norms.
+  bool plain_final_norm = false;
+  float logit_multiplier = 1.0f;
   float attn_scale = 0.0f;
   float rope_theta = 1e4f;
   RopeScaling rope_scaling;
@@ -201,8 +210,10 @@ struct DecoderConfig {
   }
   // Qwen3.5's full attention: q_proj gives each head its query and then an
   // output gate (head_dim each), and the attention output is multiplied by
-  // sigmoid(gate) before o_proj.
+  // sigmoid(gate) before o_proj. With attn_gate_proj (Muse Glimmer) the gate
+  // has its own projection, self_attn.gate_proj [heads * head_dim, hidden].
   bool attn_output_gate = false;
+  bool attn_gate_proj = false;
   // Qwen3.5's multi-token prediction head (DecoderWeights::mtp): its layer
   // is layer num_layers of the per-layer fields above, a full-attention one.
   int mtp_layers = 0;
@@ -234,6 +245,7 @@ struct DecoderLayer {
   // k_proj and v_proj are empty (rows 0) in KV-shared layers, v_proj with k_eq_v;
   // gate_proj, up_proj and down_proj in mixture-of-experts layers.
   Linear q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj;
+  Linear attn_gate;  // the attention output gate's own projection, with attn_gate_proj
   // Mixture of experts: the router [experts, hidden] and one view per expert;
   // biases [experts * rows] only with router_bias and expert_bias.
   Linear router;

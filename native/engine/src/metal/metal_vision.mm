@@ -372,7 +372,7 @@ class Gemma4VisionMetal final : public Gemma4VisionEncoder, private MetalKit {
     id<MTLBuffer> input_norm, post_attention_norm, pre_feedforward_norm, post_feedforward_norm, q_norm, k_norm;
     GpuMatrix q, k, v, o, gate, up, down;
   };
-  struct ResidualNormParams { int cols; float eps; float offset; int post_norm; int has_next; float scale; };
+  struct ResidualNormParams { int cols; float eps; float post_eps; float offset; int post_norm; int has_next; float scale; };
   struct GluMulParams { int count; int silu; };
   struct AxialRopeParams { int heads; int dim; int freqs; };
   struct PoolStandardizeParams {
@@ -447,7 +447,7 @@ class Gemma4VisionMetal final : public Gemma4VisionEncoder, private MetalKit {
     [enc setBuffer:w_post offset:0 atIndex:2];
     [enc setBuffer:(w_next != nil ? w_next : dummy_) offset:0 atIndex:3];
     [enc setBuffer:h_ offset:0 atIndex:4];
-    bytes(enc, ResidualNormParams{c.hidden_size, c.rms_norm_eps, 0.0f, 1, w_next != nil ? 1 : 0, 1.0f}, 5);
+    bytes(enc, ResidualNormParams{c.hidden_size, c.rms_norm_eps, c.rms_norm_eps, 0.0f, 1, w_next != nil ? 1 : 0, 1.0f}, 5);
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(rows), 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
   }
 

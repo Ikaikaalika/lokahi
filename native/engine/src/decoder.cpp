@@ -41,6 +41,13 @@ bool is_gemma4(const Json& raw) {
   return type == "gemma4_text" || type == "gemma4" || type == "gemma4_unified" || type == "gemma4_unified_text";
 }
 
+// Meta's Muse Glimmer: its text model (the multimodal checkpoint's
+// text_config, or MLX-LM's flattened one).
+bool is_muse_glimmer(const Json& raw) {
+  const std::string type = model_type(raw);
+  return type == "muse_glimmer" || type == "muse_glimmer_text";
+}
+
 bool is_llama_family(const Json& raw) {
   const std::string type = model_type(raw);
   return type == "llama" || type == "mistral" || type == "qwen2" || type == "qwen3" || type == "qwen3_moe" ||
@@ -197,6 +204,97 @@ DecoderConfig gemma3_config(const Json& raw) {
   if (const Json* cap = cfg.find("attn_logit_softcapping"); cap && cap->is_number()) {
     c.attn_logit_softcapping = static_cast<float>(cap->as_number());
   }
+  c.eos_token_ids = eos_ids(raw, cfg);
+  return c;
+}
+
+// Muse Glimmer (Transformers' modeling_muse_glimmer, MLX-LM muse_glimmer):
+// Gemma 3's block, sandwich norms that scale by 1 + weight with post-norms of
+// their own epsilon, and SwiGLU; scale-free RMSNorm on the token embeddings
+// and on each head's q and k, with q then times qk_scale_factor (folded into
+// the attention scale); a sigmoid output gate from self_attn.gate_proj; RoPE
+// on the sliding layers only, the full layers running without positions
+// (layer_rope_theta 0); and a final norm that scales by its weight, the
+// logits times output_multiplier before the soft-cap.
+DecoderConfig muse_glimmer_config(const Json& raw) {
+  const Json& cfg = text_config(raw);
+  DecoderConfig c;
+  c.architecture = "muse_glimmer";
+  const std::string& arch = c.architecture;
+  LK_CHECK(!flag(cfg, "attention_bias"), arch + ": attention_bias is not supported");
+  c.vocab_size = static_cast<int>(cfg.int_or("vocab_size", 202048));
+  c.hidden_size = static_cast<int>(cfg.at("hidden_size").as_int());
+  c.intermediate_size = static_cast<int>(cfg.at("intermediate_size").as_int());
+  c.num_layers = static_cast<int>(cfg.at("num_hidden_layers").as_int());
+  c.num_heads = static_cast<int>(cfg.at("num_attention_heads").as_int());
+  c.num_kv_heads = static_cast<int>(cfg.int_or("num_key_value_heads", c.num_heads));
+  c.head_dim = static_cast<int>(cfg.int_or("head_dim", c.hidden_size / c.num_heads));
+  c.rms_norm_eps = static_cast<float>(cfg.number_or("rms_norm_eps", 1e-5));
+  c.post_norm_eps = static_cast<float>(cfg.number_or("post_norm_eps", 1e-8));
+  c.norm_offset = 1.0f;
+  c.sandwich_norms = true;
+  c.qk_norm = true;
+  c.qk_norm_scale = false;
+  c.attn_output_gate = true;
+  c.attn_gate_proj = true;
+  c.embed_norm = true;
+  c.plain_final_norm = true;
+  c.logit_multiplier = static_cast<float>(cfg.number_or("output_multiplier", 0.19611613513818404));
+  c.attn_scale = static_cast<float>(cfg.number_or("qk_scale_factor", 3.87)) /
+                 std::sqrt(static_cast<float>(c.head_dim));
+  const std::string activation = cfg.string_or("hidden_activation", "silu");
+  LK_CHECK(activation == "silu", arch + ": unsupported activation " + activation);
+  c.activation = Activation::Silu;
+  if (const Json* cap = cfg.find("final_logit_softcapping"); cap && cap->is_number()) {
+    c.final_logit_softcapping = static_cast<float>(cap->as_number());
+  } else if (cap == nullptr) {
+    c.final_logit_softcapping = 20.0f;
+  }
+  double theta = cfg.number_or("rope_theta", 500000.0);
+  if (const Json* rope = cfg.find("rope_parameters"); rope != nullptr && rope->is_object()) {
+    const std::string kind = rope->string_or("rope_type", "default");
+    LK_CHECK(kind == "default", arch + ": rope_type '" + kind + "' is not supported");
+    theta = rope->number_or("rope_theta", theta);
+  }
+  if (const Json* scaling = cfg.find("rope_scaling"); scaling != nullptr && !scaling->is_null()) {
+    LK_CHECK(scaling->is_object() &&
+                 scaling->string_or("rope_type", scaling->string_or("type", "default")) == "default",
+             arch + ": rope_scaling is not supported");
+  }
+  if (const Json* types = cfg.find("layer_types"); types != nullptr && types->is_array()) {
+    for (const Json& kind : types->as_array()) {
+      const std::string name = kind.as_string();
+      LK_CHECK(name == "sliding_attention" || name == "full_attention", arch + ": unknown layer type " + name);
+      c.layer_is_sliding.push_back(name == "sliding_attention");
+    }
+  } else {  // [local, local, local, global], repeating
+    for (int i = 0; i < c.num_layers; ++i) c.layer_is_sliding.push_back(i % 4 != 3);
+  }
+  LK_CHECK(static_cast<int>(c.layer_is_sliding.size()) == c.num_layers, arch + ": layer_types length mismatch");
+  // Sliding layers rotate with one theta and full layers do not rotate: the
+  // global frequencies are all zero (global_partial_rotary 0).
+  double local_theta = theta;
+  if (const Json* thetas = cfg.find("layer_rope_theta"); thetas != nullptr && !thetas->is_null()) {
+    LK_CHECK(thetas->is_array() && static_cast<int>(thetas->as_array().size()) == c.num_layers,
+             arch + ": layer_rope_theta must give every layer's theta");
+    bool first = true;
+    for (int i = 0; i < c.num_layers; ++i) {
+      const double value = thetas->as_array()[static_cast<size_t>(i)].as_number();
+      if (!c.layer_is_sliding[static_cast<size_t>(i)]) {
+        LK_CHECK(value == 0.0, arch + ": full-attention layers with RoPE are not supported");
+        continue;
+      }
+      LK_CHECK(value > 0.0, arch + ": sliding layers without RoPE are not supported");
+      LK_CHECK(first || value == local_theta, arch + ": sliding layers with different RoPE thetas are not supported");
+      local_theta = value;
+      first = false;
+    }
+  }
+  c.rope_theta = static_cast<float>(theta);
+  c.local_rope = true;
+  c.rope_local_theta = static_cast<float>(local_theta);
+  c.global_partial_rotary = 0.0f;
+  c.sliding_window = static_cast<int>(cfg.int_or("sliding_window", 2048));
   c.eos_token_ids = eos_ids(raw, cfg);
   return c;
 }
@@ -818,7 +916,7 @@ DecoderConfig qwen2_5_vl_config(const Json& raw) {
 
 bool is_supported_decoder(const Json& raw) {
   return is_gemma3(raw) || is_gemma4(raw) || is_llama_family(raw) || is_deepseek(raw) || is_qwen3_5(raw) ||
-         is_qwen3_vl(raw) || is_qwen2_5_vl(raw);
+         is_qwen3_vl(raw) || is_qwen2_5_vl(raw) || is_muse_glimmer(raw);
 }
 
 DecoderConfig DecoderConfig::from_json(const Json& raw) {
@@ -826,13 +924,14 @@ DecoderConfig DecoderConfig::from_json(const Json& raw) {
            "unsupported architecture '" + model_type(raw) +
                "'; this build supports gemma3, gemma4, llama, mistral, qwen2, qwen3, qwen3_moe, gpt_oss, glm4_moe, "
                "glm4_moe_lite, deepseek_v2, deepseek_v3, qwen3_5, qwen3_5_moe, qwen3_next, qwen3_vl, qwen3_vl_moe, "
-               "qwen2_5_vl and qwen2_vl text models");
+               "qwen2_5_vl, qwen2_vl and muse_glimmer text models");
   DecoderConfig c = is_gemma3(raw)       ? gemma3_config(raw)
                     : is_gemma4(raw)     ? gemma4_config(raw)
                     : is_deepseek(raw)   ? deepseek_config(raw)
                     : is_qwen3_5(raw)    ? qwen3_5_config(raw)
                     : is_qwen3_vl(raw)   ? qwen3_vl_config(raw)
                     : is_qwen2_5_vl(raw) ? qwen2_5_vl_config(raw)
+                    : is_muse_glimmer(raw) ? muse_glimmer_config(raw)
                                          : llama_family_config(raw);
   LK_CHECK(static_cast<int>(c.layer_is_sliding.size()) == c.num_layers,
            c.architecture + ": layer_types length mismatch");
@@ -1159,9 +1258,14 @@ DecoderLayer bind_layer(const DecoderWeights& w, const std::string& base, int i,
     bind_linear_attention(w, layer, base, mlx_layout);
   } else if (c.mla()) {
     bind_latent_attention(w, layer, base);
-  } else if (c.qk_norm) {
+  } else if (c.qk_norm && c.qk_norm_scale) {
     layer.q_norm = vec(base + ".self_attn.q_norm", dim);
     if (own_kv) layer.k_norm = vec(base + ".self_attn.k_norm", dim);
+  } else if (c.qk_norm) {
+    // Scale-free: weights that make (norm_offset + weight) one.
+    LK_CHECK(!ck.contains(p + base + ".self_attn.q_norm.weight"), base + ": unexpected q_norm for " + arch);
+    layer.q_norm.assign(static_cast<size_t>(dim), 1.0f - c.norm_offset);
+    if (own_kv) layer.k_norm.assign(static_cast<size_t>(dim), 1.0f - c.norm_offset);
   }
   if (c.qkv_bias) {
     layer.q_bias = bias(base + ".self_attn.q_proj", q_out);
@@ -1173,6 +1277,7 @@ DecoderLayer bind_layer(const DecoderWeights& w, const std::string& base, int i,
   for (const char* module : {".self_attn.q_proj", ".self_attn.k_proj", ".self_attn.v_proj"}) {
     LK_CHECK(c.qkv_bias || !ck.contains(p + base + module + ".bias"), base + module + ": unexpected bias for " + arch);
   }
+  LK_CHECK(!ck.contains(p + base + ".self_attn.gate_proj.bias"), base + ".self_attn.gate_proj: unexpected bias for " + arch);
   LK_CHECK(c.o_bias || !ck.contains(p + base + ".self_attn.o_proj.bias"),
            base + ".self_attn.o_proj: unexpected bias for " + arch);
   for (const char* module : {".mlp.gate_proj", ".mlp.up_proj", ".mlp.down_proj"}) {
@@ -1193,8 +1298,12 @@ DecoderLayer bind_layer(const DecoderWeights& w, const std::string& base, int i,
                base + ": k/v shape");
     }
     layer.o_proj = linear(base + ".self_attn.o_proj");
-    // With an output gate, each head's query rows are followed by its gate's.
-    const int64_t q_rows = c.attn_output_gate ? 2 * q_out : q_out;
+    // With an output gate in q_proj, each head's query rows are followed by its gate's.
+    const int64_t q_rows = c.attn_output_gate && !c.attn_gate_proj ? 2 * q_out : q_out;
+    if (c.attn_gate_proj) {
+      layer.attn_gate = linear(base + ".self_attn.gate_proj");
+      LK_CHECK(layer.attn_gate.rows == q_out && layer.attn_gate.cols == c.hidden_size, base + ": gate_proj shape");
+    }
     LK_CHECK(layer.q_proj.rows == q_rows && layer.q_proj.cols == c.hidden_size, base + ": q_proj shape");
     LK_CHECK(layer.o_proj.rows == c.hidden_size && layer.o_proj.cols == q_out, base + ": o_proj shape");
   }
@@ -1371,6 +1480,12 @@ std::shared_ptr<DecoderWeights> DecoderWeights::load(const std::string& director
     w->tied_lm_head = true;
   }
   w->final_norm = vec(stem + "norm", c.hidden_size);
+  if (c.plain_final_norm || c.logit_multiplier != 1.0f) {
+    // Read in the block norms' convention, with the logit multiplier folded
+    // in: (norm_offset + w') = (offset + w) * multiplier, w' below.
+    const float offset = c.plain_final_norm ? 0.0f : c.norm_offset;
+    for (float& value : w->final_norm) value = (offset + value) * c.logit_multiplier - c.norm_offset;
+  }
   if (c.per_layer_input > 0) {
     const int64_t width = static_cast<int64_t>(c.num_layers) * c.per_layer_input;
     const Json& cfg = text_config(w->raw_config);
@@ -1395,7 +1510,7 @@ size_t DecoderWeights::matrix_bytes() const {
                  embed_per_layer.weight_bytes() + per_layer_model_proj.weight_bytes();
   for (const auto& l : layers) {
     total += l.q_proj.weight_bytes() + l.k_proj.weight_bytes() + l.v_proj.weight_bytes() +
-             l.o_proj.weight_bytes() + l.gate_proj.weight_bytes() + l.up_proj.weight_bytes() +
+             l.o_proj.weight_bytes() + l.attn_gate.weight_bytes() + l.gate_proj.weight_bytes() + l.up_proj.weight_bytes() +
              l.down_proj.weight_bytes() + l.per_layer_gate.weight_bytes() + l.per_layer_proj.weight_bytes() +
              l.router.weight_bytes() + l.shared_gate.weight_bytes() + l.shared_up.weight_bytes() +
              l.shared_down.weight_bytes() + l.q_a_proj.weight_bytes() + l.kv_a_proj.weight_bytes() +
@@ -1418,7 +1533,7 @@ bool DecoderWeights::dense_mxfp4() const {
     return true;
   }
   for (const auto& l : layers) {
-    for (const Linear* m : {&l.q_proj, &l.k_proj, &l.v_proj, &l.o_proj, &l.gate_proj, &l.up_proj, &l.down_proj,
+    for (const Linear* m : {&l.q_proj, &l.k_proj, &l.v_proj, &l.o_proj, &l.attn_gate, &l.gate_proj, &l.up_proj, &l.down_proj,
                             &l.per_layer_gate, &l.per_layer_proj, &l.router, &l.shared_gate, &l.shared_up,
                             &l.shared_down, &l.q_a_proj, &l.kv_a_proj, &l.kv_b_proj, &l.shared_expert_gate,
                             &l.in_proj_qkv, &l.in_proj_z, &l.in_proj_b, &l.in_proj_a, &l.in_proj_qkvz,
@@ -1843,10 +1958,11 @@ class DecoderCpu final : public Model {
   // x += sublayer output r, normalized first when the family uses sandwich norms.
   void add_residual(int n, const std::vector<float>& post_norm) {
     const int64_t hidden = c_.hidden_size;
+    const float eps = c_.post_norm_eps > 0.0f ? c_.post_norm_eps : c_.rms_norm_eps;
     for (int t = 0; t < n; ++t) {
       float* xr = x_.data() + t * hidden;
       float* rr = r_.data() + t * hidden;
-      if (c_.sandwich_norms) norm(rr, post_norm, hidden, rr);
+      if (c_.sandwich_norms) rms_norm(rr, post_norm.data(), hidden, eps, c_.norm_offset, rr);
       for (int64_t i = 0; i < hidden; ++i) xr[i] += rr[i];
     }
   }
@@ -1915,6 +2031,7 @@ class DecoderCpu final : public Model {
         if (c_.embed_scale != 1.0f) {
           for (int64_t i = 0; i < hidden; ++i) row[i] *= c_.embed_scale;
         }
+        if (c_.embed_norm) rms_norm(row, nullptr, hidden, c_.rms_norm_eps, 0.0f, row);
       }
     }
     if (c_.per_layer_input > 0) per_layer_inputs(tokens, n);
@@ -1977,6 +2094,7 @@ class DecoderCpu final : public Model {
     if (c_.embed_scale != 1.0f) {
       for (int64_t i = 0; i < hidden; ++i) out[i] *= c_.embed_scale;
     }
+    if (c_.embed_norm) rms_norm(out, nullptr, hidden, c_.rms_norm_eps, 0.0f, out);
     norm(out, M.embedding_norm, hidden, out);
     norm(before, M.hidden_norm, hidden, out + hidden);
   }
@@ -2052,9 +2170,14 @@ class DecoderCpu final : public Model {
         Section section(profiler_, "qkv",
                         profiling ? traffic::linear(L.q_proj, n) +
                                         (own_kv ? traffic::linear(L.k_proj, n) : 0.0) +
-                                        (own_kv && !c_.k_eq_v(l) ? traffic::linear(L.v_proj, n) : 0.0)
+                                        (own_kv && !c_.k_eq_v(l) ? traffic::linear(L.v_proj, n) : 0.0) +
+                                        (c_.attn_gate_proj ? traffic::linear(L.attn_gate, n) : 0.0)
                                   : 0.0);
-        if (c_.attn_output_gate) {
+        if (c_.attn_gate_proj) {
+          matmul(L.q_proj, h_.data(), n, q_.data(), pool_);
+          out_gate_.resize(sn * static_cast<size_t>(H) * D);
+          matmul(L.attn_gate, h_.data(), n, out_gate_.data(), pool_);
+        } else if (c_.attn_output_gate) {
           // Each head's query, then its output gate.
           const size_t width = static_cast<size_t>(H) * D;
           q_gate_.resize(sn * 2 * width);

@@ -1,4 +1,5 @@
 // Dependency-free unit tests for the Lokahi engine core.
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1103,6 +1104,114 @@ static const char* kQwen3VL2BConfig = R"({
   "vision_end_token_id": 151653, "vision_start_token_id": 151652
 })";
 
+// mlx-community/Muse-Glimmer-30B-4bit's config.json, as published (Meta's
+// Transformers 5.15 layout; whitespace compacted).
+static const char* kMuseGlimmer30BConfig = R"({
+  "architectures": ["MuseGlimmerForConditionalGeneration"], "do_sample": false, "dtype": "bfloat16",
+  "eos_token_id": [200001, 200008],
+  "generation_config": {"bos_token_id": 200000, "eos_token_id": [200001, 200008], "pad_token_id": 200018,
+                        "max_length": 131072, "do_sample": false},
+  "image_token_id": 200092, "model_type": "muse_glimmer", "out_hidden_size": 6144, "projector_hidden_act": "gelu",
+  "projector_hidden_size": 4096,
+  "quantization": {"group_size": 64, "bits": 4, "mode": "affine"},
+  "quantization_config": {"group_size": 64, "bits": 4, "mode": "affine"},
+  "text_config": {
+    "attention_bias": false, "attention_dropout": 0.0, "bos_token_id": 200000, "eos_token_id": 200001,
+    "final_logit_softcapping": 20.0, "head_dim": 128, "hidden_activation": "silu", "hidden_size": 6656,
+    "initializer_range": 0.02, "intermediate_size": 19968,
+    "layer_rope_theta": [
+      500000.0, 500000.0, 500000.0, 0,
+      500000.0, 500000.0, 500000.0, 0,
+      500000.0, 500000.0, 500000.0, 0,
+      500000.0, 500000.0, 500000.0, 0,
+      500000.0, 500000.0, 500000.0, 0,
+      500000.0, 500000.0, 500000.0, 0,
+      500000.0, 500000.0, 500000.0, 0,
+      500000.0, 500000.0, 500000.0, 0,
+      500000.0, 500000.0, 500000.0, 0,
+      500000.0, 500000.0, 500000.0, 0,
+      500000.0, 500000.0, 500000.0, 0,
+      500000.0, 500000.0, 500000.0, 0,
+      500000.0, 500000.0, 500000.0, 0
+    ],
+    "layer_types": [
+      "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+      "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+      "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+      "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+      "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+      "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+      "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+      "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+      "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+      "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+      "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+      "sliding_attention", "sliding_attention", "sliding_attention", "full_attention",
+      "sliding_attention", "sliding_attention", "sliding_attention", "full_attention"
+    ],
+    "max_position_embeddings": 131072, "model_type": "muse_glimmer_text", "num_attention_heads": 32,
+    "num_hidden_layers": 52, "num_key_value_heads": 2, "output_multiplier": 0.19611613513818404,
+    "pad_token_id": null, "post_norm_eps": 1e-08, "qk_scale_factor": 3.87, "rms_norm_eps": 1e-05,
+    "rope_parameters": {"rope_theta": 500000.0, "rope_type": "default"}, "sliding_window": 2048,
+    "tie_word_embeddings": false, "use_cache": true, "vocab_size": 202048
+  },
+  "transformers_version": "5.15.0.dev0", "video_token_id": 200091,
+  "vision_config": {
+    "hidden_act": "gelu", "hidden_size": 1536, "intermediate_size": 8960, "layer_norm_eps": 1e-05,
+    "layer_types": [
+      "window_attention", "window_attention", "window_attention", "full_attention",
+      "window_attention", "window_attention", "window_attention", "full_attention",
+      "window_attention", "window_attention", "window_attention", "full_attention",
+      "window_attention", "window_attention", "window_attention", "full_attention",
+      "window_attention", "window_attention", "window_attention", "full_attention",
+      "window_attention", "window_attention", "window_attention", "full_attention",
+      "window_attention", "window_attention", "window_attention", "full_attention",
+      "window_attention", "window_attention", "window_attention", "full_attention",
+      "window_attention", "window_attention", "window_attention", "full_attention",
+      "window_attention", "window_attention", "window_attention", "full_attention",
+      "window_attention", "window_attention", "window_attention", "full_attention",
+      "window_attention", "window_attention", "window_attention", "full_attention",
+      "window_attention", "full_attention"
+    ],
+    "max_position_embeddings": 1024, "merge_size": 2, "model_type": "muse_glimmer_vision", "num_attention_heads": 16,
+    "num_hidden_layers": 50, "patch_size": 14, "patch_temporal": 2, "pos_emb_height": 32, "pos_emb_width": 32,
+    "rope_parameters": {"rope_theta": 10000.0, "rope_type": "default"}
+  }
+})";
+
+void test_muse_glimmer_config() {
+  const DecoderConfig c = DecoderConfig::from_json(Json::parse(kMuseGlimmer30BConfig));
+  EXPECT(c.architecture == "muse_glimmer" && c.num_layers == 52 && c.hidden_size == 6656 && c.vocab_size == 202048);
+  EXPECT(c.num_heads == 32 && c.num_kv_heads == 2 && c.head_dim == 128 && c.intermediate_size == 19968);
+  EXPECT(c.activation == Activation::Silu && c.rms_norm_eps == 1e-5f && c.post_norm_eps == 1e-8f);
+  // Centered block norms, scale-free Q/K norms, the gate's own projection,
+  // the embedding norm and a plain final norm with the logit multiplier.
+  EXPECT(c.norm_offset == 1.0f && c.sandwich_norms && c.qk_norm && !c.qk_norm_scale && !c.v_norm);
+  EXPECT(c.attn_output_gate && c.attn_gate_proj && c.embed_norm && c.embed_scale == 1.0f);
+  EXPECT(c.plain_final_norm && c.logit_multiplier == 0.19611613513818404f && c.final_logit_softcapping == 20.0f);
+  // q times qk_scale_factor, folded into the attention scale head_dim^-0.5.
+  EXPECT(std::fabs(c.attn_scale - 3.87f / std::sqrt(128.0f)) < 1e-7f);
+  bool pattern = c.sliding_window == 2048;
+  for (int i = 0; i < 52; ++i) pattern = pattern && c.layer_is_sliding[static_cast<size_t>(i)] == (i % 4 != 3);
+  EXPECT(pattern);
+  // RoPE at theta 500000 on the sliding layers; none on the full ones.
+  const std::vector<double> local = c.rope_inv_freq(true), global = c.rope_inv_freq(false);
+  EXPECT(local.size() == 64 && local[0] == 1.0 && std::fabs(local[1] - std::pow(500000.0, -2.0 / 128)) < 1e-15);
+  EXPECT(global.size() == 64 && std::all_of(global.begin(), global.end(), [](double f) { return f == 0.0; }));
+  EXPECT(c.eos_token_ids == std::vector<int32_t>({200001, 200008}));
+  // A full layer with RoPE, or a sliding one without, fails closed.
+  std::string rotary_full = kMuseGlimmer30BConfig, plain_sliding = kMuseGlimmer30BConfig;
+  const std::string row = "500000.0, 500000.0, 500000.0, 0,";
+  rotary_full.replace(rotary_full.find(row), row.size(), "500000.0, 500000.0, 500000.0, 500000.0,");
+  plain_sliding.replace(plain_sliding.find(row), row.size(), "0, 500000.0, 500000.0, 0,");
+  EXPECT(throws([&] { DecoderConfig::from_json(Json::parse(rotary_full)); }));
+  EXPECT(throws([&] { DecoderConfig::from_json(Json::parse(plain_sliding)); }));
+  // MLX-LM's flattened config (text fields at the top level) reads the same.
+  Json flat = Json::parse(kMuseGlimmer30BConfig).at("text_config");
+  const DecoderConfig f = DecoderConfig::from_json(flat);
+  EXPECT(f.architecture == "muse_glimmer" && f.num_layers == 52 && f.attn_gate_proj && f.eos_token_ids == std::vector<int32_t>({200001}));
+}
+
 void test_qwen3_vl_config() {
   // Sections [temporal 24, rows 20, columns 20] over 64 frequencies: rows at
   // 1, 4, ..., 58, columns at 2, 5, ..., 59, the rest temporal.
@@ -1463,6 +1572,7 @@ int main() {
   test_glm_config();
   test_deepseek_configs();
   test_qwen3_5_configs();
+  test_muse_glimmer_config();
   test_kv_cache_option();
   test_prompt_lookup_drafter();
   test_mrope_injection_plan();
