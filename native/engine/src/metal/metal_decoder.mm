@@ -194,6 +194,8 @@ struct QmvParams { int rows; int cols; };
 struct GluParams { int rows; int cols; int silu; };
 struct QkvParams { int q_rows; int kv_rows; int cols; };
 struct QmmParams { int n; int rows; int cols; };
+struct QmvNParams { int rows; int cols; int n; };
+constexpr int kQmvNMax = 8;  // QMV_N_MAX in decoder_kernels.metal
 struct ElementwiseParams { int count; };
 struct GluMulParams { int count; int silu; };
 struct RopeParams {
@@ -1089,6 +1091,15 @@ class DecoderMetal final : public Model {
                   id<MTLBuffer> y) {
     if (n == 1) {
       encode_qmv(enc, l, x, 0, y, 0);
+      return;
+    }
+    if (n <= kQmvNMax && !l.mxfp4) {  // a short pass: read the weights once for all n tokens
+      [enc setComputePipelineState:quant_pipeline("qmv_n", l)];
+      bind_weights(enc, l, 0);
+      bind(enc, x, 0, 3);
+      bind(enc, y, 0, 4);
+      bytes(enc, QmvNParams{l.rows, l.cols, n}, 5);
+      [enc dispatchThreadgroups:MTLSizeMake(qmv_groups(l.rows), 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
       return;
     }
     [enc setComputePipelineState:quant_pipeline("qmm", l)];
