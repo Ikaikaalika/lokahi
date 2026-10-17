@@ -1096,8 +1096,9 @@ class DecoderMetal final : public Model {
     bind(enc, x, 0, 3);
     bind(enc, y, 0, 4);
     bytes(enc, QmmParams{n, l.rows, l.cols}, 5);
-    [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((l.rows + 31) / 32),
-                                          static_cast<NSUInteger>((n + 31) / 32), 1)
+    // 64x64 tiles, as QMM_TILE_M and QMM_TILE_N in decoder_kernels.metal.
+    [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((l.rows + 63) / 64),
+                                          static_cast<NSUInteger>((n + 63) / 64), 1)
         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
   }
 
