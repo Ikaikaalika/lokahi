@@ -304,6 +304,12 @@ kernel void residual_norm_rows(device float* x_rows [[buffer(0)]],
 //
 // Each simdgroup produces QMV_ROWS consecutive output rows; each lane covers
 // 16 input values per iteration, so a simdgroup reads 512 inputs per step.
+// 4-bit affine weights (most checkpoints) take a faster layout instead: each
+// half of the simdgroup owns two of the rows and strides them 16 codes per
+// lane, so narrow matrices (Gemma 3 1B's 1152 columns, 2.25 steps of 512)
+// keep every lane busy, and inputs are pre-divided by 16^j as in MLX so a
+// code needs a mask rather than a shift. Callers still reduce each row with
+// simd_sum: the other half's lanes contribute zero to it.
 // Requires cols % 16 == 0 and QGROUP % 16 == 0.
 // ---------------------------------------------------------------------------
 
@@ -315,9 +321,53 @@ struct QmvParams {
   int cols;
 };
 
+// The 4-bit layout above: this lane's two rows, both returned in a[0..1].
+inline void qmv_accumulate4(const device uint* w, const device ushort* scales, const device ushort* biases,
+                            const device float* x, int row, int rows, int cols, int sub, thread float* a) {
+  const int words_per_row = cols / 8;
+  const int groups_per_row = cols / QGROUP;
+  const int r0 = min(row, rows - 1), r1 = min(row + 1, rows - 1);  // a clamped row's sum is discarded
+  for (int k0 = sub * 16; k0 < cols; k0 += 16 * 16) {
+    float xv[16];
+    float xsum = 0.0f;
+    const device float4* x4 = reinterpret_cast<const device float4*>(x + k0);
+    for (int j = 0; j < 4; ++j) {
+      const float4 v = x4[j];
+      xsum += v.x + v.y + v.z + v.w;
+      xv[4 * j] = v.x;
+      xv[4 * j + 1] = v.y * (1.0f / 16.0f);
+      xv[4 * j + 2] = v.z * (1.0f / 256.0f);
+      xv[4 * j + 3] = v.w * (1.0f / 4096.0f);
+    }
+    const int g = k0 / QGROUP;
+    for (int rr = 0; rr < 2; ++rr) {
+      const int r = rr == 0 ? r0 : r1;
+      const device ushort* wr = reinterpret_cast<const device ushort*>(w + r * words_per_row + k0 / 8);
+      float dot = 0.0f;
+      for (int h = 0; h < 4; ++h) {
+        const uint ww = wr[h];
+        dot += xv[4 * h] * float(ww & 0x000Fu) + xv[4 * h + 1] * float(ww & 0x00F0u) +
+               xv[4 * h + 2] * float(ww & 0x0F00u) + xv[4 * h + 3] * float(ww & 0xF000u);
+      }
+      const int gi = r * groups_per_row + g;
+      a[rr] += scale_at(scales, gi) * dot + scale_at(biases, gi) * xsum;
+    }
+  }
+}
+
 inline void qmv_accumulate(const device uint* w, const device ushort* scales,
                            const device ushort* biases, const device float* x, int row0,
                            int rows, int cols, uint lane, thread float* acc) {
+  if (QBITS == 4 && !QMXFP4) {
+    const int half_ = int(lane) / 16;
+    float a[2] = {0.0f, 0.0f};
+    qmv_accumulate4(w, scales, biases, x, row0 + 2 * half_, rows, cols, int(lane) % 16, a);
+    acc[0] += half_ == 0 ? a[0] : 0.0f;
+    acc[1] += half_ == 0 ? a[1] : 0.0f;
+    acc[2] += half_ == 1 ? a[0] : 0.0f;
+    acc[3] += half_ == 1 ? a[1] : 0.0f;
+    return;
+  }
   const int words_per_row = cols * QBITS / 32;
   const int groups_per_row = cols / QGROUP;
   for (int k0 = int(lane) * 16; k0 < cols; k0 += 32 * 16) {
