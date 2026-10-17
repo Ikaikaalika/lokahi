@@ -37,10 +37,12 @@ so jobs cannot read your personal files or keychain.
 xcode-select --install                      # or a full Xcode
 xcodebuild -downloadComponent MetalToolchain # Xcode 26+: only needed for xcrun metal
 brew install cmake                          # or the cmake.org installer
-/usr/bin/python3 -m pip install --user numpy pytest mlx==0.31.1 mlx-lm==0.31.2
+/usr/bin/python3 -m pip install --user numpy pytest mlx==0.32.4 mlx-lm==0.32.2
 ```
 
-The pinned MLX versions match the recorded MLX-LM ladder baseline. If you use a
+The pinned MLX versions match the ladder's MLX-LM baseline
+(`benchmarks/targets/commoncompute_m1_model_ladder_v1.json`), which tracks the
+current MLX release: the control Lōkahi has to beat. Bump both together. If you use a
 different interpreter, set the repository variable `LOKAHI_PYTHON` to its path.
 
 ## 3. Register the runner
