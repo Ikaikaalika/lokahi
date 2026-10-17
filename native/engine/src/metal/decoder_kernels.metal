@@ -254,7 +254,8 @@ kernel void mtp_concat_norms(const device float* e [[buffer(0)]],
 // has_next, h = norm(x) * (offset + w_next).
 struct ResidualNormParams {
   int cols;
-  float eps;
+  float eps;       // the next norm's
+  float post_eps;  // the post-norm's
   float offset;
   int post_norm;
   int has_next;
@@ -280,7 +281,7 @@ kernel void residual_norm_rows(device float* x_rows [[buffer(0)]],
   if (p.post_norm != 0) {  // Uniform across the threadgroup.
     float ss = 0.0f;
     for (int i = int(tid); i < p.cols; i += int(tpg)) ss += r[i] * r[i];
-    const float inv_r = precise::rsqrt(threadgroup_sum(ss, scratch, sg, lane, simdgroups) / float(p.cols) + p.eps);
+    const float inv_r = precise::rsqrt(threadgroup_sum(ss, scratch, sg, lane, simdgroups) / float(p.cols) + p.post_eps);
     for (int i = int(tid); i < p.cols; i += int(tpg)) {
       const float v = (x[i] + r[i] * inv_r * (p.offset + w_post[i])) * p.scale;
       x[i] = v;

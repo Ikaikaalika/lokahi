@@ -88,6 +88,7 @@ struct GpuDense {
 
 struct GpuLayer {
   GpuLinear q, k, v, o, gate, up, down;
+  GpuLinear attn_gate;                       // the output gate's own projection (Muse Glimmer)
   GpuLinear router;                          // mixture-of-experts layers
   GpuDense dense_router;                     // when the router is not quantized
   bool router_dense = false;
@@ -189,7 +190,7 @@ class WeightArena {
 // Parameter blocks; layouts match the structs in decoder_kernels.metal.
 struct EmbedParams { int cols; int n; float scale; };
 struct NormParams { int cols; float eps; float offset; };
-struct ResidualNormParams { int cols; float eps; float offset; int post_norm; int has_next; float scale; };
+struct ResidualNormParams { int cols; float eps; float post_eps; float offset; int post_norm; int has_next; float scale; };
 struct QmvParams { int rows; int cols; };
 struct GluParams { int rows; int cols; int silu; };
 struct QkvParams { int q_rows; int kv_rows; int cols; };
@@ -702,6 +703,12 @@ class DecoderMetal final : public Model {
       lm_head_ = add_linear(arena, w_->lm_head, linear_fix, &lm_head_);
     }
     add_vector(w_->final_norm, &final_norm_);
+    // A scale-free norm is one with weights making (norm_offset + weight) one.
+    // The arena reads its sources at upload, so the weights live in a member.
+    if (c_.embed_norm) {
+      unit_norm_data_.assign(static_cast<size_t>(c_.hidden_size), 1.0f - c_.norm_offset);
+      add_vector(unit_norm_data_, &unit_norm_);
+    }
     if (c_.per_layer_input > 0) {
       embed_per_layer_ = add_linear(arena, w_->embed_per_layer, linear_fix, &embed_per_layer_);
       per_layer_model_proj_ = add_linear(arena, w_->per_layer_model_proj, linear_fix, &per_layer_model_proj_);
@@ -763,6 +770,7 @@ class DecoderMetal final : public Model {
         if (G.own_kv && !c_.mla()) G.k = add_linear(arena, L.k_proj, linear_fix, &G.k);
         if (G.own_kv && !G.k_eq_v && !c_.mla()) G.v = add_linear(arena, L.v_proj, linear_fix, &G.v);
         G.o = add_linear(arena, L.o_proj, linear_fix, &G.o);
+        if (c_.attn_gate_proj) G.attn_gate = add_linear(arena, L.attn_gate, linear_fix, &G.attn_gate);
       }
       add_optional(L.conv, &G.conv_taps);
       add_optional(L.decay_rate, &G.decay_rate);
@@ -1138,7 +1146,8 @@ class DecoderMetal final : public Model {
     bind(enc, w_post, 2);
     bind(enc, w_next ? *w_next : w_post, 3);
     bind(enc, h_, 0, 4);
-    bytes(enc, ResidualNormParams{c_.hidden_size, c_.rms_norm_eps, c_.norm_offset, c_.sandwich_norms ? 1 : 0,
+    const float post_eps = c_.post_norm_eps > 0.0f ? c_.post_norm_eps : c_.rms_norm_eps;
+    bytes(enc, ResidualNormParams{c_.hidden_size, c_.rms_norm_eps, post_eps, c_.norm_offset, c_.sandwich_norms ? 1 : 0,
                                   w_next ? 1 : 0, scale},
           5);
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(n), 1, 1)
@@ -1155,14 +1164,20 @@ class DecoderMetal final : public Model {
     bind(enc, weight, 2);
     bind(enc, weight, 3);
     bind(enc, h_, 0, 4);  // unread without a next norm
-    bytes(enc, ResidualNormParams{c_.hidden_size, c_.rms_norm_eps, c_.norm_offset, 1, 0, 1.0f}, 5);
+    bytes(enc, ResidualNormParams{c_.hidden_size, c_.rms_norm_eps, c_.rms_norm_eps, c_.norm_offset, 1, 0, 1.0f}, 5);
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(n), 1, 1)
         threadsPerThreadgroup:MTLSizeMake(norm_threads(pso), 1, 1)];
   }
 
   // q_proj into q_ (or, with an output gate, into q_gate_ and then split into
-  // q_ and out_gate_), and k and v into kt_ and vt_.
+  // q_ and out_gate_; or the gate's own projection into out_gate_), and k and
+  // v into kt_ and vt_.
   void encode_qkv(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n) {
+    if (c_.attn_gate_proj) {
+      encode_qkv_into(enc, G, n, q_);
+      encode_qmm(enc, G.attn_gate, h_, n, out_gate_);
+      return;
+    }
     encode_qkv_into(enc, G, n, c_.attn_output_gate ? q_gate_ : q_);
     if (!c_.attn_output_gate) return;
     [enc setComputePipelineState:pipeline("split_query_gate")];
@@ -1321,6 +1336,7 @@ class DecoderMetal final : public Model {
     bytes(enc, EmbedParams{c_.hidden_size, rows, c_.embed_scale}, 5);
     [enc dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(c_.hidden_size), static_cast<NSUInteger>(rows), 1)
         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    if (c_.embed_norm) encode_rms_norm(enc, mtp_e_, unit_norm_, mtp_e_, rows);
     id<MTLComputePipelineState> pso = pipeline("mtp_concat_norms");
     [enc setComputePipelineState:pso];
     bind(enc, mtp_e_, 0, 0);
@@ -1867,7 +1883,8 @@ class DecoderMetal final : public Model {
       encode_qkv(enc, G, n);
       section(enc, "qkv",
               profiling ? traffic::linear(L.q_proj, n) + (G.own_kv ? traffic::linear(L.k_proj, n) : 0.0) +
-                              (G.own_kv && !G.k_eq_v ? traffic::linear(L.v_proj, n) : 0.0)
+                              (G.own_kv && !G.k_eq_v ? traffic::linear(L.v_proj, n) : 0.0) +
+                              (c_.attn_gate_proj ? traffic::linear(L.attn_gate, n) : 0.0)
                         : 0.0);
       encode_rope(enc, G, n, start);
       // q in and out, k and v in, and k and v written to the cache.
@@ -1968,6 +1985,7 @@ class DecoderMetal final : public Model {
     bytes(enc, EmbedParams{c_.hidden_size, n, c_.embed_scale}, 5);
     [enc dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(c_.hidden_size), static_cast<NSUInteger>(n), 1)
         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    if (c_.embed_norm) encode_rms_norm(enc, x_, unit_norm_, x_, n);
     if (!plan_.empty()) {  // injected rows (image features) replace the scaled embeddings
       [enc setComputePipelineState:pipeline("replace_rows")];
       bind(enc, inject_rows_, 0, 0);
@@ -2112,8 +2130,9 @@ class DecoderMetal final : public Model {
   GpuLinear embed_, lm_head_, embed_per_layer_, per_layer_model_proj_;
   bool tied_ = false;
   BufRef final_norm_, placeholder_, inv_freq_local_buf_, inv_freq_global_buf_, per_layer_proj_norm_;
+  BufRef unit_norm_;  // weights for a scale-free hidden_size norm, with embed_norm
   int max_head_dim_ = 0, max_kv_width_ = 0, max_inter_ = 0;  // the largest over layers
-  std::vector<float> inv_freq_local_, inv_freq_global_, placeholder_data_;
+  std::vector<float> inv_freq_local_, inv_freq_global_, placeholder_data_, unit_norm_data_;
   std::vector<GpuLayer> layers_;
   size_t device_weight_bytes_ = 0;
 

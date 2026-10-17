@@ -3,8 +3,8 @@
 These tests pin the oracles' semantics to an independent implementation:
 ``mx.dequantize`` for the packed affine layout, and MLX-LM's ``gemma3_text``,
 ``gemma4``, ``llama``, ``qwen2``, ``qwen3``, ``qwen3_moe``, ``gpt_oss``, ``glm4_moe``,
-``deepseek_v2``, ``deepseek_v3``, ``glm4_moe_lite``, ``qwen3_5``, ``qwen3_5_moe`` and ``qwen3_next``
-models for the full decoders. They need
+``deepseek_v2``, ``deepseek_v3``, ``glm4_moe_lite``, ``qwen3_5``, ``qwen3_5_moe``, ``qwen3_next`` and
+``muse_glimmer`` models for the full decoders. They need
 ``mlx`` and ``mlx_lm``: hosted macOS CI runs them on its virtual GPU, and
 ``mlx[cpu]`` runs them on Linux.
 """
@@ -21,16 +21,25 @@ from lokahi.fixtures import (
     TinyDenseSpec,
     TinyGemma3Spec,
     TinyGemma4Spec,
+    TinyMuseGlimmerSpec,
     TinyQwen35Spec,
     write_tiny_deepseek,
     write_tiny_dense,
     write_tiny_gemma3,
     write_tiny_gemma4,
+    write_tiny_muse_glimmer,
     write_tiny_qwen35,
 )
 from lokahi.formats import QuantSpec, dequantize_affine, pack_affine
 from lokahi.fixtures.deepseek_tiny import DEEPSEEK_YARN
-from lokahi.oracles import DeepseekReference, Gemma3Reference, Gemma4Reference, LlamaFamilyReference, Qwen35Reference
+from lokahi.oracles import (
+    DeepseekReference,
+    Gemma3Reference,
+    Gemma4Reference,
+    LlamaFamilyReference,
+    MuseGlimmerReference,
+    Qwen35Reference,
+)
 
 pytestmark = pytest.mark.skipif(
     importlib.util.find_spec("mlx") is None or importlib.util.find_spec("mlx_lm") is None,
@@ -261,6 +270,25 @@ def test_oracle_matches_mlx_lm_qwen35(tmp_path, spec):
                    for name, value in mx.load(path).items()}
         mx.save_safetensors(path, weights, metadata={"format": "pt"})
     _assert_mlx_lm_matches(directory, Qwen35Reference.load(directory).logits(TOKENS))
+
+
+@pytest.mark.parametrize(
+    "spec",
+    [
+        # mlx-community's layout (text_config, language_model.*, vision
+        # tensors MLX-LM's sanitize drops). Its per-module quantization keys
+        # would be read before sanitize renames the modules, so no overrides.
+        TinyMuseGlimmerSpec(eight_bit_mlp_layers=()),
+        TinyMuseGlimmerSpec(prefix="", flat_config=True, vision_tower=False, seed=2),
+        TinyMuseGlimmerSpec(hidden_size=256, num_key_value_heads=1, head_dim=128, num_hidden_layers=8,
+                            sliding_window=6, explicit_layer_rope_theta=False, group_size=64, prefix="",
+                            eight_bit_mlp_layers=(), vision_tower=False, seed=1),
+    ],
+    ids=["mlx-community-layout", "flat-mixed-bits", "hd128-derived-theta"],
+)
+def test_oracle_matches_mlx_lm_muse_glimmer(tmp_path, spec):
+    directory = write_tiny_muse_glimmer(tmp_path / "model", spec)
+    _assert_mlx_lm_matches(directory, MuseGlimmerReference.load(directory).logits(TOKENS))
 
 
 def _assert_mlx_lm_matches(directory, expected):

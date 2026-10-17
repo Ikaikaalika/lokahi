@@ -20,11 +20,13 @@ from lokahi.fixtures import (
     TinyDenseSpec,
     TinyGemma3Spec,
     TinyGemma4Spec,
+    TinyMuseGlimmerSpec,
     TinyQwen35Spec,
     write_tiny_deepseek,
     write_tiny_dense,
     write_tiny_gemma3,
     write_tiny_gemma4,
+    write_tiny_muse_glimmer,
     write_tiny_qwen35,
 )
 from lokahi.fixtures.deepseek_tiny import DEEPSEEK_YARN
@@ -34,6 +36,7 @@ from lokahi.oracles import (
     Gemma3Reference,
     Gemma4Reference,
     LlamaFamilyReference,
+    MuseGlimmerReference,
     Qwen35Reference,
 )
 from lokahi.oracles.gemma3 import Gemma3Config
@@ -255,8 +258,29 @@ QWEN35_VARIANTS = {
     "qwen3.5-mlx-6bit": TinyQwen35Spec(bits=6, group_size=64, seed=0),
     "qwen3.5-moe-mlx-3bit": TinyQwen35Spec(model_type="qwen3_5_moe", bits=3, seed=0),
 }
+MUSE_GLIMMER_VARIANTS = {
+    # mlx-community's layout: text_config, language_model.*, vision tensors.
+    "muse-glimmer-mlx": TinyMuseGlimmerSpec(),
+    # MLX-LM's flattened config and model.* names, thetas from layer_types,
+    # 128-wide heads over one KV head, two windows of full layers.
+    "muse-glimmer-flat-hd128": TinyMuseGlimmerSpec(
+        hidden_size=256,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        head_dim=128,
+        num_hidden_layers=8,
+        sliding_window=6,
+        explicit_layer_rope_theta=False,
+        flat_config=True,
+        group_size=64,
+        eight_bit_mlp_layers=(),
+        vision_tower=False,
+        prefix="",
+        seed=1,
+    ),
+}
 VARIANTS = (sorted(GEMMA3_VARIANTS) + sorted(GEMMA4_VARIANTS) + sorted(DENSE_VARIANTS) + sorted(DEEPSEEK_VARIANTS)
-            + sorted(QWEN35_VARIANTS))
+            + sorted(QWEN35_VARIANTS) + sorted(MUSE_GLIMMER_VARIANTS))
 
 
 @pytest.fixture(scope="module", params=VARIANTS)
@@ -274,6 +298,9 @@ def fixture_model(request, tmp_path_factory):
     if request.param in QWEN35_VARIANTS:
         write_tiny_qwen35(directory, QWEN35_VARIANTS[request.param])
         return directory, Qwen35Reference.load(directory)
+    if request.param in MUSE_GLIMMER_VARIANTS:
+        write_tiny_muse_glimmer(directory, MUSE_GLIMMER_VARIANTS[request.param])
+        return directory, MuseGlimmerReference.load(directory)
     write_tiny_dense(directory, DENSE_VARIANTS[request.param])
     return directory, LlamaFamilyReference.load(directory)
 
@@ -424,6 +451,27 @@ _NO_PLE_OR_EXPERTS = "gemma4_unified: per-layer inputs and experts are not part 
 )
 def test_unsupported_gemma4_unified_configurations_fail_closed(native_cli, tmp_path, change, message):
     directory = write_tiny_gemma4(tmp_path / "model", GEMMA4_VARIANTS["gemma4-unified-12b-shape"])
+    assert message in _load_error(native_cli, _edit_text_config(directory, change))
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        ({"layer_rope_theta": [500000.0, 500000.0, 500000.0, 10000.0]},
+         "muse_glimmer: full-attention layers with RoPE are not supported"),
+        ({"layer_rope_theta": [500000.0, 0, 500000.0, 0]}, "muse_glimmer: sliding layers without RoPE are not supported"),
+        ({"layer_rope_theta": [500000.0, 10000.0, 500000.0, 0]},
+         "muse_glimmer: sliding layers with different RoPE thetas are not supported"),
+        ({"hidden_activation": "gelu_pytorch_tanh"}, "muse_glimmer: unsupported activation gelu_pytorch_tanh"),
+        ({"attention_bias": True}, "muse_glimmer: attention_bias is not supported"),
+        ({"rope_parameters": {"rope_type": "yarn", "factor": 4.0, "rope_theta": 500000.0}},
+         "muse_glimmer: rope_type 'yarn' is not supported"),
+        ({"layer_types": ["sliding_attention", "chunked_attention", "sliding_attention", "full_attention"]},
+         "muse_glimmer: unknown layer type chunked_attention"),
+    ],
+)
+def test_unsupported_muse_glimmer_configurations_fail_closed(native_cli, tmp_path, change, message):
+    directory = write_tiny_muse_glimmer(tmp_path / "model", MUSE_GLIMMER_VARIANTS["muse-glimmer-mlx"])
     assert message in _load_error(native_cli, _edit_text_config(directory, change))
 
 
