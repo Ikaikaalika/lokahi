@@ -373,6 +373,109 @@ kernel void qmv(const device uint* w [[buffer(0)]],
   }
 }
 
+// Quantized products for short passes of 2 to QMV_N_MAX tokens (speculative
+// verification, batched decode): Y[n, rows] = X[n, cols] W^T with qmv's row
+// and lane layout. Each lane unpacks its rows' 16 codes once per step and
+// reads each token's 16 inputs once, applying them to all of its rows, so
+// the weights are read once per pass rather than once per token and a pass
+// costs a fraction of n decode steps instead of a whole qmm tile. Each
+// token's sums take qmv's form. Not for MXFP4 (qmv's own path).
+// ---------------------------------------------------------------------------
+
+constant constexpr int QMV_N_MAX = 8;
+
+struct QmvNParams {
+  int rows;
+  int cols;
+  int n;
+};
+
+// The 16 codes of a row from code k0 (a multiple of 16), as floats.
+inline void unpack16(const device uint* row, int k0, thread float* out) {
+  if (!whole_codes()) {  // 16 codes fill QBITS halfwords
+    uint codes[16];
+    stream_codes<ushort, 16>(reinterpret_cast<const device ushort*>(row) + k0 * QBITS / 16, codes);
+    for (int j = 0; j < 16; ++j) out[j] = float(codes[j]);
+  } else if (QBITS == 4) {
+    const uint2 ww = *reinterpret_cast<const device uint2*>(row + k0 / 8);
+    for (int j = 0; j < 8; ++j) out[j] = float((ww.x >> (4 * j)) & 0xFu);
+    for (int j = 0; j < 8; ++j) out[8 + j] = float((ww.y >> (4 * j)) & 0xFu);
+  } else if (QBITS == 8) {
+    const uint4 ww = *reinterpret_cast<const device uint4*>(row + k0 / 4);
+    for (int j = 0; j < 4; ++j) out[j] = float((ww.x >> (8 * j)) & 0xFFu);
+    for (int j = 0; j < 4; ++j) out[4 + j] = float((ww.y >> (8 * j)) & 0xFFu);
+    for (int j = 0; j < 4; ++j) out[8 + j] = float((ww.z >> (8 * j)) & 0xFFu);
+    for (int j = 0; j < 4; ++j) out[12 + j] = float((ww.w >> (8 * j)) & 0xFFu);
+  } else {
+    const uint ww = row[k0 / 16];
+    for (int j = 0; j < 16; ++j) out[j] = float((ww >> (2 * j)) & 0x3u);
+  }
+}
+
+// Fixed-trip loops over the accumulators unroll fully; a loop the compiler
+// keeps would index them dynamically and spill them.
+#define QMV_N_UNROLL _Pragma("clang loop unroll(full)")
+
+kernel void qmv_n(const device uint* w [[buffer(0)]],
+                  const device ushort* scales [[buffer(1)]],
+                  const device ushort* biases [[buffer(2)]],
+                  const device float* x [[buffer(3)]],
+                  device float* y [[buffer(4)]],
+                  constant QmvNParams& p [[buffer(5)]],
+                  uint tg [[threadgroup_position_in_grid]],
+                  uint sg [[simdgroup_index_in_threadgroup]],
+                  uint lane [[thread_index_in_simdgroup]]) {
+  const int row0 = (int(tg) * QMV_SIMDGROUPS + int(sg)) * QMV_ROWS;
+  if (row0 >= p.rows) return;
+  const int words_per_row = p.cols * QBITS / 32;
+  const int groups_per_row = p.cols / QGROUP;
+  float acc[QMV_N_MAX][QMV_ROWS];
+  QMV_N_UNROLL for (int t = 0; t < QMV_N_MAX; ++t)
+    QMV_N_UNROLL for (int r = 0; r < QMV_ROWS; ++r) acc[t][r] = 0.0f;
+  for (int k0 = int(lane) * 16; k0 < p.cols; k0 += 32 * 16) {
+    const int g = k0 / QGROUP;
+    // Unpack the rows' codes once, then read each token's 16 inputs once
+    // and apply them to every row.
+    float codes[QMV_ROWS][16];
+    float s[QMV_ROWS], b[QMV_ROWS];
+    QMV_N_UNROLL for (int r = 0; r < QMV_ROWS; ++r) {
+      const int row = min(row0 + r, p.rows - 1);  // a clamped row's sums are never stored
+      unpack16(w + row * words_per_row, k0, codes[r]);
+      const int gi = row * groups_per_row + g;
+      s[r] = scale_at(scales, gi);
+      b[r] = scale_at(biases, gi);
+    }
+    QMV_N_UNROLL for (int t = 0; t < QMV_N_MAX; ++t) {
+      if (t < p.n) {  // Uniform across the simdgroup.
+        const device float4* x4 = reinterpret_cast<const device float4*>(x + t * p.cols + k0);
+        float xv[16];
+        QMV_N_UNROLL for (int j = 0; j < 4; ++j) {
+          const float4 v = x4[j];
+          xv[4 * j] = v.x;
+          xv[4 * j + 1] = v.y;
+          xv[4 * j + 2] = v.z;
+          xv[4 * j + 3] = v.w;
+        }
+        float xsum = 0.0f;
+        QMV_N_UNROLL for (int j = 0; j < 16; ++j) xsum += xv[j];
+        QMV_N_UNROLL for (int r = 0; r < QMV_ROWS; ++r) {
+          float dot = 0.0f;
+          QMV_N_UNROLL for (int j = 0; j < 16; ++j) dot += codes[r][j] * xv[j];
+          acc[t][r] += s[r] * dot + b[r] * xsum;
+        }
+      }
+    }
+  }
+  QMV_N_UNROLL for (int t = 0; t < QMV_N_MAX; ++t) {
+    if (t < p.n) {
+      QMV_N_UNROLL for (int r = 0; r < QMV_ROWS; ++r) {
+        const float total = simd_sum(acc[t][r]);
+        if (lane == 0 && row0 + r < p.rows) y[t * p.rows + row0 + r] = total;
+      }
+    }
+  }
+}
+
 // q, k and v projections of one token in one dispatch. Row space is the
 // concatenation [q_rows | kv_rows | kv_rows]; every 4-row block lies in one
 // matrix because q_rows and kv_rows are multiples of 4.
