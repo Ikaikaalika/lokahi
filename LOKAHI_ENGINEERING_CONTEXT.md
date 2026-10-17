@@ -12,7 +12,7 @@ document retains the teaching-oriented explanation and historical roadmap.
 
 **Project name:** Lōkahi
 
-**Repository:** `https://github.com/Ikaikaalika/strata`
+**Repository:** `https://github.com/Ikaikaalika/lokahi`
 
 **Local path:** `/Volumes/Tyler HDD/strata`
 

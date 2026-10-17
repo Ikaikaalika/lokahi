@@ -34,8 +34,8 @@ dev = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/Ikaikaalika/strata"
-"Bug Tracker" = "https://github.com/Ikaikaalika/strata/issues"
+"Homepage" = "https://github.com/Ikaikaalika/lokahi"
+"Bug Tracker" = "https://github.com/Ikaikaalika/lokahi/issues"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -141,5 +141,5 @@ only promotes a plan for fingerprints that passed.
 | Register the self-hosted runner and set `LOKAHI_HW_RUNNER=enabled` | Tyler | [APPLE_SILICON_RUNNER.md](APPLE_SILICON_RUNNER.md) |
 | Grant this project access to the Common Compute provider app repository | Tyler | Needed to add the `lokahi_bench` workload |
 | Counsel review of the CLA and the copyright assignment from Tyler to Common Compute LLC | Tyler | No outside contributions until then |
-| Rename the GitHub repository to `lokahi` (and consider moving it into the `commoncompute` organization and detaching it from the oLLM fork network) | Tyler | GitHub redirects the old URL; update `pyproject.toml` URLs afterwards |
+| Consider moving the repository into the `commoncompute` organization and detaching it from the oLLM fork network | Tyler | Renamed to `Ikaikaalika/lokahi` on 2026-10-16; GitHub redirects the old `strata` URL |
 | Trademark search for "Lōkahi" in software | Tyler | PyPI and the obvious GitHub names were free on 2026-10-09 |
