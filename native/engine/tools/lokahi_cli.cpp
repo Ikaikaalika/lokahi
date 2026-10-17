@@ -147,6 +147,7 @@ SpeculationOptions speculation_options(const Args& args) {
   LK_CHECK(speculation.max_draft >= 0, "--speculate must not be negative");
   if (args.has("draft-reference")) speculation.reference = parse_tokens(read_text_file(args.get("draft-reference")));
   speculation.drafter = parse_drafter(args.get("drafter", "lookup"));
+  speculation.policy = parse_draft_policy(args.get("draft-policy", "fixed"));
   return speculation;
 }
 
@@ -653,6 +654,7 @@ int cmd_bench(const Args& args) {
   reps << "]";
   const std::string speculated =
       speculating ? "{\"max_draft\":" + std::to_string(max_draft) + ",\"drafter\":" + json_string(drafter) +
+                        ",\"policy\":" + json_string(args.get("draft-policy", "fixed")) +
                         ",\"inter_token_latency\":\"mean\",\"matches_plain_greedy\":" +
                         (matches_plain ? "true" : "false") + "}"
                   : "null";

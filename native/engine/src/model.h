@@ -152,6 +152,9 @@ class Model {
   virtual bool can_verify() const { return false; }
   virtual const float* verify(const int32_t* tokens, int n);
   virtual void accept(int kept);
+  // About what one more verified token adds to a pass, in decode steps; the
+  // adaptive draft policy weighs drafts against it (DraftBudget).
+  virtual double verify_token_cost() const { return 0.25; }
 
   // Multi-token prediction (Qwen3.5's MTP head). While the head follows the
   // model, which must start from an empty context, every pass also writes
@@ -163,8 +166,9 @@ class Model {
   virtual void follow_mtp(bool on);
   virtual std::vector<int32_t> mtp_draft(int32_t token, int count, std::vector<float>* logits = nullptr);
 
-  // Greedy generation drafts up to options.max_draft tokens per verify pass
-  // (speculation.h); other sampling decodes one token at a time.
+  // Greedy generation drafts up to options.max_draft tokens per verify pass,
+  // fewer under the adaptive policy (speculation.h); other sampling decodes
+  // one token at a time.
   void set_speculation(SpeculationOptions options) { speculation_ = std::move(options); }
   const SpeculationStats& speculation_stats() const { return speculation_stats_; }
 

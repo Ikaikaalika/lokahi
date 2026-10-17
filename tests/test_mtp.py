@@ -194,8 +194,8 @@ def test_bench_speculates_only_to_reproduce_plain_greedy(native_cli, backend, tm
     for drafter_name in ("lookup", "mtp", "both"):
         report = json.loads(subprocess.run([*bench, *speculate, "--drafter", drafter_name],
                                            check=True, capture_output=True, text=True).stdout)
-        assert report["speculation"] == {"max_draft": 3, "drafter": drafter_name, "inter_token_latency": "mean",
-                                         "matches_plain_greedy": True}
+        assert report["speculation"] == {"max_draft": 3, "drafter": drafter_name, "policy": "fixed",
+                                         "inter_token_latency": "mean", "matches_plain_greedy": True}
         for run in report["repetitions"]:
             assert run["token_ids"] == plain
             stats = run["speculation"]

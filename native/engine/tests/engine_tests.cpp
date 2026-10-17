@@ -1423,6 +1423,43 @@ void test_prompt_lookup_drafter() {
   EXPECT(repeat.propose({7, 1, 2, 3, 4, 8, 1, 2, 3}, 2) == V({5, 9}));
 }
 
+void test_draft_budget() {
+  // With c = 0.25 a k-token draft pays when 1 + p + ... + p^k > 1 + 0.25 k.
+  DraftBudget budget(0.25);
+  // The priors: a one-token lookup match (p = 0.3) drafts 1; a three-token
+  // match (p = 0.6) drafts 2 of the 4 available.
+  EXPECT(budget.length(DraftBudget::kLookup1, 4) == 1);
+  EXPECT(budget.length(DraftBudget::kLookup3, 4) == 2);
+  // Rejected drafts drive p down until drafting stops, except one probe
+  // token every kProbeEvery plain steps.
+  for (int i = 0; i < 12; ++i) budget.update(DraftBudget::kLookup1, 1, 0);
+  EXPECT(budget.acceptance(DraftBudget::kLookup1) < 0.1);
+  int drafted = 0;
+  for (int step = 0; step < 4 * DraftBudget::kProbeEvery; ++step) drafted += budget.length(DraftBudget::kLookup1, 4);
+  EXPECT(drafted == 4);
+  // Accepted drafts drive it up until the whole room is worth drafting.
+  for (int i = 0; i < 12; ++i) budget.update(DraftBudget::kLookup2, 4, 4);
+  EXPECT(budget.acceptance(DraftBudget::kLookup2) > 0.95 && budget.length(DraftBudget::kLookup2, 7) == 7);
+  // A pass observes accepted positions and the first rejected one only.
+  DraftBudget one(0.25);
+  const double before = one.acceptance(DraftBudget::kMtp);
+  one.update(DraftBudget::kMtp, 4, 4);
+  const double all = one.acceptance(DraftBudget::kMtp);
+  DraftBudget two(0.25);
+  two.update(DraftBudget::kMtp, 4, 3);
+  EXPECT(all > before && two.acceptance(DraftBudget::kMtp) < all);
+  EXPECT(DraftBudget::lookup_source(0) == DraftBudget::kLookup1 && DraftBudget::lookup_source(5) == DraftBudget::kLookup3);
+  EXPECT(parse_draft_policy("adaptive") == DraftPolicy::Adaptive && parse_draft_policy("fixed") == DraftPolicy::Fixed);
+  EXPECT(throws([] { parse_draft_policy("greedy"); }));
+  // A shortened reference proposal resumes where the shortened draft ended.
+  PromptLookupDrafter drafter({1, 2, 3, 4, 5, 6, 7, 8});
+  int matched = 0;
+  std::vector<int32_t> first = drafter.propose({9, 1, 2}, 4, &matched);
+  EXPECT(matched == 2 && first == std::vector<int32_t>({3, 4, 5, 6}));
+  drafter.shorten(3);  // kept only its first token
+  EXPECT(drafter.propose({9, 1, 2, 3}, 2) == std::vector<int32_t>({4, 5}));
+}
+
 void test_kv_cache_option() {
   // Metal stores standard attention's keys and values as FP16 unless asked
   // for FP32; the CPU keeps FP32 unless asked; latent attention keeps FP32.
@@ -1465,6 +1502,7 @@ int main() {
   test_qwen3_5_configs();
   test_kv_cache_option();
   test_prompt_lookup_drafter();
+  test_draft_budget();
   test_mrope_injection_plan();
   test_qwen3_vl_config();
   test_qwen2_5_vl_config();

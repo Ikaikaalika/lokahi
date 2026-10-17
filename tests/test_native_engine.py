@@ -495,6 +495,34 @@ def test_speculative_stop_keeps_the_tokens_before_it(native_cli, name, backend, 
         assert report["tokens"] == plain[:limit] and report["continued"] == plain[limit : limit + 3]
 
 
+@pytest.mark.parametrize("backend", _backends())
+def test_adaptive_drafting_matches_plain_greedy(native_cli, fixture_model, backend):
+    # The adaptive policy changes how long drafts are, never the tokens: with
+    # a good reference (drafts mostly accepted) and with one whose every
+    # draft after the prompt is wrong (drafting backs off to probes).
+    directory, _ = fixture_model
+    _skip_unsupported(directory, backend)
+    prompt = TOKENS[:6]
+    args = ("--max-new", "16", "--no-eos-stop")
+    plain = _run(native_cli, "generate", "--model", str(directory), "--backend", backend,
+                 "--tokens", ",".join(map(str, prompt)), *args)["tokens"]
+    good = _speculative_run(native_cli, directory, backend, prompt, prompt + plain, *args, "--draft-policy", "adaptive")
+    assert good["tokens"] == plain and good["speculation"]["accepted"] > 0
+    wrong = list(prompt) + [(t + 1) % 64 for t in plain]
+    fixed = _speculative_run(native_cli, directory, backend, prompt, wrong, *args)
+    adaptive = _speculative_run(native_cli, directory, backend, prompt, wrong, *args, "--draft-policy", "adaptive")
+    assert fixed["tokens"] == plain and adaptive["tokens"] == plain
+    assert adaptive["speculation"]["drafted"] <= fixed["speculation"]["drafted"]
+
+
+def test_unknown_draft_policy_fails_closed(native_cli, tmp_path):
+    directory = write_tiny_qwen35(tmp_path / "model", QWEN35_VARIANTS["qwen3.5-mlx"])
+    result = subprocess.run([str(native_cli), "generate", "--model", str(directory), "--backend", "cpu",
+                             "--tokens", "2,5,9", "--max-new", "4", "--speculate", "2", "--draft-policy", "eager"],
+                            capture_output=True, text=True)
+    assert result.returncode != 0 and "the draft policy must be fixed or adaptive, not 'eager'" in result.stderr
+
+
 def test_speculation_is_greedy_only(native_cli, tmp_path):
     # Sampled generation decodes one token at a time, with the same draws.
     directory = write_tiny_qwen35(tmp_path / "model", QWEN35_VARIANTS["qwen3.5-mlx"])
