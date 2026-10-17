@@ -178,6 +178,8 @@ std::vector<int32_t> Model::generate_speculative(const std::vector<int32_t>& pro
   PromptLookupDrafter drafter(speculation_.reference);
   const bool lookup = speculation_.drafter != Drafter::Mtp;
   const bool mtp = speculation_.drafter != Drafter::Lookup;
+  const bool adaptive = speculation_.policy == DraftPolicy::Adaptive;
+  DraftBudget budget(verify_token_cost());
   if (mtp) follow_mtp(true);
   std::vector<int32_t> context = prompt;
   bool keep_going = true;
@@ -203,9 +205,21 @@ std::vector<int32_t> Model::generate_speculative(const std::vector<int32_t>& pro
     // A pass yields up to one token beyond its drafts, so it drafts at most
     // the tokens still wanted minus one.
     const int room = std::min(speculation_.max_draft, max_new - static_cast<int>(out.size()) - 1);
-    // Lookup's draft when it finds one, else the MTP head's.
-    std::vector<int32_t> draft = lookup ? drafter.propose(context, room) : std::vector<int32_t>{};
-    if (draft.empty() && mtp && room > 0) draft = mtp_draft(token, room);
+    // Lookup's draft when it finds one, else the MTP head's; the adaptive
+    // policy shortens either to what its acceptance makes worthwhile.
+    int matched = 0;
+    std::vector<int32_t> draft = lookup ? drafter.propose(context, room, &matched) : std::vector<int32_t>{};
+    DraftBudget::Source source = DraftBudget::lookup_source(matched);
+    if (adaptive && !draft.empty()) {
+      const int keep = budget.length(source, static_cast<int>(draft.size()));
+      drafter.shorten(static_cast<int>(draft.size()) - keep);
+      draft.resize(static_cast<size_t>(keep));
+    }
+    if (draft.empty() && mtp && room > 0) {
+      const int count = adaptive ? budget.length(DraftBudget::kMtp, room) : room;
+      if (count > 0) draft = mtp_draft(token, count);
+      source = DraftBudget::kMtp;
+    }
     if (draft.empty()) {
       token = pick(decode(token));
       more = emit(token);
@@ -227,6 +241,7 @@ std::vector<int32_t> Model::generate_speculative(const std::vector<int32_t>& pro
       ++speculation_stats_.accepted;
     }
     accept(kept);
+    if (adaptive) budget.update(source, static_cast<int>(draft.size()), kept - 1);
   }
   if (timing) timing->decode_seconds = timing->token_times.back() - first;
   return out;
