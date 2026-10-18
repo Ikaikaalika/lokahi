@@ -1867,6 +1867,184 @@ LOKAHI_ATTN_ALL_DPL(8)
 LOKAHI_ATTN_KV(4, 3, float, "")
 LOKAHI_ATTN_KV(4, 18, float, "")
 
+// ---------------------------------------------------------------------------
+// Prefill attention on simdgroup matrices: scores S = Q K^T (scaled, soft-capped
+// and masked as they are written), a row softmax (softmax_rows), then O = P V.
+// attn_partial suits decode, where one query row spreads its keys over
+// threadgroups; a long pass instead reuses every key and value tile across 64
+// query rows. Both products take qmm's 64x64 tiles (four simdgroups of 4x4 8x8
+// matrices, K in steps of 32). Keys are positions key_base ... key_base +
+// keys - 1, read from their cache slots (position % capacity), so a sliding
+// layer's ring is read in order. A sub-pass covers query rows row0 ... row0 +
+// rows - 1 of the pass; S holds [heads, rows, keys]. Requires head_dim % 64 == 0.
+// ---------------------------------------------------------------------------
+
+struct AttnMmParams {
+  int heads;
+  int kv_heads;
+  int head_dim;
+  int start_pos;     // position of the pass's row 0
+  int row0;          // this sub-pass's first query row within the pass
+  int rows;          // query rows in this sub-pass
+  int key_base;      // position of key 0
+  int keys;          // keys per query row in S
+  int window;        // keys allowed per query (sliding window or a large value)
+  int capacity;      // KV slots for this layer
+  float scale;
+  float softcap;     // 0 disables
+  int has_last_key;  // last_key[t] extends query t's keys (Gemma 3's image blocks)
+};
+
+#define ATT_MM_UNROLL _Pragma("clang loop unroll(full)")
+constant constexpr int ATT_MM_T = 64;              // tile rows and columns
+constant constexpr int ATT_MM_K = 32;              // reduction step
+constant constexpr int ATT_MM_LD = ATT_MM_K + 4;   // staging stride
+constant constexpr int ATT_MM_OUT_LD = ATT_MM_T + 4;
+
+// The four simdgroups' 32x32 quadrants of a 64x64 tile over one K step.
+inline void att_mm_step(threadgroup float* as, threadgroup float* bs, int sm, int sn,
+                        thread simdgroup_float8x8 (&acc)[4][4]) {
+  ATT_MM_UNROLL for (int kk = 0; kk < ATT_MM_K; kk += 8) {
+    simdgroup_float8x8 a[4];
+    simdgroup_float8x8 b[4];
+    ATT_MM_UNROLL for (int i = 0; i < 4; ++i) simdgroup_load(a[i], as + (sm + 8 * i) * ATT_MM_LD + kk, ATT_MM_LD);
+    ATT_MM_UNROLL for (int j = 0; j < 4; ++j)
+      simdgroup_load(b[j], bs + (sn + 8 * j) * ATT_MM_LD + kk, ATT_MM_LD, ulong2(0, 0), true);
+    ATT_MM_UNROLL for (int i = 0; i < 4; ++i)
+      ATT_MM_UNROLL for (int j = 0; j < 4; ++j) simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+  }
+}
+
+// Grid (ceil(keys / 64), ceil(rows / 64), heads), 128 threads.
+template <typename KV>
+[[kernel]] void attn_qk(const device float* q [[buffer(0)]],
+                        const device KV* k_cache [[buffer(1)]],
+                        device float* s [[buffer(2)]],
+                        constant AttnMmParams& p [[buffer(3)]],
+                        const device int* last_key [[buffer(4)]],
+                        uint3 tg [[threadgroup_position_in_grid]],
+                        uint tid [[thread_index_in_threadgroup]],
+                        uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float stage[2 * ATT_MM_T * ATT_MM_LD];
+  threadgroup float* as = stage;
+  threadgroup float* bs = stage + ATT_MM_T * ATT_MM_LD;
+  const int D = p.head_dim;
+  const int h = int(tg.z);
+  const int kvh = h / (p.heads / p.kv_heads);
+  const int r0 = int(tg.y) * ATT_MM_T;  // first query row of the tile, within the sub-pass
+  const int j0 = int(tg.x) * ATT_MM_T;  // first key of the tile
+  const int sm = int(sg / 2) * 32;
+  const int sn = int(sg % 2) * 32;
+  simdgroup_float8x8 acc[4][4];
+  ATT_MM_UNROLL for (int i = 0; i < 4; ++i)
+    ATT_MM_UNROLL for (int j = 0; j < 4; ++j) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  for (int k0 = 0; k0 < D; k0 += ATT_MM_K) {
+    // 64 rows x 32 dims of Q and of K: 512 float4 each, four per thread.
+    ATT_MM_UNROLL for (int i = int(tid); i < ATT_MM_T * ATT_MM_K / 4; i += 128) {
+      const int r = i / (ATT_MM_K / 4);
+      const int c = (i % (ATT_MM_K / 4)) * 4;
+      float4 qv = {0.0f, 0.0f, 0.0f, 0.0f};
+      if (r0 + r < p.rows) qv = *reinterpret_cast<const device float4*>(q + ((p.row0 + r0 + r) * p.heads + h) * D + k0 + c);
+      *reinterpret_cast<threadgroup float4*>(as + r * ATT_MM_LD + c) = qv;
+      float4 kv = {0.0f, 0.0f, 0.0f, 0.0f};
+      if (j0 + r < p.keys) {
+        const int slot = (p.key_base + j0 + r) % p.capacity;
+        const device KV* kp = k_cache + (kvh * p.capacity + slot) * D + k0 + c;
+        kv = {float(kp[0]), float(kp[1]), float(kp[2]), float(kp[3])};
+      }
+      *reinterpret_cast<threadgroup float4*>(bs + r * ATT_MM_LD + c) = kv;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    att_mm_step(as, bs, sm, sn, acc);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  threadgroup float* tile = stage;  // free after the last barrier
+  ATT_MM_UNROLL for (int i = 0; i < 4; ++i)
+    ATT_MM_UNROLL for (int j = 0; j < 4; ++j)
+      simdgroup_store(acc[i][j], tile + (sm + 8 * i) * ATT_MM_OUT_LD + sn + 8 * j, ATT_MM_OUT_LD);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int i = int(tid); i < ATT_MM_T * ATT_MM_T; i += 128) {
+    const int r = i / ATT_MM_T;
+    const int c = i % ATT_MM_T;
+    const int row = r0 + r, key = j0 + c;
+    if (row >= p.rows || key >= p.keys) continue;
+    const int t = p.row0 + row;  // query row within the pass
+    const int qpos = p.start_pos + t;
+    const int kpos = p.key_base + key;
+    const int hi = p.has_last_key != 0 ? max(qpos, last_key[t]) : qpos;
+    float v = tile[r * ATT_MM_OUT_LD + c] * p.scale;
+    if (p.softcap > 0.0f) v = precise::tanh(v / p.softcap) * p.softcap;
+    const bool allowed = kpos <= hi && kpos > qpos - p.window;
+    s[(h * p.rows + row) * p.keys + key] = allowed ? v : -INFINITY;
+  }
+}
+
+// Grid (head_dim / 64, ceil(rows / 64), heads), 128 threads.
+template <typename KV>
+[[kernel]] void attn_pv(const device float* s [[buffer(0)]],
+                        const device KV* v_cache [[buffer(1)]],
+                        device float* out [[buffer(2)]],
+                        constant AttnMmParams& p [[buffer(3)]],
+                        uint3 tg [[threadgroup_position_in_grid]],
+                        uint tid [[thread_index_in_threadgroup]],
+                        uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float stage[2 * ATT_MM_T * ATT_MM_LD];
+  threadgroup float* as = stage;
+  threadgroup float* bs = stage + ATT_MM_T * ATT_MM_LD;
+  const int D = p.head_dim;
+  const int h = int(tg.z);
+  const int kvh = h / (p.heads / p.kv_heads);
+  const int r0 = int(tg.y) * ATT_MM_T;
+  const int d0 = int(tg.x) * ATT_MM_T;
+  const int sm = int(sg / 2) * 32;
+  const int sn = int(sg % 2) * 32;
+  simdgroup_float8x8 acc[4][4];
+  ATT_MM_UNROLL for (int i = 0; i < 4; ++i)
+    ATT_MM_UNROLL for (int j = 0; j < 4; ++j) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  for (int k0 = 0; k0 < p.keys; k0 += ATT_MM_K) {
+    // P: 64 rows x 32 keys; V: 32 keys x 64 dims, staged transposed as [dim][key].
+    ATT_MM_UNROLL for (int i = int(tid); i < ATT_MM_T * ATT_MM_K; i += 128) {
+      const int r = i / ATT_MM_K;
+      const int c = i % ATT_MM_K;
+      const int row = r0 + r, key = k0 + c;
+      as[r * ATT_MM_LD + c] = row < p.rows && key < p.keys ? s[(h * p.rows + row) * p.keys + key] : 0.0f;
+      const int kk = i / ATT_MM_T;  // consecutive threads read consecutive dims of one key
+      const int d = i % ATT_MM_T;
+      float vv = 0.0f;
+      if (k0 + kk < p.keys) {
+        const int slot = (p.key_base + k0 + kk) % p.capacity;
+        vv = float(v_cache[(kvh * p.capacity + slot) * D + d0 + d]);
+      }
+      bs[d * ATT_MM_LD + kk] = vv;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    att_mm_step(as, bs, sm, sn, acc);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+  if (r0 + ATT_MM_T <= p.rows) {
+    device float* o = out + ((p.row0 + r0 + sm) * p.heads + h) * D + d0 + sn;
+    const int ld = p.heads * D;  // consecutive query rows of one head
+    ATT_MM_UNROLL for (int i = 0; i < 4; ++i)
+      ATT_MM_UNROLL for (int j = 0; j < 4; ++j) simdgroup_store(acc[i][j], o + 8 * i * ld + 8 * j, ld);
+    return;
+  }
+  threadgroup float* tile = stage;
+  ATT_MM_UNROLL for (int i = 0; i < 4; ++i)
+    ATT_MM_UNROLL for (int j = 0; j < 4; ++j)
+      simdgroup_store(acc[i][j], tile + (sm + 8 * i) * ATT_MM_OUT_LD + sn + 8 * j, ATT_MM_OUT_LD);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int i = int(tid); i < ATT_MM_T * ATT_MM_T; i += 128) {
+    const int r = i / ATT_MM_T;
+    const int c = i % ATT_MM_T;
+    if (r0 + r < p.rows) out[((p.row0 + r0 + r) * p.heads + h) * D + d0 + c] = tile[r * ATT_MM_OUT_LD + c];
+  }
+}
+
+template LOKAHI_INSTANCE_ATTRS("attn_qk") decltype(attn_qk<float>) attn_qk<float>;
+template LOKAHI_INSTANCE_ATTRS("attn_qk_h") decltype(attn_qk<half>) attn_qk<half>;
+template LOKAHI_INSTANCE_ATTRS("attn_pv") decltype(attn_pv<float>) attn_pv<float>;
+template LOKAHI_INSTANCE_ATTRS("attn_pv_h") decltype(attn_pv<half>) attn_pv<half>;
+
 struct ReduceParams {
   int heads;
   int head_dim;
