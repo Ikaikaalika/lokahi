@@ -19,7 +19,27 @@ struct half {
   half(float) : bits(0) {}
   operator float() const { return 0.0f; }
 };
-struct float4 { float x, y, z, w; };
+struct float2 {
+  float x, y;
+  float2() = default;
+  explicit float2(float v) : x(v), y(v) {}
+  float2 operator*(float v) const { return {x * v, y * v}; }
+  float2& operator*=(float v) { x *= v; y *= v; return *this; }
+  float2(float a, float b) : x(a), y(b) {}
+};
+struct float4 {
+  float x, y, z, w;
+  float4() = default;
+  explicit float4(float v) : x(v), y(v), z(v), w(v) {}
+  float4(float a, float b, float c, float d) : x(a), y(b), z(c), w(d) {}
+  float operator[](int i) const { return i == 0 ? x : i == 1 ? y : i == 2 ? z : w; }
+};
+template <typename T, int N> struct vec {
+  T v[N];
+  vec() = default;
+  explicit vec(T) {}
+};
+#define M_LOG2E_F 1.4426950408889634f
 struct uint2 {
   uint x, y;
   uint2() : x(0), y(0) {}
@@ -44,10 +64,14 @@ template <typename T> T simd_max(T v) { return v; }
 template <typename T> T simd_min(T v) { return v; }
 inline uint mulhi(uint a, uint b) { return static_cast<uint>((static_cast<unsigned long long>(a) * b) >> 32); }
 template <typename T> T simd_shuffle_down(T v, ushort) { return v; }
+template <typename T> T simd_shuffle_xor(T v, ushort) { return v; }
 template <typename T, typename U> T as_type(U v) { T out; std::memcpy(&out, &v, sizeof(T)); return out; }
 template <typename T> T max(T a, T b) { return a > b ? a : b; }
 template <typename T> T min(T a, T b) { return a < b ? a : b; }
 template <typename T> T clamp(T v, T lo, T hi) { return v < lo ? lo : v > hi ? hi : v; }
+namespace fast {
+inline float exp2(float v) { return std::exp2(v); }
+}  // namespace fast
 namespace precise {
 inline float rsqrt(float v) { return 1.0f / std::sqrt(v); }
 inline float tanh(float v) { return std::tanh(v); }

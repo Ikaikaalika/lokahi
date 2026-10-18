@@ -1,6 +1,10 @@
 // Syntax-check stub (see metal_stdlib).
 #pragma once
-template <typename T, int C, int R> struct simdgroup_matrix { T v[C * R]; };
+template <typename T, int C, int R> struct simdgroup_matrix {
+  T v[C * R];
+  // MSL declares the whole matrix's storage; each thread holds two elements.
+  T (&thread_elements())[C * R] { return v; }
+};
 typedef simdgroup_matrix<float, 8, 8> simdgroup_float8x8;
 template <typename T, int C, int R> simdgroup_matrix<T, C, R> make_filled_simdgroup_matrix(T) { return {}; }
 template <typename T, int C, int R>

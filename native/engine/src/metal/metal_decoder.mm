@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -196,6 +197,9 @@ struct QkvParams { int q_rows; int kv_rows; int cols; };
 struct QmmParams { int n; int rows; int cols; };
 struct QmvNParams { int rows; int cols; int n; };
 constexpr int kQmvNMax = 8;  // QMV_N_MAX in decoder_kernels.metal
+// From this many tokens, 4-bit short passes run qmv_mma (simdgroup matrices)
+// instead of qmv_n; at 2 tokens qmv_n is as fast on M1.
+constexpr int kQmvMmaMinRows = 3;
 struct ElementwiseParams { int count; };
 struct GluMulParams { int count; int silu; };
 struct RopeParams {
@@ -274,6 +278,13 @@ class DecoderMetal final : public Model {
       upload();
       allocate_state();
       zero_states();
+      fragments_ = fragment_layout_matches();
+      if (!fragments_) {
+        std::fprintf(stderr,
+                     "metal: %s holds simdgroup matrix elements in another layout; "
+                     "attention and short passes keep their unfused kernels\n",
+                     [[device_ name] UTF8String]);
+      }
     }
   }
 
@@ -284,6 +295,7 @@ class DecoderMetal final : public Model {
   int vocab_size() const override { return c_.vocab_size; }
   int max_context() const override { return max_context_; }
   const char* kv_cache() const override { return kv_f16_ ? "f16" : "f32"; }
+  std::string device() const override { return [[device_ name] UTF8String]; }
   double kv_bytes() const { return kv_f16_ ? 2.0 : 4.0; }
   int position() const override { return position_; }
   size_t weight_bytes() const override { return w_->matrix_bytes(); }
@@ -1102,6 +1114,19 @@ class DecoderMetal final : public Model {
       return;
     }
     if (n <= kQmvNMax && !l.mxfp4) {  // a short pass: read the weights once for all n tokens
+      // 4-bit weights on simdgroup matrices: one dequantization for all n
+      // (its 32-code steps need groups of a multiple of 32).
+      if (fragments_ && l.bits == 4 && l.group % 32 == 0 && n >= kQmvMmaMinRows) {
+        [enc setComputePipelineState:quant_pipeline("qmv_mma", l)];
+        bind_weights(enc, l, 0);
+        bind(enc, x, 0, 3);
+        bind(enc, y, 0, 4);
+        bytes(enc, QmvNParams{l.rows, l.cols, n}, 5);
+        // QMV_MMA_ROWS rows per threadgroup of QMV_MMA_SG simdgroups.
+        [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((l.rows + 15) / 16), 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        return;
+      }
       [enc setComputePipelineState:quant_pipeline("qmv_n", l)];
       bind_weights(enc, l, 0);
       bind(enc, x, 0, 3);
@@ -1487,9 +1512,12 @@ class DecoderMetal final : public Model {
     const int window = G.sliding ? c_.sliding_window : (1 << 30);
     // Image blocks let a query also see up to plan_.reach later keys.
     const bool blocks = !plan_.empty() && plan_.reach > 0 && c_.image_blocks_apply(G.sliding);
-    if (n >= kAttnMmMinRows && G.head_dim % 64 == 0 && !c_.attention_sinks &&
-        encode_attention_mm(enc, G, n, start, window, blocks)) {
-      return;
+    if (n >= kAttnMmMinRows && !c_.attention_sinks) {
+      if (fragments_ && (G.head_dim == 64 || G.head_dim == 128 || G.head_dim == 256)) {
+        encode_attention_flash(enc, G, n, start, window, blocks);
+        return;
+      }
+      if (G.head_dim % 64 == 0 && encode_attention_mm(enc, G, n, start, window, blocks)) return;
     }
     const int keys_max = std::min(window + (blocks ? plan_.reach : 0), start + n);  // the most keys a query sees
     const int max_blocks = n == 1 ? kDecodeMaxBlocks : kPrefillMaxBlocks;
@@ -1521,6 +1549,54 @@ class DecoderMetal final : public Model {
     bind(enc, G.sinks, 4);
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(c_.num_heads), static_cast<NSUInteger>(n), 1)
         threadsPerThreadgroup:MTLSizeMake(static_cast<NSUInteger>(G.head_dim), 1, 1)];
+  }
+
+  // Whether this GPU's simdgroup matrices hold the elements attn_flash and
+  // qmv_mma assume: lane l, two adjacent elements of row (l / 4 & 4) +
+  // (l / 2 % 4) from column (l / 4 & 2) * 2 + (l % 2) * 2, for loaded
+  // matrices and for products alike. Checked once at load (one dispatch) so
+  // a GPU that lays them out otherwise keeps the other kernels instead of
+  // computing wrong results.
+  bool fragment_layout_matches() {
+    id<MTLBuffer> out = [device_ newBufferWithLength:128 * sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> cb = [queue_ commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pipeline("simdgroup_layout_probe")];
+    [enc setBuffer:out offset:0 atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    if (cb.status != MTLCommandBufferStatusCompleted) return false;
+    const float* got = static_cast<const float*>(out.contents);
+    for (int lane = 0; lane < 32; ++lane) {
+      const int row = (lane / 4 & 4) + lane / 2 % 4;
+      const int col = (lane / 4 & 2) * 2 + lane % 2 * 2;
+      for (int j = 0; j < 2; ++j) {
+        const float want = static_cast<float>(row * 8 + col + j);
+        if (got[lane * 4 + j] != want || got[lane * 4 + 2 + j] != want) return false;
+      }
+    }
+    return true;
+  }
+
+  // A long pass's attention in one fused kernel (attn_flash), 32 query rows
+  // of one head per threadgroup, for head_dim 64, 128 and 256.
+  void encode_attention_flash(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n, int start, int window,
+                              bool blocks) {
+    const int key_base = std::max(0, start - window + 1);  // the earliest key any row of the pass sees
+    const AttnMmParams params{c_.num_heads, G.kv_heads, G.head_dim, start, 0, n, key_base, start + n - key_base,
+                              window, G.capacity, c_.attn_scale, c_.attn_logit_softcapping, blocks ? 1 : 0};
+    [enc setComputePipelineState:pipeline("attn_flash_d" + std::to_string(G.head_dim) + (kv_f16_ ? "_h" : ""))];
+    bind(enc, q_, 0, 0);
+    bind(enc, G.k_cache, 0, 1);
+    bind(enc, G.v_cache, 0, 2);
+    bind(enc, attn_, 0, 3);
+    bytes(enc, params, 4);
+    bind(enc, last_key_, blocks ? sizeof(int32_t) * static_cast<size_t>(start - plan_.base) : 0, 5);
+    [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((n + 31) / 32), static_cast<NSUInteger>(c_.num_heads),
+                                          1)
+        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
   }
 
   // A long pass's attention as S = Q K^T, softmax, P V on simdgroup matrices,
@@ -2203,6 +2279,7 @@ class DecoderMetal final : public Model {
   id<MTLDevice> device_ = nil;
   id<MTLCommandQueue> queue_ = nil;
   id<MTLLibrary> library_ = nil;
+  bool fragments_ = false;  // fragment_layout_matches(): attn_flash and qmv_mma may run
   std::map<std::string, id<MTLComputePipelineState>> pipelines_;
 
   GpuLinear embed_, lm_head_, embed_per_layer_, per_layer_model_proj_;

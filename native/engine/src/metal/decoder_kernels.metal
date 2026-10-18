@@ -42,6 +42,13 @@ inline float scale_at(const device ushort* values, int index) {
   return float(as_type<half>(bits));
 }
 
+// The two elements a lane holds of a float simdgroup_matrix<float, 8, 8>:
+// row (lane / 4 & 4) + (lane / 2 % 4), columns (lane / 4 & 2) * 2 +
+// (lane % 2) * 2 and the next. MSL declares the whole matrix's storage, so
+// the lane's pair is reached through a cast. The layout is checked at load
+// (simdgroup_layout_probe); MLX's kernels rely on it too.
+#define FRAG_ELEMS(m) reinterpret_cast<thread float2&>((m).thread_elements())
+
 // Whether a QBITS-bit code never straddles words (2, 4 and 8 bits).
 inline bool whole_codes() { return 32 % QBITS == 0; }
 
@@ -523,6 +530,102 @@ kernel void qmv_n(const device uint* w [[buffer(0)]],
         if (lane == 0 && row0 + r < p.rows) y[t * p.rows + row0 + r] = total;
       }
     }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The same short passes for 4-bit weights on simdgroup matrices: each weight
+// is dequantized once, straight into the 8x8 fragments' lanes, and one
+// multiply-accumulate applies it to all (up to 8) tokens. Y^T = W X^T: an
+// accumulator is 8 weight rows by 8 tokens; A is 8 rows by 8 codes; B is
+// those 8 codes by the tokens. A lane holds two adjacent elements of one
+// fragment row (FRAG_ELEMS), and a sum over k may visit k in any order as
+// long as A and B agree, so each lane fills its A elements from one 32-bit
+// word: in k-block j of a 32-code step, lane (row fm, column fn) takes
+// nibbles j and j + 4 of word fn / 2 of its row, which puts code
+// k0 + 8 (c / 2) + 4 (c % 2) + j in column c, and B's row r holds the same
+// code, so a lane's four k-blocks of x are one float4 per token. A nibble is
+// masked in place (no shift) and its 16^p factor folded into the scale; a
+// 32-code step lies in one group (groups of 32, 64 or 128). The
+// threadgroup's simdgroups split K and add their partial sums at the end.
+// Rows of x past p.n read as zero.
+//
+// Measured on M1 (rows x cols from 2048 x 2048 to 9728 x 2560): 8 tokens cost
+// 1.4-1.7x one token's qmv (qmv_n: 2.7-3.5x), 4 tokens 1.4-1.6x (1.8-2.4x);
+// at 2 tokens qmv_n is as fast or faster. Two 8-row blocks per simdgroup and
+// eight simdgroups beat 1-4 blocks and 2-4 simdgroups; uint4 loads per lane
+// and one accumulator per k-block did not help.
+// ---------------------------------------------------------------------------
+
+constant constexpr int QMV_MMA_RB = 2;  // 8-row blocks per simdgroup
+constant constexpr int QMV_MMA_SG = 8;  // simdgroups splitting K
+constant constexpr int QMV_MMA_ROWS = 8 * QMV_MMA_RB;
+
+kernel void qmv_mma(const device uint* w [[buffer(0)]],
+                    const device ushort* scales [[buffer(1)]],
+                    const device ushort* biases [[buffer(2)]],
+                    const device float* x [[buffer(3)]],
+                    device float* y [[buffer(4)]],
+                    constant QmvNParams& p [[buffer(5)]],
+                    uint tg [[threadgroup_position_in_grid]],
+                    uint tid [[thread_index_in_threadgroup]],
+                    uint sg [[simdgroup_index_in_threadgroup]],
+                    uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float partial[QMV_MMA_SG * QMV_MMA_RB * 64];
+  const int fm = int((lane / 4) & 4) + int((lane / 2) % 4);
+  const int fn = int((lane / 4) & 2) * 2 + int(lane % 2) * 2;
+  const int row_base = int(tg) * QMV_MMA_ROWS;
+  const int words_per_row = p.cols / 8;
+  const int groups_per_row = p.cols / QGROUP;
+  const int steps = p.cols / 32;
+  const int per = (steps + QMV_MMA_SG - 1) / QMV_MMA_SG;
+  const int s0 = int(sg) * per;
+  const int s1 = min(steps, s0 + per);
+  int row[QMV_MMA_RB];
+  QMV_N_UNROLL for (int rb = 0; rb < QMV_MMA_RB; ++rb) row[rb] = min(row_base + 8 * rb + fm, p.rows - 1);
+  // This lane's B elements: tokens fn and fn + 1 at codes x_at ... x_at + 3
+  // of each step (k-blocks 0 to 3).
+  const int x_at = 8 * (fm / 2) + 4 * (fm % 2);
+  const bool t0 = fn < p.n, t1 = fn + 1 < p.n;
+  const device float* x0 = x + (t0 ? fn : 0) * p.cols + x_at;
+  const device float* x1 = x + (t1 ? fn + 1 : 0) * p.cols + x_at;
+  simdgroup_float8x8 acc[QMV_MMA_RB];
+  QMV_N_UNROLL for (int rb = 0; rb < QMV_MMA_RB; ++rb) acc[rb] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  for (int st = s0; st < s1; ++st) {
+    const int k0 = st * 32;
+    const float4 xa = t0 ? *reinterpret_cast<const device float4*>(x0 + k0) : float4(0.0f);
+    const float4 xb = t1 ? *reinterpret_cast<const device float4*>(x1 + k0) : float4(0.0f);
+    simdgroup_float8x8 b[4];
+    QMV_N_UNROLL for (int j = 0; j < 4; ++j) FRAG_ELEMS(b[j]) = float2(xa[j], xb[j]);
+    // This lane's word: codes k0 + 8 (fn / 2) ... + 7, all in one group.
+    const int word = k0 / 8 + fn / 2;
+    const int group = (k0 + 8 * (fn / 2)) / QGROUP;
+    QMV_N_UNROLL for (int rb = 0; rb < QMV_MMA_RB; ++rb) {
+      const uint code = w[row[rb] * words_per_row + word];
+      const int gi = row[rb] * groups_per_row + group;
+      const float s = scale_at(scales, gi);
+      const float bias = scale_at(biases, gi);
+      QMV_N_UNROLL for (int j = 0; j < 4; ++j) {
+        // Nibbles j and j + 4, each times 16^nibble, scaled back by s / 16^nibble.
+        const float lo = float(code & (0xFu << (4 * j))) * (s * (1.0f / float(1u << (4 * j))));
+        const float hi = float(code & (0xFu << (4 * j + 16))) * (s * (1.0f / float(1u << (4 * j + 16))));
+        simdgroup_float8x8 a;
+        FRAG_ELEMS(a) = float2(lo + bias, hi + bias);
+        simdgroup_multiply_accumulate(acc[rb], a, b[j], acc[rb]);
+      }
+    }
+  }
+  // Sum the simdgroups' partial products: rows by tokens, 8 x 8 per block.
+  QMV_N_UNROLL for (int rb = 0; rb < QMV_MMA_RB; ++rb)
+    simdgroup_store(acc[rb], partial + (int(sg) * QMV_MMA_RB + rb) * 64, 8);
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  for (int i = int(tid); i < QMV_MMA_RB * 64; i += QMV_MMA_SG * 32) {
+    const int rb = i / 64, r = (i % 64) / 8, t = i % 8;
+    const int out_row = row_base + 8 * rb + r;
+    if (t >= p.n || out_row >= p.rows) continue;
+    float total = 0.0f;
+    QMV_N_UNROLL for (int g = 0; g < QMV_MMA_SG; ++g) total += partial[(g * QMV_MMA_RB + rb) * 64 + r * 8 + t];
+    y[t * p.rows + out_row] = total;
   }
 }
 
@@ -2145,6 +2248,197 @@ template LOKAHI_INSTANCE_ATTRS("attn_qk") decltype(attn_qk<float>) attn_qk<float
 template LOKAHI_INSTANCE_ATTRS("attn_qk_h") decltype(attn_qk<half>) attn_qk<half>;
 template LOKAHI_INSTANCE_ATTRS("attn_pv") decltype(attn_pv<float>) attn_pv<float>;
 template LOKAHI_INSTANCE_ATTRS("attn_pv_h") decltype(attn_pv<half>) attn_pv<half>;
+
+// ---------------------------------------------------------------------------
+// Fused prefill attention (flash attention). A threadgroup takes 32 query rows
+// of one head, 8 per simdgroup, and streams the keys those rows can see in
+// blocks of BK, keeping S = Q K^T, the online softmax and O = P V in
+// registers: no scores in memory, and the key blocks past the tile's causal
+// edge or before its window are never read, so a causal pass does about half
+// of attn_qk + attn_pv's arithmetic. Each thread of a simdgroup_matrix<T, 8, 8>
+// holds two adjacent elements of one row: row (lane / 4 & 4) + (lane / 2 % 4),
+// columns (lane / 4 & 2) * 2 + (lane % 2) * 2 + {0, 1} (checked on M1, and
+// MLX's steel attention relies on the same layout). Every fragment a thread
+// holds is therefore in the same row, the row's four threads differ in lane
+// bits 0 and 3, and the per-row max, sum and rescale take two shuffles each.
+// Takes AttnMmParams with row0 = 0 and rows = the pass.
+// ---------------------------------------------------------------------------
+
+constant constexpr int ATT_FL_Q = 32;  // query rows per threadgroup
+
+
+inline float att_fl_row_max(float v) {
+  v = max(v, simd_shuffle_xor(v, ushort(1)));
+  return max(v, simd_shuffle_xor(v, ushort(8)));
+}
+
+inline float att_fl_row_sum(float v) {
+  v += simd_shuffle_xor(v, ushort(1));
+  return v + simd_shuffle_xor(v, ushort(8));
+}
+
+// Grid (ceil(rows / 32), heads), 128 threads. KV blocks of BK keys are staged
+// as stored (half or float), BK * (D + pad) elements each for K and V.
+template <typename KV, int D, int BK>
+[[kernel]] void attn_flash(const device float* q [[buffer(0)]],
+                           const device KV* k_cache [[buffer(1)]],
+                           const device KV* v_cache [[buffer(2)]],
+                           device float* out [[buffer(3)]],
+                           constant AttnMmParams& p [[buffer(4)]],
+                           const device int* last_key [[buffer(5)]],
+                           uint2 tg [[threadgroup_position_in_grid]],
+                           uint tid [[thread_index_in_threadgroup]],
+                           uint sg [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+  constexpr int LD = D + 16 / int(sizeof(KV));  // 16 bytes of padding per staged key
+  threadgroup KV ks[BK * LD];
+  threadgroup KV vs[BK * LD];
+  const int h = int(tg.y);
+  const int kvh = h / (p.heads / p.kv_heads);
+  const int t0 = int(tg.x) * ATT_FL_Q;
+  const int t_last = min(t0 + ATT_FL_Q, p.rows) - 1;
+  // This thread's row and first column within every 8x8 fragment.
+  const int fm = int((lane / 4) & 4) + int((lane / 2) % 4);
+  const int fn = int((lane / 4) & 2) * 2 + int(lane % 2) * 2;
+  const int t = t0 + int(sg) * 8 + fm;  // query row within the pass
+  const bool row_ok = t < p.rows;
+  const int qpos = p.start_pos + t;
+  const int lo = qpos - p.window + 1;  // first key the row may see
+  const int hi = p.has_last_key != 0 && row_ok ? max(qpos, last_key[t]) : qpos;
+
+  // The tile's key range: from its first row's window start to its furthest key.
+  int tile_hi = p.start_pos + t_last;
+  if (p.has_last_key != 0) tile_hi = max(tile_hi, simd_max(t0 + int(lane) <= t_last ? last_key[t0 + int(lane)] : 0));
+  tile_hi = min(tile_hi, p.key_base + p.keys - 1);
+  const int tile_lo = max(p.key_base, p.start_pos + t0 - p.window + 1);
+
+  // Q, prescaled so the scores come out in log2 units (softcap applies the
+  // log2 factor after its tanh instead).
+  const float q_scale = p.softcap > 0.0f ? p.scale : p.scale * M_LOG2E_F;
+  simdgroup_float8x8 qf[D / 8];
+  simdgroup_float8x8 o[D / 8];
+  const device float* qrow = q + (size_t(row_ok ? t : 0) * size_t(p.heads) + size_t(h)) * D + fn;
+  ATT_MM_UNROLL for (int d = 0; d < D / 8; ++d) {
+    const float2 v = row_ok ? *reinterpret_cast<const device float2*>(qrow + 8 * d) : float2(0.0f);
+    FRAG_ELEMS(qf[d]) = v * q_scale;
+    o[d] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  }
+  float m = -INFINITY;  // running max (log2 units) and sum of this thread's row
+  float l = 0.0f;
+
+  for (int kb = tile_lo; kb <= tile_hi; kb += BK) {
+    // Stage keys kb ... kb + BK - 1 from their ring slots; zeros past tile_hi.
+    const int slot0 = kb % p.capacity;
+    ATT_MM_UNROLL for (int i = int(tid); i < BK * D / 4; i += 128) {
+      const int r = i / (D / 4);
+      const int c = (i % (D / 4)) * 4;
+      vec<KV, 4> kv4 = vec<KV, 4>(KV(0));
+      vec<KV, 4> vv4 = vec<KV, 4>(KV(0));
+      if (kb + r <= tile_hi) {
+        int slot = slot0 + r;
+        if (slot >= p.capacity) slot -= p.capacity;
+        const size_t at = (size_t(kvh) * size_t(p.capacity) + size_t(slot)) * D + c;
+        kv4 = *reinterpret_cast<const device vec<KV, 4>*>(k_cache + at);
+        vv4 = *reinterpret_cast<const device vec<KV, 4>*>(v_cache + at);
+      }
+      *reinterpret_cast<threadgroup vec<KV, 4>*>(ks + r * LD + c) = kv4;
+      *reinterpret_cast<threadgroup vec<KV, 4>*>(vs + r * LD + c) = vv4;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    simdgroup_float8x8 s[BK / 8];
+    ATT_MM_UNROLL for (int j = 0; j < BK / 8; ++j) s[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    ATT_MM_UNROLL for (int d = 0; d < D / 8; ++d) {
+      ATT_MM_UNROLL for (int j = 0; j < BK / 8; ++j) {
+        simdgroup_matrix<KV, 8, 8> kf;
+        simdgroup_load(kf, ks + 8 * j * LD + 8 * d, LD, ulong2(0, 0), true);
+        simdgroup_multiply_accumulate(s[j], qf[d], kf, s[j]);
+      }
+    }
+
+    // Soft-cap and mask, then the online softmax update of this row.
+    // A block every row of the tile sees in full needs no mask.
+    const bool full = kb + BK - 1 <= min(p.start_pos + t0, tile_hi) && kb >= p.start_pos + t_last - p.window + 1;
+    float block_max = -INFINITY;
+    ATT_MM_UNROLL for (int j = 0; j < BK / 8; ++j) {
+      thread float2& e = FRAG_ELEMS(s[j]);
+      if (p.softcap > 0.0f) {
+        e.x = precise::tanh(e.x / p.softcap) * p.softcap * M_LOG2E_F;
+        e.y = precise::tanh(e.y / p.softcap) * p.softcap * M_LOG2E_F;
+      }
+      if (!full) {
+        const int key = kb + 8 * j + fn;
+        e.x = key >= lo && key <= hi ? e.x : -INFINITY;
+        e.y = key + 1 >= lo && key + 1 <= hi ? e.y : -INFINITY;
+      }
+      block_max = max(block_max, max(e.x, e.y));
+    }
+    const float m_new = max(m, att_fl_row_max(block_max));
+    const float m_ref = m_new == -INFINITY ? 0.0f : m_new;  // a row with no key yet keeps zeros
+    const float factor = fast::exp2(m - m_ref);
+    float block_sum = 0.0f;
+    ATT_MM_UNROLL for (int j = 0; j < BK / 8; ++j) {
+      thread float2& e = FRAG_ELEMS(s[j]);
+      e.x = fast::exp2(e.x - m_ref);
+      e.y = fast::exp2(e.y - m_ref);
+      block_sum += e.x + e.y;
+    }
+    l = l * factor + att_fl_row_sum(block_sum);
+    m = m_new;
+    ATT_MM_UNROLL for (int d = 0; d < D / 8; ++d) FRAG_ELEMS(o[d]) *= factor;
+    ATT_MM_UNROLL for (int j = 0; j < BK / 8; ++j) {
+      ATT_MM_UNROLL for (int d = 0; d < D / 8; ++d) {
+        simdgroup_matrix<KV, 8, 8> vf;
+        simdgroup_load(vf, vs + 8 * j * LD + 8 * d, LD);
+        simdgroup_multiply_accumulate(o[d], s[j], vf, o[d]);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  if (!row_ok) return;
+  const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+  device float* orow = out + (size_t(t) * size_t(p.heads) + size_t(h)) * D + fn;
+  ATT_MM_UNROLL for (int d = 0; d < D / 8; ++d)
+    *reinterpret_cast<device float2*>(orow + 8 * d) = FRAG_ELEMS(o[d]) * inv;
+}
+
+#define LOKAHI_ATTN_FLASH(D, BK_H, BK_F)                                                           \
+  template LOKAHI_INSTANCE_ATTRS("attn_flash_d" #D "_h")                                          \
+  decltype(attn_flash<half, D, BK_H>) attn_flash<half, D, BK_H>;                                    \
+  template LOKAHI_INSTANCE_ATTRS("attn_flash_d" #D) decltype(attn_flash<float, D, BK_F>) attn_flash<float, D, BK_F>;
+// Key blocks keep K and V staging within 32 KB of threadgroup memory; on M1,
+// 16 keys beat 32 at 128-wide heads and 8 beat 16 at 256-wide heads, where
+// Q and O already fill the registers.
+LOKAHI_ATTN_FLASH(64, 32, 32)
+LOKAHI_ATTN_FLASH(128, 16, 16)
+LOKAHI_ATTN_FLASH(256, 8, 8)
+
+// One simdgroup writes, per lane, the two elements thread_elements() holds of
+// a loaded 8x8 matrix (element r * 8 + c holds r * 8 + c) and of its product
+// with the identity, so the host can check the fragment layout attn_flash
+// assumes before using it on this GPU.
+kernel void simdgroup_layout_probe(device float* out [[buffer(0)]], uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float m[64];
+  threadgroup float eye[64];
+  for (uint i = lane; i < 64; i += 32) {
+    m[i] = float(i);
+    eye[i] = i / 8 == i % 8 ? 1.0f : 0.0f;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  simdgroup_float8x8 a;
+  simdgroup_float8x8 e;
+  simdgroup_load(a, m, 8);
+  simdgroup_load(e, eye, 8);
+  simdgroup_float8x8 p = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  simdgroup_multiply_accumulate(p, e, a, p);
+  const float2 la = FRAG_ELEMS(a);
+  const float2 lp = FRAG_ELEMS(p);
+  out[lane * 4 + 0] = la.x;
+  out[lane * 4 + 1] = la.y;
+  out[lane * 4 + 2] = lp.x;
+  out[lane * 4 + 3] = lp.y;
+}
 
 struct ReduceParams {
   int heads;

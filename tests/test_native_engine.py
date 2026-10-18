@@ -324,6 +324,41 @@ def test_logits_match_oracle(native_cli, fixture_model, backend, prefill, chunk,
     np.testing.assert_array_equal(got.argmax(axis=1), expected.argmax(axis=1))
 
 
+def _write_named(directory: Path, name: str):
+    if name in GEMMA3_VARIANTS:
+        write_tiny_gemma3(directory, GEMMA3_VARIANTS[name])
+        return Gemma3Reference.load(directory)
+    if name in GEMMA4_VARIANTS:
+        write_tiny_gemma4(directory, GEMMA4_VARIANTS[name])
+        return Gemma4Reference.load(directory)
+    write_tiny_dense(directory, DENSE_VARIANTS[name])
+    return LlamaFamilyReference.load(directory)
+
+
+# Prompts long enough for Metal's fused prefill attention (attn_flash) to run
+# several 32-row tiles, a partial last tile, passes that start past position 0
+# (chunks of 33) and sliding windows whose rings wrap, at 64-, 128- and
+# 256-wide heads. The 2% tolerance above misses a 1% error in attention's
+# output (it moved these logits by 0.6% of their scale); the paths measured
+# 2e-5 to 6.5e-4 of it (correctness evidence).
+@pytest.mark.parametrize("backend", _backends())
+@pytest.mark.parametrize("chunk", [512, 33])
+@pytest.mark.parametrize("name", ["llama3-tied-rope-llama3", "qwen3-qk-norm-hd128", "gemma3-tied-hd256-rope-scaled",
+                                  "mistral-sliding-untied", "gemma4-e2b-shape"])
+def test_long_prefill_matches_oracle_closely(native_cli, name, backend, chunk, tmp_path):
+    oracle = _write_named(tmp_path / "model", name)
+    tokens = (TOKENS * 4)[:80]
+    out = tmp_path / "logits.bin"
+    report = _run(native_cli, "logits", "--model", str(tmp_path / "model"), "--backend", backend,
+                  "--tokens", ",".join(map(str, tokens)), "--prefill", str(len(tokens) - 2),
+                  "--prefill-chunk", str(chunk), "--out", str(out))
+    got = np.fromfile(out, dtype=np.float32).reshape(report["rows"], oracle.config.vocab_size)
+    expected = oracle.logits(tokens)[len(tokens) - 3 :]
+    tolerance = 2e-4 if backend == "cpu" else 2e-3
+    np.testing.assert_allclose(got, expected, atol=tolerance * np.abs(expected).max(), rtol=0)
+    np.testing.assert_array_equal(got.argmax(axis=1), expected.argmax(axis=1))
+
+
 def _latent(directory: Path) -> bool:
     config = json.loads((directory / "config.json").read_text())
     text = config.get("text_config") or config
