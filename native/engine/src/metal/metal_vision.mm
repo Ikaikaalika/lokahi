@@ -34,6 +34,11 @@ struct ElementwiseParams { int count; };
 struct PoolParams { int cols; int side; int tokens_side; };
 struct GluMulParams { int count; int silu; };
 struct WindowAttentionParams { int dim; int stride; int hidden; float scale; };
+struct SplitHeadsParams { int heads; int dim; int stride; int rows; };
+struct AttnMmParams {
+  int heads; int kv_heads; int head_dim; int start_pos; int row0; int rows; int key_base; int keys; int window;
+  int capacity; float scale; float softcap; int has_last_key; int head_rows; int block_keys; int has_bounds;
+};
 constexpr int kMaxWindowKeys = 1024;  // as decoder_kernels.metal
 // One page of the placeholder buffer bound for unused optional inputs.
 constexpr size_t kDummyBytes = 16384;
@@ -66,6 +71,7 @@ class MetalKit {
     LK_CHECK(device_ != nil, "metal: no Metal device");
     queue_ = [device_ newCommandQueue];
     library_ = compile_kernels(device_);
+    check_fragment_layout(device_, queue_, library_);
     // Bound where a kernel's optional input is unused, and filled with NaN so
     // a kernel that reads it anyway (a bias flagged present but nil) fails
     // every check instead of adding whatever the recycled page held.
@@ -668,6 +674,11 @@ class Qwen35VisionMetal final : public Qwen35VisionEncoder, private MetalKit {
     h_ = private_buffer(n * hidden * f);
     qkv_ = private_buffer(n * 3 * hidden * f);
     attn_ = private_buffer(n * hidden * f);
+    if (flash()) {  // attn_flash's layouts of q, k and v
+      q_heads_ = private_buffer(n * hidden * f);
+      k_heads_ = private_buffer(n * hidden * f);
+      v_heads_ = private_buffer(n * hidden * f);
+    }
     f_ = private_buffer(n * static_cast<size_t>(c.intermediate_size) * f);
     if (c.qwen2_5()) {
       up_ = private_buffer(n * static_cast<size_t>(c.intermediate_size) * f);
@@ -740,7 +751,7 @@ class Qwen35VisionMetal final : public Qwen35VisionEncoder, private MetalKit {
     const GpuMatrix fused{qkv_, "f32"};
     const int pass_rows = score_rows(N);
     const size_t scores = static_cast<size_t>(pass_rows) * static_cast<size_t>(N);
-    if (scores > score_capacity_) {
+    if (!flash() && scores > score_capacity_) {
       scores_ = private_buffer(scores * sizeof(float));
       score_capacity_ = scores;
     }
@@ -751,7 +762,30 @@ class Qwen35VisionMetal final : public Qwen35VisionEncoder, private MetalKit {
       rope(enc, 0, N);
       rope(enc, 1, N);
       const bool global = !c.qwen2_5() || std::binary_search(c.full_attention.begin(), c.full_attention.end(), index);
-      if (!global) {  // each patch over its window's rows, every head at once
+      if (flash()) {
+        // attn_flash over all heads: every patch over every patch (its rows
+        // placed at the last position so they see every key), or over its
+        // window's rows, which run consecutively (window_'s bounds).
+        [enc setComputePipelineState:pipeline("split_qkv_heads")];
+        [enc setBuffer:qkv_ offset:0 atIndex:0];
+        [enc setBuffer:q_heads_ offset:0 atIndex:1];
+        [enc setBuffer:k_heads_ offset:0 atIndex:2];
+        [enc setBuffer:v_heads_ offset:0 atIndex:3];
+        bytes(enc, SplitHeadsParams{heads, D, stride, N}, 4);
+        [enc dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(hidden), static_cast<NSUInteger>(N), 1)
+            threadsPerThreadgroup:MTLSizeMake(64, 4, 1)];
+        [enc setComputePipelineState:pipeline("attn_flash_d" + std::to_string(D))];
+        [enc setBuffer:q_heads_ offset:0 atIndex:0];
+        [enc setBuffer:k_heads_ offset:0 atIndex:1];
+        [enc setBuffer:v_heads_ offset:0 atIndex:2];
+        [enc setBuffer:attn_ offset:0 atIndex:3];
+        bytes(enc, AttnMmParams{heads, heads, D, N - 1, 0, N, 0, N, 1 << 30, N, scale, 0.0f, 0, 0, 0, global ? 0 : 1}, 4);
+        [enc setBuffer:(global ? dummy_ : window_) offset:0 atIndex:5];
+        [enc setBuffer:dummy_ offset:0 atIndex:6];
+        [enc setBuffer:dummy_ offset:0 atIndex:7];
+        [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((N + 31) / 32), static_cast<NSUInteger>(heads), 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      } else if (!global) {  // each patch over its window's rows, every head at once
         [enc setComputePipelineState:pipeline("window_attention")];
         [enc setBuffer:qkv_ offset:0 atIndex:0];
         [enc setBuffer:window_ offset:0 atIndex:1];
@@ -760,10 +794,9 @@ class Qwen35VisionMetal final : public Qwen35VisionEncoder, private MetalKit {
         [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(heads), static_cast<NSUInteger>(N), 1)
             threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
       }
-      // Otherwise every patch sees every patch, one head and up to
-      // pass_rows query rows at a time through scores_ [pass_rows, N]; each
-      // qkv_ row is [q | k | v].
-      for (int head = 0; global && head < heads; ++head) {
+      // Without it, one head and up to pass_rows query rows at a time
+      // through scores_ [pass_rows, N]; each qkv_ row is [q | k | v].
+      for (int head = 0; global && !flash() && head < heads; ++head) {
         const size_t column = static_cast<size_t>(head) * D;
         for (int first = 0; first < N; first += pass_rows) {
           const int count = std::min(pass_rows, N - first);
@@ -806,6 +839,13 @@ class Qwen35VisionMetal final : public Qwen35VisionEncoder, private MetalKit {
     merge(enc, merger_, true, features_, N);
   }
 
+  // Whether full attention runs as attn_flash (the head widths it is built
+  // for), else through scores_.
+  bool flash() const {
+    const int D = config().head_dim();
+    return D == 32 || D == 64 || D == 72 || D == 80 || D == 128;
+  }
+
   // The query rows of each attention pass over N patches.
   int score_rows(int N) const {
     const size_t budget = std::max<size_t>(32, kScoreBudget / static_cast<size_t>(N));
@@ -838,6 +878,7 @@ class Qwen35VisionMetal final : public Qwen35VisionEncoder, private MetalKit {
   id<MTLBuffer> patches_ = nil, x_ = nil, cos_ = nil, sin_ = nil;
   id<MTLBuffer> h_ = nil, qkv_ = nil, attn_ = nil, f_ = nil, scores_ = nil, merged_ = nil, features_ = nil;
   id<MTLBuffer> up_ = nil, window_ = nil;  // Qwen2.5-VL: the MLP's up rows, each slot's window bounds
+  id<MTLBuffer> q_heads_ = nil, k_heads_ = nil, v_heads_ = nil;  // flash(): q, k and v as attn_flash reads them
   int attention_rows_ = 0;     // set_attention_rows; 0: kScoreBudget's share
   size_t score_capacity_ = 0;  // floats scores_ holds
 };
