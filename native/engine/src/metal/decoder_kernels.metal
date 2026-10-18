@@ -1833,6 +1833,11 @@ struct MlaRopeParams {
   float eps;
   int pairs;
   float factor;
+  // A batched decode (qk_norm_rope_store's batched): row t is sequence
+  // rows[t].x's token at position rows[t].y, in that sequence's slot of the
+  // cache (capacity positions).
+  int capacity;
+  int batched;
 };
 
 inline void rope_latent(const device float* src, device float* dst, int dims, int pos, int pairs, float factor,
@@ -1858,6 +1863,7 @@ kernel void mla_rope_store(const device float* q [[buffer(0)]],
                            const device float* kv_norm [[buffer(4)]],
                            const device float* inv_freq [[buffer(5)]],
                            constant MlaRopeParams& p [[buffer(6)]],
+                           const device int4* rows [[buffer(7)]],
                            uint2 tgp [[threadgroup_position_in_grid]],
                            uint2 tid2 [[thread_position_in_threadgroup]],
                            uint2 tpg2 [[threads_per_threadgroup]],
@@ -1868,8 +1874,9 @@ kernel void mla_rope_store(const device float* q [[buffer(0)]],
   const uint tpg = tpg2.x;
   const int g = int(tgp.x);
   const int t = int(tgp.y);
-  const int pos = p.start_pos + t;
+  const int pos = p.batched != 0 ? rows[t].y : p.start_pos + t;
   const int width = p.rank + p.rope;
+  if (p.batched != 0) cache += size_t(rows[t].x) * size_t(p.capacity) * size_t(width);
   if (g < p.heads) {  // uniform across the threadgroup
     const int row = t * p.heads + g;
     rope_latent(q + row * (p.nope + p.rope) + p.nope, latent_q + row * width + p.rank, p.rope, pos, p.pairs,
@@ -2100,6 +2107,79 @@ kernel void gdn_recurrence(const device float* mixed [[buffer(0)]],
     if (lane == 0) out[(t * hv + h) * p.value_dim + j] = read;
   }
   for (int r = 0; r < rows; ++r) state_out[column + lane + 32 * r] = s[r];
+}
+
+// A batched decode's conv: row t is one token of sequence rows[t].x, whose
+// history slot ((taps - 1) x C floats) its position reads in history0 or
+// history1 (rows[t].w) and writes in the other. Grid: (C, rows) threads.
+kernel void gdn_conv_rows(device float* mixed [[buffer(0)]],
+                          const device float* taps [[buffer(1)]],
+                          device float* history0 [[buffer(2)]],
+                          device float* history1 [[buffer(3)]],
+                          constant GdnConvParams& p [[buffer(4)]],
+                          const device int4* rows [[buffer(5)]],
+                          uint2 gid [[thread_position_in_grid]]) {
+  const int c = int(gid.x), t = int(gid.y), C = p.channels, K = p.taps;
+  if (c >= C || t >= p.n) return;
+  const size_t slot = size_t(rows[t].x) * size_t(K - 1) * size_t(C);
+  const bool from0 = rows[t].w == 0;
+  const device float* history_in = (from0 ? history0 : history1) + slot;
+  device float* history_out = (from0 ? history1 : history0) + slot;
+  float window[GDN_MAX_TAPS];
+  for (int k = 0; k < K - 1; ++k) window[k] = history_in[k * C + c];
+  const float x = mixed[t * C + c];
+  float sum = taps[c * K + K - 1] * x;
+  for (int k = 0; k < K - 1; ++k) sum += taps[c * K + k] * window[k];
+  mixed[t * C + c] = silu(sum);
+  for (int k = 0; k + 1 < K - 1; ++k) history_out[k * C + c] = window[k + 1];
+  if (K > 1) history_out[(K - 2) * C + c] = x;
+}
+
+// gdn_recurrence for a batched decode: row t is one token of sequence
+// rows[t].x, whose state slot (Hv x dv x dk floats) its position reads in
+// state0 or state1 (rows[t].w) and writes in the other. Grid: threadgroups
+// (ceil(dv / 4), Hv, rows) of 4 simdgroups.
+kernel void gdn_recurrence_rows(const device float* mixed [[buffer(0)]],
+                                const device float* beta [[buffer(1)]],
+                                const device float* decay [[buffer(2)]],
+                                device float* state0 [[buffer(3)]],
+                                device float* state1 [[buffer(4)]],
+                                device float* out [[buffer(5)]],
+                                constant GdnRecurrenceParams& p [[buffer(6)]],
+                                const device int4* rows [[buffer(7)]],
+                                uint3 tgp [[threadgroup_position_in_grid]],
+                                uint sg [[simdgroup_index_in_threadgroup]],
+                                uint lane [[thread_index_in_simdgroup]]) {
+  const int j = int(tgp.x) * GDN_SIMDGROUPS + int(sg), h = int(tgp.y), t = int(tgp.z);
+  if (j >= p.value_dim) return;  // uniform across the simdgroup
+  const int dk = p.key_dim, hv = p.value_heads;
+  const int kh = h / (hv / p.key_heads);
+  const int count = (dk - int(lane) + 31) / 32;  // this lane's rows: lane, lane + 32, ...
+  const size_t slot = size_t(rows[t].x) * size_t(hv) * size_t(p.value_dim) * size_t(dk);
+  const bool from0 = rows[t].w == 0;
+  const size_t column = slot + (size_t(h) * p.value_dim + j) * dk;
+  const device float* state_in = (from0 ? state0 : state1) + column;
+  device float* state_out = (from0 ? state1 : state0) + column;
+  const device float* row = mixed + t * p.channels;
+  const device float* q = row + kh * dk;
+  const device float* k = row + (p.key_heads + kh) * dk;
+  const float v = row[2 * p.key_heads * dk + h * p.value_dim + j];
+  const float g = decay[t * hv + h], bt = beta[t * hv + h];
+  float s[GDN_MAX_ROWS];
+  float memory = 0.0f;
+  for (int r = 0; r < count; ++r) {
+    s[r] = state_in[lane + 32 * r] * g;
+    memory += s[r] * k[lane + 32 * r];
+  }
+  const float delta = (v - simd_sum(memory)) * bt;
+  float read = 0.0f;
+  for (int r = 0; r < count; ++r) {
+    s[r] += k[lane + 32 * r] * delta;
+    read += s[r] * q[lane + 32 * r];
+  }
+  read = simd_sum(read);
+  if (lane == 0) out[(t * hv + h) * p.value_dim + j] = read;
+  for (int r = 0; r < count; ++r) state_out[lane + 32 * r] = s[r];
 }
 
 // gdn_recurrence's rule over a long pass in chunks of 8 tokens on simdgroup
