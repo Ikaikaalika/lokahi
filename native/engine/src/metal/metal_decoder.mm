@@ -215,6 +215,7 @@ struct MoeRouteParams {
 };
 struct GatherParams { int rows; int cols; int k; int input_rows; int act; int has_bias; float limit; int x_stride; int y_stride; };
 struct MoeSortParams { int pairs; int experts; };
+struct HeadTilesParams { int n; int heads; };
 // From this many tokens, a pass's experts run grouped by expert (moe_sort,
 // moe_qmm) instead of one matrix-vector product per (token, slot) pair.
 constexpr int kMoeGroupedMinTokens = 16;
@@ -1015,6 +1016,9 @@ class DecoderMetal final : public Model {
       latent_q_ = private_buffer(chunk * H * width * f);
       latent_out_ = private_buffer(chunk * H * width * f);
       if (c_.q_lora_rank > 0) q_latent_ = private_buffer(chunk * static_cast<size_t>(c_.q_lora_rank) * f);
+      head_order_ = private_buffer(chunk * H * sizeof(int32_t));
+      head_tiles_ = private_buffer(H * ((chunk + 31) / 32) * 4 * sizeof(int32_t));
+      head_tile_count_ = private_buffer(sizeof(int32_t));
       // Each (token, head) pair's head, the expert index of the per-head
       // gathered kernels.
       head_index_ = shared_buffer(chunk * H * sizeof(int32_t));
@@ -1695,16 +1699,7 @@ class DecoderMetal final : public Model {
     const int H = c_.num_heads, nope = c_.qk_nope_dim, rank = c_.kv_lora_rank, width = c_.latent_width();
     const NSUInteger pairs = static_cast<NSUInteger>(n * H);
     if (G.absorbed) {
-      [enc setComputePipelineState:quant_pipeline("qmv_gather", G.embed_q.format())];
-      bind(enc, G.embed_q.words, 0);
-      bind(enc, G.embed_q.scales, 1);
-      bind(enc, G.embed_q.biases, 2);
-      bind(enc, q_, 0, 3);
-      bind(enc, latent_q_, 0, 4);
-      bytes(enc, GatherParams{rank, nope, 1, 0, 0, 0, 0.0f, c_.head_dim, width}, 5);
-      bind(enc, head_index_, 0, 6);
-      bind(enc, placeholder_, 7);
-      [enc dispatchThreadgroups:MTLSizeMake(qmv_groups(rank), pairs, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+      encode_per_head(enc, G.embed_q, q_, latent_q_, GatherParams{rank, nope, 1, 0, 0, 0, 0.0f, c_.head_dim, width}, n);
       return;
     }
     id<MTLComputePipelineState> pso = quant_pipeline("qmv_t_heads", G.kv_b);
@@ -1718,6 +1713,57 @@ class DecoderMetal final : public Model {
     const NSUInteger threads =
         std::min<NSUInteger>((units + 31) / 32 * 32, std::min<NSUInteger>(256, [pso maxTotalThreadsPerThreadgroup] / 32 * 32));
     [enc dispatchThreadgroups:MTLSizeMake(pairs, 1, 1) threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+  }
+
+  // Whether moe_qmm can take a stacked matrix: it steps K 32 codes at a time
+  // within one group.
+  static bool groupable(const GpuExperts& w) { return w.cols % 32 == 0 && w.group % 32 == 0; }
+
+  // Per-head matrices over a pass's (token, head) pairs: one matrix-vector
+  // product per pair for short passes (qmv_gather with head_index_), else
+  // grouped by head (head_tiles, moe_qmm), so each head's matrix is read
+  // once per 32 tokens rather than once per token.
+  void encode_per_head(id<MTLComputeCommandEncoder> enc, const GpuExperts& w, id<MTLBuffer> x, id<MTLBuffer> y,
+                       const GatherParams& params, int n) {
+    const int H = c_.num_heads;
+    if (n < kMoeGroupedMinTokens || !groupable(w)) {
+      [enc setComputePipelineState:quant_pipeline("qmv_gather", w.format())];
+      bind(enc, w.words, 0);
+      bind(enc, w.scales, 1);
+      bind(enc, w.biases, 2);
+      bind(enc, x, 0, 3);
+      bind(enc, y, 0, 4);
+      bytes(enc, params, 5);
+      bind(enc, head_index_, 0, 6);
+      bind(enc, placeholder_, 7);
+      [enc dispatchThreadgroups:MTLSizeMake(qmv_groups(params.rows), static_cast<NSUInteger>(n * H), 1)
+          threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+      return;
+    }
+    const int tiles = H * ((n + 31) / 32);
+    [enc setComputePipelineState:pipeline("head_tiles")];
+    bind(enc, head_order_, 0, 0);
+    bind(enc, head_tiles_, 0, 1);
+    bind(enc, head_tile_count_, 0, 2);
+    bytes(enc, HeadTilesParams{n, H}, 3);
+    encode_elementwise(enc, std::max(n * H, tiles));
+    [enc setComputePipelineState:quant_pipeline("moe_qmm", w.format())];
+    for (int i = 0; i < 2; ++i) {  // buffers 3-5 (GLU's up) are unused
+      bind(enc, w.words, 3 * i);
+      bind(enc, w.scales, 3 * i + 1);
+      bind(enc, w.biases, 3 * i + 2);
+    }
+    bind(enc, x, 0, 6);
+    bind(enc, y, 0, 7);
+    bytes(enc, params, 8);
+    bind(enc, head_order_, 0, 9);
+    bind(enc, head_tiles_, 0, 10);
+    bind(enc, head_tile_count_, 0, 11);
+    bind(enc, placeholder_, 12);
+    bind(enc, placeholder_, 13);
+    [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((params.rows + 31) / 32),
+                                          static_cast<NSUInteger>(tiles), 1)
+        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
   }
 
   // RoPE on the rope queries (into latent_q_[t, h, rank:]) and the pass's
@@ -1743,6 +1789,21 @@ class DecoderMetal final : public Model {
   void encode_latent_attention(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n, int start) {
     constexpr int kHeadsPerGroup = 4;
     const int H = c_.num_heads, width = c_.latent_width();
+    // A long pass on simdgroup matrices: attn_flash with values the first
+    // kv_lora_rank of the latents, four simdgroups per 8 query rows.
+    const bool flash_shape = (width == 576 && c_.kv_lora_rank == 512) || (width == 96 && c_.kv_lora_rank == 64);
+    if (fragments_ && n >= kAttnMmMinRows && flash_shape) {
+      [enc setComputePipelineState:pipeline("attn_flash_mla_" + std::to_string(width))];
+      bind(enc, latent_q_, 0, 0);
+      bind(enc, G.k_cache, 0, 1);
+      bind(enc, G.k_cache, 0, 2);
+      bind(enc, latent_out_, 0, 3);
+      bytes(enc, AttnMmParams{H, 1, width, start, 0, n, 0, start + n, 1 << 30, G.capacity, c_.attn_scale, 0.0f, 0}, 4);
+      bind(enc, placeholder_, 5);
+      [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((n + 31) / 32), static_cast<NSUInteger>(H), 1)
+          threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+      return;
+    }
     const int keys_max = start + n;
     const int max_blocks = n == 1 ? kDecodeMaxBlocks : kPrefillMaxBlocks;
     const int block = std::max(n == 1 ? 32 : 64, (keys_max + max_blocks - 1) / max_blocks);
@@ -1774,17 +1835,8 @@ class DecoderMetal final : public Model {
   // v_head_dim], then o_proj into r_.
   void encode_latent_out(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n) {
     const int V = c_.v_head_dim;
-    [enc setComputePipelineState:quant_pipeline("qmv_gather", G.unembed_out.format())];
-    bind(enc, G.unembed_out.words, 0);
-    bind(enc, G.unembed_out.scales, 1);
-    bind(enc, G.unembed_out.biases, 2);
-    bind(enc, latent_out_, 0, 3);
-    bind(enc, attn_, 0, 4);
-    bytes(enc, GatherParams{V, c_.kv_lora_rank, 1, 0, 0, 0, 0.0f, c_.latent_width(), 0}, 5);
-    bind(enc, head_index_, 0, 6);
-    bind(enc, placeholder_, 7);
-    [enc dispatchThreadgroups:MTLSizeMake(qmv_groups(V), static_cast<NSUInteger>(n * c_.num_heads), 1)
-        threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    encode_per_head(enc, G.unembed_out, latent_out_, attn_,
+                    GatherParams{V, c_.kv_lora_rank, 1, 0, 0, 0, 0.0f, c_.latent_width(), 0}, n);
     encode_qmm(enc, G.o, attn_, n, r_);
   }
 
@@ -1964,7 +2016,7 @@ class DecoderMetal final : public Model {
     const int K = c_.experts_per_token;
     const int act = c_.activation == Activation::ClampedSwiglu ? 2 : c_.activation == Activation::Silu ? 1 : 0;
     const int has_bias = c_.expert_bias ? 1 : 0;
-    if (n >= kMoeGroupedMinTokens) {
+    if (n >= kMoeGroupedMinTokens && groupable(G.expert_gate) && groupable(G.expert_down)) {
       encode_experts_grouped(enc, G, n, input, act, has_bias);
     } else {
       encode_experts_per_pair(enc, G, n, input, act, has_bias);
@@ -2395,6 +2447,8 @@ class DecoderMetal final : public Model {
   // weights [chunk, K], and each slot's expert activations and outputs.
   id<MTLBuffer> route_ = nil, chosen_ = nil, expert_weights_ = nil, expert_hidden_ = nil, expert_out_ = nil;
   id<MTLBuffer> moe_order_ = nil, moe_tiles_ = nil, moe_tile_count_ = nil;
+  // head_tiles' pair order and tiles for latent attention's per-head matrices.
+  id<MTLBuffer> head_order_ = nil, head_tiles_ = nil, head_tile_count_ = nil;
   // Host copies of expert stacks, alive until the arena has copied them.
   std::deque<std::vector<uint8_t>> staged_;
   std::vector<std::pair<GpuExperts*, std::array<size_t, 3>>> expert_fix_;
