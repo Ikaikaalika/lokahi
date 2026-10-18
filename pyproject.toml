@@ -7,10 +7,15 @@ name = "strata-llm"
 version = "0.5.0"
 description = "Memory-tiered LLM inference for Apple Silicon"
 authors = [
-  { name="Anuar Sharafudinov", email="anuarsh@ailabs.us" }
+  { name="Common Compute LLC", email="support@commoncompute.ai" }
 ]
 readme = "README.md"
 license = { file="LICENSE" }
+classifiers = [
+  "License :: Free for non-commercial use",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3",
+]
 requires-python = ">=3.10"
 dependencies = [
     "numpy",
