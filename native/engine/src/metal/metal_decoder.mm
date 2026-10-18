@@ -226,6 +226,10 @@ struct AttnParams {
   int heads; int kv_heads; int head_dim; int start_pos; int window; int capacity; int block; int n_blocks;
   float scale; float softcap; int has_last_key; int groups_per_kv;
 };
+struct AttnMmParams {
+  int heads; int kv_heads; int head_dim; int start_pos; int row0; int rows; int key_base; int keys; int window;
+  int capacity; float scale; float softcap; int has_last_key;
+};
 struct ReplaceParams { int cols; int n; };
 struct ReduceParams { int heads; int head_dim; int n_blocks; int has_sinks; };
 struct BiasParams { int cols; int count; };
@@ -249,6 +253,10 @@ SampleParams sample_params(const SamplingParams& sp, int vocab, int history_inde
 
 constexpr int kDecodeMaxBlocks = 64;
 constexpr int kPrefillMaxBlocks = 8;
+// Passes of at least this many tokens attend on simdgroup matrices (attn_qk,
+// softmax_rows, attn_pv), their scores held in at most this many floats.
+constexpr int kAttnMmMinRows = 16;
+constexpr size_t kAttnScoresBudget = size_t{1} << 24;
 constexpr int kInflightSteps = 2;
 
 class DecoderMetal final : public Model {
@@ -1471,6 +1479,10 @@ class DecoderMetal final : public Model {
     const int window = G.sliding ? c_.sliding_window : (1 << 30);
     // Image blocks let a query also see up to plan_.reach later keys.
     const bool blocks = !plan_.empty() && plan_.reach > 0 && c_.image_blocks_apply(G.sliding);
+    if (n >= kAttnMmMinRows && G.head_dim % 64 == 0 && !c_.attention_sinks &&
+        encode_attention_mm(enc, G, n, start, window, blocks)) {
+      return;
+    }
     const int keys_max = std::min(window + (blocks ? plan_.reach : 0), start + n);  // the most keys a query sees
     const int max_blocks = n == 1 ? kDecodeMaxBlocks : kPrefillMaxBlocks;
     const int min_block = n == 1 ? 32 : 64;
@@ -1501,6 +1513,54 @@ class DecoderMetal final : public Model {
     bind(enc, G.sinks, 4);
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(c_.num_heads), static_cast<NSUInteger>(n), 1)
         threadsPerThreadgroup:MTLSizeMake(static_cast<NSUInteger>(G.head_dim), 1, 1)];
+  }
+
+  // A long pass's attention as S = Q K^T, softmax, P V on simdgroup matrices,
+  // over query rows in sub-passes whose scores fit kAttnScoresBudget; false
+  // (leaving attn_partial to it) when 64 rows would not.
+  bool encode_attention_mm(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n, int start, int window,
+                           bool blocks) {
+    const int H = c_.num_heads, D = G.head_dim;
+    const int key_base = std::max(0, start - window + 1);  // the earliest key any row of the pass sees
+    const int keys = start + n - key_base;
+    const size_t per_row = static_cast<size_t>(H) * static_cast<size_t>(keys);
+    const int fit = static_cast<int>(std::min<size_t>(kAttnScoresBudget / per_row, static_cast<size_t>(n)));
+    const int sub = fit >= n ? n : fit / 64 * 64;
+    if (sub < std::min(n, 64)) return false;
+    const size_t scores_bytes = per_row * static_cast<size_t>(sub) * sizeof(float);
+    if (attn_scores_bytes_ < scores_bytes) {
+      attn_scores_ = private_buffer(scores_bytes);
+      attn_scores_bytes_ = scores_bytes;
+    }
+    const std::string kv = kv_f16_ ? "_h" : "";
+    for (int row0 = 0; row0 < n; row0 += sub) {
+      const int rows = std::min(sub, n - row0);
+      const AttnMmParams params{H, G.kv_heads, D, start, row0, rows, key_base, keys, window, G.capacity,
+                                c_.attn_scale, c_.attn_logit_softcapping, blocks ? 1 : 0};
+      const NSUInteger row_tiles = static_cast<NSUInteger>((rows + 63) / 64);
+      [enc setComputePipelineState:pipeline("attn_qk" + kv)];
+      bind(enc, q_, 0, 0);
+      bind(enc, G.k_cache, 0, 1);
+      bind(enc, attn_scores_, 0, 2);
+      bytes(enc, params, 3);
+      bind(enc, last_key_, blocks ? sizeof(int32_t) * static_cast<size_t>(start - plan_.base) : 0, 4);
+      [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((keys + 63) / 64), row_tiles,
+                                            static_cast<NSUInteger>(H))
+          threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      [enc setComputePipelineState:pipeline("softmax_rows")];
+      bind(enc, attn_scores_, 0, 0);
+      bytes(enc, ElementwiseParams{keys}, 1);
+      [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(H * rows), 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      [enc setComputePipelineState:pipeline("attn_pv" + kv)];
+      bind(enc, attn_scores_, 0, 0);
+      bind(enc, G.v_cache, 0, 1);
+      bind(enc, attn_, 0, 2);
+      bytes(enc, params, 3);
+      [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(D / 64), row_tiles, static_cast<NSUInteger>(H))
+          threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    }
+    return true;
   }
 
   // ---- multi-head latent attention ---------------------------------------
@@ -2131,6 +2191,8 @@ class DecoderMetal final : public Model {
 
   id<MTLBuffer> x_ = nil, h_ = nil, r_ = nil, q_ = nil, kt_ = nil, vt_ = nil, attn_ = nil, gate_ = nil, up_ = nil;
   id<MTLBuffer> part_o_ = nil, part_ml_ = nil;
+  id<MTLBuffer> attn_scores_ = nil;  // [heads, rows, keys] for encode_attention_mm, grown on demand
+  size_t attn_scores_bytes_ = 0;
   // Mixture of experts: router logits [chunk, E], each token's experts and
   // weights [chunk, K], and each slot's expert activations and outputs.
   id<MTLBuffer> route_ = nil, chosen_ = nil, expert_weights_ = nil, expert_hidden_ = nil, expert_out_ = nil;
