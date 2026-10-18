@@ -1147,7 +1147,7 @@ class DecoderMetal final : public Model {
       [enc dispatchThreadgroups:MTLSizeMake(qmv_groups(l.rows), 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
       return;
     }
-    // 4-bit weights take the pipelined kernel, staged in half for a norm's
+    // 4-bit weights take qmm4 (32x32 tiles), staged in half for a norm's
     // output (h_, whose values half holds), or for any input when the
     // checkpoint itself is float16 (F16 scales: its reference runs in half,
     // as MLX does), and in float otherwise. Mixture-of-experts models stage
@@ -1160,9 +1160,10 @@ class DecoderMetal final : public Model {
     bind(enc, x, 0, 3);
     bind(enc, y, 0, 4);
     bytes(enc, QmmParams{n, l.rows, l.cols}, 5);
-    // 64x64 tiles, as QMM_TILE_M and QMM_TILE_N in decoder_kernels.metal.
-    [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((l.rows + 63) / 64),
-                                          static_cast<NSUInteger>((n + 63) / 64), 1)
+    // qmm4's 32x32 tiles, or qmm's 64x64 (QMM_TILE_M and QMM_TILE_N).
+    const int tile = four_bit ? 32 : 64;
+    [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((l.rows + tile - 1) / tile),
+                                          static_cast<NSUInteger>((n + tile - 1) / tile), 1)
         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
   }
 
