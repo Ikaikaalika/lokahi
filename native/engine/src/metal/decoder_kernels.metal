@@ -1110,12 +1110,6 @@ kernel void moe_combine(const device float* slots [[buffer(0)]],
 // (qmm, below dequant16).
 // ---------------------------------------------------------------------------
 
-// dense_mm's 32x32 tiles (below).
-constant constexpr int QMM_BM = 32;
-constant constexpr int QMM_BN = 32;
-constant constexpr int QMM_BK = 32;
-constant constexpr int QMM_PAD = 4;
-
 // Fixed-trip loops over simdgroup matrices must unroll fully, or the matrices
 // are indexed dynamically and spill.
 #define QMM_UNROLL _Pragma("clang loop unroll(full)")
@@ -2945,8 +2939,40 @@ inline float load_value(const device float* p, int i) { return p[i]; }
 inline float load_value(const device half* p, int i) { return float(p[i]); }
 inline float load_value(const device Bf16* p, int i) { return as_type<float>(uint(p[i].bits) << 16); }
 
-// The qmm tiling (32x32 tiles, four simdgroups of 16x16) with bounds checks
-// on every edge, so m, n and k are arbitrary.
+// One 32-column K step of dense_mm's tile into its staging: A rows m0 ...
+// m0 + 31 and B's rows n0 ... n0 + 31 (B^T for TRANS_B false), 8 values per
+// thread. GUARD checks rows, columns and K against the matrices' edges (edge
+// tiles and the last, partial K step); interior steps run unguarded, as
+// qmm's do.
+template <typename TB, bool TRANS_B, bool GUARD>
+inline void dense_mm_stage(const device float* a, const device TB* b, constant MmParams& p, threadgroup float* as,
+                           threadgroup float* bs, int m0, int n0, int k0, short tid) {
+  constexpr short LD = 36;
+  const short r = tid / 4, c0 = (tid % 4) * 8;
+  {
+    const int row = m0 + r;
+    const device float* src = a + row * p.lda + k0 + c0;
+    QMM_UNROLL for (short j = 0; j < 8; ++j)
+      as[r * LD + c0 + j] = !GUARD || (row < p.m && k0 + c0 + j < p.k) ? src[j] : 0.0f;
+  }
+  if (TRANS_B) {  // B[n][k]: row n0 + r, K columns c0 ...
+    const int row = n0 + r;
+    QMM_UNROLL for (short j = 0; j < 8; ++j)
+      bs[r * LD + c0 + j] =
+          !GUARD || (row < p.n && k0 + c0 + j < p.k) ? load_value(b, row * p.ldb + k0 + c0 + j) : 0.0f;
+  } else {  // B[k][n]: K row k0 + r, columns n0 + c0 ..., staged transposed
+    const int kr = k0 + r;
+    QMM_UNROLL for (short j = 0; j < 8; ++j)
+      bs[(c0 + j) * LD + r] =
+          !GUARD || (kr < p.k && n0 + c0 + j < p.n) ? load_value(b, kr * p.ldb + n0 + c0 + j) : 0.0f;
+  }
+}
+
+// C = alpha A B^T (TRANS_B) or alpha A B, plus a bias per column, into or
+// onto C, for any m, n and k (vision towers' dense matrices and attention):
+// qmm's 32x32 tiles, interleaved simdgroup fragments loaded per lane as
+// float through offsets computed once, and unguarded staging for interior
+// steps. Grid (ceil(n / 32), ceil(m / 32)), 128 threads.
 template <typename TB, bool TRANS_B>
 [[kernel]] void dense_mm(const device float* a [[buffer(0)]],
                          const device TB* b [[buffer(1)]],
@@ -2955,63 +2981,59 @@ template <typename TB, bool TRANS_B>
                          const device float* bias [[buffer(4)]],
                          uint2 tg [[threadgroup_position_in_grid]],
                          uint tid [[thread_index_in_threadgroup]],
-                         uint sg [[simdgroup_index_in_threadgroup]]) {
-  threadgroup float as[QMM_BM][QMM_BK + QMM_PAD];
-  threadgroup float bs[QMM_BN][QMM_BK + QMM_PAD];
-  threadgroup float out_tile[QMM_BM][QMM_BN + QMM_PAD];
-
-  const int m0 = int(tg.y) * QMM_BM;
-  const int n0 = int(tg.x) * QMM_BN;
-  const int sm = int(sg / 2) * 16;
-  const int sn = int(sg % 2) * 16;
-
-  simdgroup_float8x8 acc[2][2];
-  for (int i = 0; i < 2; ++i)
-    for (int j = 0; j < 2; ++j) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-
-  for (int k0 = 0; k0 < p.k; k0 += QMM_BK) {
-    for (int i = int(tid); i < QMM_BM * QMM_BK; i += 128) {
-      const int r = i / QMM_BK;
-      const int kk = i % QMM_BK;
-      const int row = m0 + r;
-      const int col = k0 + kk;
-      as[r][kk] = row < p.m && col < p.k ? a[row * p.lda + col] : 0.0f;
-    }
-    for (int i = int(tid); i < QMM_BN * QMM_BK; i += 128) {
-      // Consecutive threads read consecutive addresses in either layout.
-      const int r = TRANS_B ? i / QMM_BK : i % QMM_BN;
-      const int kk = TRANS_B ? i % QMM_BK : i / QMM_BN;
-      const int row = n0 + r;
-      const int col = k0 + kk;
-      bs[r][kk] = row < p.n && col < p.k ? load_value(b, TRANS_B ? row * p.ldb + col : col * p.ldb + row) : 0.0f;
+                         uint sg [[simdgroup_index_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]]) {
+  constexpr short LD = 36;
+  threadgroup float as[32 * LD];
+  threadgroup float bs[32 * LD];
+  const int m0 = int(tg.y) * 32, n0 = int(tg.x) * 32;
+  const short fm = short((lane / 4) & 4) + short((lane / 2) % 4);
+  const short fn = short((lane / 4) & 2) * 2 + short(lane % 2) * 2;
+  const short tm = 8 * short(sg / 2), tn = 8 * short(sg % 2);
+  const short a_off = (tm + fm) * LD + fn, b_off = (tn + fn) * LD + fm;
+  const bool interior = m0 + 32 <= p.m && n0 + 32 <= p.n;
+  const int k_full = interior ? p.k / 32 * 32 : 0;
+  float2 acc[2][2] = {{float2(0.0f), float2(0.0f)}, {float2(0.0f), float2(0.0f)}};
+  for (int k0 = 0; k0 < p.k; k0 += 32) {
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (k0 < k_full) {
+      dense_mm_stage<TB, TRANS_B, false>(a, b, p, as, bs, m0, n0, k0, short(tid));
+    } else {
+      dense_mm_stage<TB, TRANS_B, true>(a, b, p, as, bs, m0, n0, k0, short(tid));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int kk = 0; kk < QMM_BK; kk += 8) {
-      simdgroup_float8x8 x[2];
-      simdgroup_float8x8 y[2];
-      for (int i = 0; i < 2; ++i) simdgroup_load(x[i], &as[sm + 8 * i][kk], QMM_BK + QMM_PAD);
-      for (int j = 0; j < 2; ++j)
-        simdgroup_load(y[j], &bs[sn + 8 * j][kk], QMM_BK + QMM_PAD, ulong2(0, 0), true);
-      for (int i = 0; i < 2; ++i)
-        for (int j = 0; j < 2; ++j) simdgroup_multiply_accumulate(acc[i][j], x[i], y[j], acc[i][j]);
+    const threadgroup float* ap = as + a_off;
+    const threadgroup float* bp = bs + b_off;
+    QMM_UNROLL for (short kk = 0; kk < 32; kk += 8) {
+      float2 x[2], y[2];
+      QMM_UNROLL for (short i = 0; i < 2; ++i) x[i] = float2(ap[i * 16 * LD], ap[i * 16 * LD + 1]);
+      QMM_UNROLL for (short j = 0; j < 2; ++j) y[j] = float2(bp[j * 16 * LD], bp[j * 16 * LD + LD]);
+      QMM_UNROLL for (short i = 0; i < 2; ++i)
+        QMM_UNROLL for (short j = 0; j < 2; ++j) {
+          simdgroup_float8x8 xm, ym, cm;
+          FRAG_ELEMS(xm) = x[i];
+          FRAG_ELEMS(ym) = y[j];
+          FRAG_ELEMS(cm) = acc[i][j];
+          simdgroup_multiply_accumulate(cm, xm, ym, cm);
+          acc[i][j] = FRAG_ELEMS(cm);
+        }
+      ap += 8;
+      bp += 8;
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
   }
-
-  for (int i = 0; i < 2; ++i)
-    for (int j = 0; j < 2; ++j)
-      simdgroup_store(acc[i][j], &out_tile[sm + 8 * i][sn + 8 * j], QMM_BN + QMM_PAD);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (int i = int(tid); i < QMM_BM * QMM_BN; i += 128) {
-    const int r = i / QMM_BN;
-    const int col = i % QMM_BN;
-    const int row = m0 + r;
-    const int j = n0 + col;
-    if (row >= p.m || j >= p.n) continue;
-    float value = p.alpha * out_tile[r][col];
-    if (p.has_bias != 0) value += bias[j];
-    device float* out = c + row * p.ldc + j;
-    *out = p.accumulate != 0 ? value + *out : value;
+  QMM_UNROLL for (short i = 0; i < 2; ++i) {
+    const int row = m0 + tm + 16 * i + fm;
+    if (row >= p.m) continue;
+    QMM_UNROLL for (short j = 0; j < 2; ++j) {
+      QMM_UNROLL for (short h = 0; h < 2; ++h) {
+        const int col = n0 + tn + 16 * j + fn + h;
+        if (col >= p.n) continue;
+        float value = p.alpha * (h == 0 ? acc[i][j].x : acc[i][j].y);
+        if (p.has_bias != 0) value += bias[col];
+        device float* out = c + row * p.ldc + col;
+        *out = p.accumulate != 0 ? value + *out : value;
+      }
+    }
   }
 }
 
