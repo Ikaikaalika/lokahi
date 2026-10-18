@@ -2514,6 +2514,9 @@ struct AttnMmParams {
   float scale;
   float softcap;     // 0 disables
   int has_last_key;  // last_key[t] extends query t's keys (Gemma 3's image blocks)
+  int head_rows;     // attn_flash: rows are one token's heads (all at start_pos) over kv head 0
+  int block_keys;    // attn_flash with head_rows: threadgroup y takes keys [y, y + 1) * block_keys
+                     // and leaves its rows' partial output for attn_reduce
 };
 
 #define ATT_MM_UNROLL _Pragma("clang loop unroll(full)")
@@ -2705,6 +2708,12 @@ inline float att_fl_row_sum(float v) {
 // accumulate their part of O. Values are DV wide; with VK they are the first
 // DV dimensions of the keys (latent attention's one cache), else their own
 // cache with DV = D. Q and O rows are D apart (O fills the first DV).
+// With head_rows a decode step's heads are the rows (multi-head latent
+// attention, whose heads share one cache: each threadgroup reads its keys
+// once for 32 heads instead of once per head), and with block_keys the grid's
+// y splits the keys into blocks whose unnormalized outputs and (max, sum),
+// in natural-log units, go to part_o and part_ml as attn_partial leaves them
+// for attn_reduce: grid (ceil(heads / 32), blocks).
 template <typename KV, int D, int DV, int BK, int SPLIT, bool VK>
 [[kernel]] void attn_flash(const device float* q [[buffer(0)]],
                            const device KV* k_cache [[buffer(1)]],
@@ -2712,7 +2721,10 @@ template <typename KV, int D, int DV, int BK, int SPLIT, bool VK>
                            device float* out [[buffer(3)]],
                            constant AttnMmParams& p [[buffer(4)]],
                            const device int* last_key [[buffer(5)]],
+                           device float* part_o [[buffer(6)]],
+                           device float* part_ml [[buffer(7)]],
                            uint2 tg [[threadgroup_position_in_grid]],
+                           uint2 tgs [[threadgroups_per_grid]],
                            uint tid [[thread_index_in_threadgroup]],
                            uint sg [[simdgroup_index_in_threadgroup]],
                            uint lane [[thread_index_in_simdgroup]]) {
@@ -2722,10 +2734,13 @@ template <typename KV, int D, int DV, int BK, int SPLIT, bool VK>
   threadgroup KV ks[BK * LD];
   threadgroup KV vs[VK ? 1 : BK * LD];
   threadgroup float parts[SPLIT > 1 ? 4 * SPLIT * (BK / 8) * 64 : 1];  // partial scores to exchange
-  const int h = int(tg.y);
+  const bool head_rows = p.head_rows != 0;
+  const int h = head_rows ? 0 : int(tg.y);
   const int kvh = h / (p.heads / p.kv_heads);
   const int t0 = int(tg.x) * ATT_FL_Q;
   const int t_last = min(t0 + ATT_FL_Q, p.rows) - 1;
+  // Positions of the tile's first and last rows.
+  const int pos_first = p.start_pos + (head_rows ? 0 : t0), pos_last = p.start_pos + (head_rows ? 0 : t_last);
   // This thread's row and first column within every 8x8 fragment.
   const int fm = int((lane / 4) & 4) + int((lane / 2) % 4);
   const int fn = int((lane / 4) & 2) * 2 + int(lane % 2) * 2;
@@ -2733,15 +2748,21 @@ template <typename KV, int D, int DV, int BK, int SPLIT, bool VK>
   const int d0 = part * DH, dv0 = part * DVH;
   const int t = t0 + group * 8 + fm;  // query row within the pass
   const bool row_ok = t < p.rows;
-  const int qpos = p.start_pos + t;
-  const int lo = qpos - p.window + 1;  // first key the row may see
-  const int hi = p.has_last_key != 0 && row_ok ? max(qpos, last_key[t]) : qpos;
+  const int qpos = p.start_pos + (head_rows ? 0 : t);
+  int lo = qpos - p.window + 1;  // first key the row may see
+  int hi = p.has_last_key != 0 && row_ok ? max(qpos, last_key[t]) : qpos;
 
   // The tile's key range: from its first row's window start to its furthest key.
-  int tile_hi = p.start_pos + t_last;
+  int tile_hi = pos_last;
   if (p.has_last_key != 0) tile_hi = max(tile_hi, simd_max(t0 + int(lane) <= t_last ? last_key[t0 + int(lane)] : 0));
   tile_hi = min(tile_hi, p.key_base + p.keys - 1);
-  const int tile_lo = max(p.key_base, p.start_pos + t0 - p.window + 1);
+  int tile_lo = max(p.key_base, pos_first - p.window + 1);
+  if (p.block_keys > 0) {  // this threadgroup's block of keys; rows see no others
+    tile_lo = max(tile_lo, int(tg.y) * p.block_keys);
+    tile_hi = min(tile_hi, (int(tg.y) + 1) * p.block_keys - 1);
+    lo = max(lo, tile_lo);
+    hi = min(hi, tile_hi);
+  }
 
   // Q, prescaled so the scores come out in log2 units (softcap applies the
   // log2 factor after its tanh instead).
@@ -2808,7 +2829,7 @@ template <typename KV, int D, int DV, int BK, int SPLIT, bool VK>
 
     // Soft-cap and mask, then the online softmax update of this row.
     // A block every row of the tile sees in full needs no mask.
-    const bool full = kb + BK - 1 <= min(p.start_pos + t0, tile_hi) && kb >= p.start_pos + t_last - p.window + 1;
+    const bool full = kb + BK - 1 <= min(pos_first, tile_hi) && kb >= pos_last - p.window + 1;
     float block_max = -INFINITY;
     ATT_MM_UNROLL for (int j = 0; j < BK / 8; ++j) {
       thread float2& e = FRAG_ELEMS(s[j]);
@@ -2851,6 +2872,16 @@ template <typename KV, int D, int DV, int BK, int SPLIT, bool VK>
   }
 
   if (!row_ok) return;
+  if (p.block_keys > 0) {
+    const size_t entry = size_t(t) * tgs.y + tg.y;
+    device float* prow = part_o + entry * D + dv0 + fn;
+    ATT_MM_UNROLL for (int d = 0; d < DVH / 8; ++d) *reinterpret_cast<device float2*>(prow + 8 * d) = FRAG_ELEMS(o[d]);
+    if (fn == 0 && part == 0) {
+      part_ml[2 * entry] = m * M_LN2_F;
+      part_ml[2 * entry + 1] = l;
+    }
+    return;
+  }
   const float inv = l > 0.0f ? 1.0f / l : 0.0f;
   device float* orow = out + (size_t(t) * size_t(p.heads) + size_t(h)) * D + dv0 + fn;
   ATT_MM_UNROLL for (int d = 0; d < DVH / 8; ++d)

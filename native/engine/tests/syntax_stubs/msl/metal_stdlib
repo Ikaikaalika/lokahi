@@ -49,6 +49,7 @@ template <typename T, int N> struct vec {
   template <typename U> explicit vec(const vec<U, N>&) {}
 };
 #define M_LOG2E_F 1.4426950408889634f
+#define M_LN2_F 0.693147180559945309417f
 struct uint2 {
   uint x, y;
   uint2() : x(0), y(0) {}

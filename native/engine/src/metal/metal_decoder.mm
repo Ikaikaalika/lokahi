@@ -241,7 +241,7 @@ struct AttnParams {
 };
 struct AttnMmParams {
   int heads; int kv_heads; int head_dim; int start_pos; int row0; int rows; int key_base; int keys; int window;
-  int capacity; float scale; float softcap; int has_last_key;
+  int capacity; float scale; float softcap; int has_last_key; int head_rows = 0; int block_keys = 0;
 };
 struct ReplaceParams { int cols; int n; };
 struct ReduceParams { int heads; int head_dim; int n_blocks; int has_sinks; };
@@ -271,6 +271,9 @@ constexpr int kDecodeMaxBlocks = 64;  // most key blocks a decode step's attenti
 // and 1-2 blocks starved the GPU.
 constexpr int kDecodeGroupsPerCore = 8;
 constexpr int kPrefillMaxBlocks = 8;
+// Fewest keys per block of a latent-attention decode step (attn_flash with
+// head_rows): each block stages them 8 at a time for all 32 heads of a tile.
+constexpr int kLatentMinBlockKeys = 64;
 // Passes of at least this many tokens attend on simdgroup matrices (attn_qk,
 // softmax_rows, attn_pv), their scores held in at most this many floats.
 constexpr int kAttnMmMinRows = 16;
@@ -1665,6 +1668,8 @@ class DecoderMetal final : public Model {
     bind(enc, attn_, 0, 3);
     bytes(enc, params, 4);
     bind(enc, last_key_, blocks ? sizeof(int32_t) * static_cast<size_t>(start - plan_.base) : 0, 5);
+    bind(enc, placeholder_, 6);
+    bind(enc, placeholder_, 7);
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((n + 31) / 32), static_cast<NSUInteger>(c_.num_heads),
                                           1)
         threadsPerThreadgroup:MTLSizeMake(G.head_dim == 512 ? 256 : 128, 1, 1)];
@@ -1841,8 +1846,40 @@ class DecoderMetal final : public Model {
       bind(enc, latent_out_, 0, 3);
       bytes(enc, AttnMmParams{H, 1, width, start, 0, n, 0, start + n, 1 << 30, G.capacity, c_.attn_scale, 0.0f, 0}, 4);
       bind(enc, placeholder_, 5);
+      bind(enc, placeholder_, 6);
+      bind(enc, placeholder_, 7);
       [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((n + 31) / 32), static_cast<NSUInteger>(H), 1)
           threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+      return;
+    }
+    if (fragments_ && n == 1 && flash_shape) {
+      // A decode step: the heads as attn_flash's rows over one shared cache,
+      // read once per 32 heads (attn_partial read it once per head), split
+      // into key blocks sized to the GPU, then attn_reduce over the values.
+      const int row_tiles = (H + 31) / 32, keys = start + 1;
+      const int wanted = std::clamp(kDecodeGroupsPerCore * gpu_cores_ / row_tiles, 1, kDecodeMaxBlocks);
+      const int block = (std::max(kLatentMinBlockKeys, (keys + wanted - 1) / wanted) + 7) / 8 * 8;
+      const int n_blocks = (keys + block - 1) / block;
+      [enc setComputePipelineState:pipeline("attn_flash_mla_" + std::to_string(width))];
+      bind(enc, latent_q_, 0, 0);
+      bind(enc, G.k_cache, 0, 1);
+      bind(enc, G.k_cache, 0, 2);
+      bind(enc, latent_out_, 0, 3);
+      bytes(enc, AttnMmParams{1, 1, width, start, 0, H, 0, keys, 1 << 30, G.capacity, c_.attn_scale, 0.0f, 0, 1, block},
+            4);
+      bind(enc, placeholder_, 5);
+      bind(enc, part_o_, 0, 6);
+      bind(enc, part_ml_, 0, 7);
+      [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(row_tiles), static_cast<NSUInteger>(n_blocks), 1)
+          threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+      [enc setComputePipelineState:pipeline("attn_reduce")];
+      bind(enc, part_o_, 0, 0);
+      bind(enc, part_ml_, 0, 1);
+      bind(enc, latent_out_, 0, 2);
+      bytes(enc, ReduceParams{H, width, n_blocks, 0}, 3);
+      bind(enc, placeholder_, 4);
+      [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(H), 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(static_cast<NSUInteger>(c_.kv_lora_rank), 1, 1)];
       return;
     }
     const int keys_max = start + n;
