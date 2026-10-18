@@ -38,6 +38,7 @@ struct SplitHeadsParams { int heads; int dim; int stride; int rows; };
 struct AttnMmParams {
   int heads; int kv_heads; int head_dim; int start_pos; int row0; int rows; int key_base; int keys; int window;
   int capacity; float scale; float softcap; int has_last_key; int head_rows; int block_keys; int has_bounds;
+  int batched;
 };
 constexpr int kMaxWindowKeys = 1024;  // as decoder_kernels.metal
 // One page of the placeholder buffer bound for unused optional inputs.
@@ -779,10 +780,12 @@ class Qwen35VisionMetal final : public Qwen35VisionEncoder, private MetalKit {
         [enc setBuffer:k_heads_ offset:0 atIndex:1];
         [enc setBuffer:v_heads_ offset:0 atIndex:2];
         [enc setBuffer:attn_ offset:0 atIndex:3];
-        bytes(enc, AttnMmParams{heads, heads, D, N - 1, 0, N, 0, N, 1 << 30, N, scale, 0.0f, 0, 0, 0, global ? 0 : 1}, 4);
+        bytes(enc, AttnMmParams{heads, heads, D, N - 1, 0, N, 0, N, 1 << 30, N, scale, 0.0f, 0, 0, 0, global ? 0 : 1, 0},
+              4);
         [enc setBuffer:(global ? dummy_ : window_) offset:0 atIndex:5];
         [enc setBuffer:dummy_ offset:0 atIndex:6];
         [enc setBuffer:dummy_ offset:0 atIndex:7];
+        [enc setBuffer:dummy_ offset:0 atIndex:8];
         [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((N + 31) / 32), static_cast<NSUInteger>(heads), 1)
             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
       } else if (!global) {  // each patch over its window's rows, every head at once

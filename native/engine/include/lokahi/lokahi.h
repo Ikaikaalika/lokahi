@@ -109,7 +109,7 @@ int lokahi_detokenize(const lokahi_tokenizer* tokenizer, const int32_t* ids, int
  *    "runtime_revision"?}
  * max_sequences (default 1) is how many requests each model runs at once:
  * each holds its own KV cache of max_context tokens, and every step decodes
- * the running ones in one batched pass (Metal; standard attention models).
+ * the running ones in one batched pass (Metal).
  * The KV memory is reserved at load: max_sequences times one context's. */
 typedef struct lokahi_service lokahi_service;
 

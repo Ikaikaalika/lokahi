@@ -414,16 +414,22 @@ def test_gated_deltanet_chunks_match_oracle_tightly(native_cli, chunk, tmp_path)
 # whose rows sit at different positions of different sequences. Every row's
 # logits at every step must match that sequence decoded alone on Metal (the
 # `logits` command: prefill, then one decode per token) to 1e-4 of their
-# scale, and the oracle to the suite's 2e-3 -- except GPT-OSS, whose MXFP4
-# fixture already decodes 1e-3 to 6e-3 from the oracle alone. Dense models, a
+# scale, and the oracle to the suite's 2e-3 -- except GPT-OSS's MXFP4 fixture
+# and the dense Qwen3.5 fixture (half-staged inputs), which already decode
+# 1e-3 to 6e-3 from the oracle alone. Dense models, a
 # sliding window whose ring wraps, Gemma 3 and Gemma 4 (KV-shared layers,
-# per-layer inputs), mixtures of experts and GPT-OSS's sinks; and 12 sequences
-# at once, whose rows past 8 run qmv_mma16.
+# per-layer inputs), mixtures of experts and GPT-OSS's sinks; Qwen3.5 and
+# Qwen3-Next, whose Gated DeltaNet layers keep each sequence's conv history
+# and state (gdn_conv_rows, gdn_recurrence_rows); DeepSeek's latent attention
+# (each sequence's latent cache); and 12 sequences at once, whose rows past 8
+# run qmv_mma16.
 @pytest.mark.parametrize("name,count", [("llama3-tied-rope-llama3", 3), ("qwen3-qk-norm-hd128", 3),
                                         ("mistral-sliding-untied", 3), ("gemma3-tied-hd256-rope-scaled", 3),
                                         ("gemma4-e2b-shape", 3), ("qwen3-moe-top2-of-8", 3),
-                                        ("gpt-oss-mxfp4-yarn", 3), ("llama3-tied-rope-llama3", 12),
-                                        ("qwen3-moe-top2-of-8", 12)])
+                                        ("gpt-oss-mxfp4-yarn", 3), ("qwen3.5-mlx", 3), ("qwen3-next-mlx", 3),
+                                        ("deepseek-v3-absorbed-grouped", 3), ("deepseek-v2-lite-geometry", 3),
+                                        ("llama3-tied-rope-llama3", 12), ("qwen3-moe-top2-of-8", 12),
+                                        ("qwen3.5-mlx", 12), ("deepseek-v3-absorbed-grouped", 12)])
 def test_batched_decode_matches_each_sequence_alone(native_cli, name, count, tmp_path):
     if "metal" not in _backends():
         pytest.skip("Metal only")
@@ -434,8 +440,11 @@ def test_batched_decode_matches_each_sequence_alone(native_cli, name, count, tmp
     (tmp_path / "prompts.txt").write_text("\n".join(",".join(map(str, p)) for p in prompts) + "\n")
     steps = 6
     out = tmp_path / "logits.bin"
+    # One warmup first: the measured run resets and reuses every sequence,
+    # whose caches and recurrent states must start clean.
     report = _run(native_cli, "generate-batch", "--model", str(directory), "--backend", "metal",
-                  "--prompts-file", str(tmp_path / "prompts.txt"), "--max-new", str(steps), "--out", str(out))
+                  "--prompts-file", str(tmp_path / "prompts.txt"), "--max-new", str(steps), "--out", str(out),
+                  "--warmups", "1")
     assert report["sequences"] == len(prompts)
     vocab = oracle.config.vocab_size
     got = np.fromfile(out, dtype=np.float32).reshape(steps - 1, len(prompts), vocab)
@@ -448,7 +457,7 @@ def test_batched_decode_matches_each_sequence_alone(native_cli, name, count, tmp
                     "--tokens", ",".join(map(str, tokens)), "--prefill", str(len(prompt)), "--out", str(alone))["rows"]
         single = np.fromfile(alone, dtype=np.float32).reshape(rows, vocab)[1:]
         np.testing.assert_allclose(got[:, i], single, atol=1e-4 * np.abs(single).max(), rtol=0)
-        if name != "gpt-oss-mxfp4-yarn":
+        if name not in ("gpt-oss-mxfp4-yarn", "qwen3.5-mlx"):
             expected = np.stack([oracle.logits(prompt + generated[:k])[-1] for k in range(1, steps)])
             np.testing.assert_allclose(got[:, i], expected, atol=2e-3 * np.abs(expected).max(), rtol=0)
             np.testing.assert_array_equal(got[:, i].argmax(axis=1), expected.argmax(axis=1))
@@ -462,11 +471,13 @@ def test_several_sequences_fail_closed_where_unsupported(native_cli, tmp_path):
     assert result.returncode != 0 and "holds one sequence" in result.stderr
     if "metal" not in _backends():
         return
-    for name, spec in (("qwen3.5", QWEN35_VARIANTS["qwen3.5-mlx"]),):
-        write_tiny_qwen35(tmp_path / name, spec)
-        result = subprocess.run([str(native_cli), "info", "--model", str(tmp_path / name), "--backend", "metal",
-                                 "--sequences", "2"], capture_output=True, text=True)
-        assert result.returncode != 0 and "Gated DeltaNet holds one" in result.stderr
+    # The MTP head keeps one sequence's pending rows: it refuses to follow a
+    # model that holds several.
+    directory = write_tiny_qwen35(tmp_path / "qwen3.5", TinyQwen35Spec(mtp=True, seed=0))
+    result = subprocess.run([str(native_cli), "generate", "--model", str(directory), "--backend", "metal",
+                             "--sequences", "2", "--tokens", "2,5,9", "--max-new", "4", "--speculate", "3",
+                             "--drafter", "mtp"], capture_output=True, text=True)
+    assert result.returncode != 0 and "holds one sequence" in result.stderr, result.stderr
 
 
 def _latent(directory: Path) -> bool:
