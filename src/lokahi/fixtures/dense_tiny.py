@@ -22,7 +22,7 @@ from pathlib import Path
 import numpy as np
 
 from ..formats.mlx_quant import QuantSpec
-from ..formats.safetensors import f32_to_bf16, write_safetensors
+from ..formats.safetensors import bf16_to_f32, f32_to_bf16, write_safetensors
 from .gemma3_tiny import _mxfp4, _quantized
 
 ARCHITECTURES = {
@@ -64,6 +64,7 @@ class TinyDenseSpec:
     norm_topk_prob: bool = True
     stacked_experts: bool = True  # MLX's switch_mlp stacks; False writes Transformers' experts.{e}
     mxfp4_mlp: bool = False  # MLP and expert projections in MXFP4, as GPT-OSS ships its experts
+    f16_scales: bool = False  # affine scales and biases in F16, as Llama 3.2's MLX checkpoints store them
     # GLM-4.5
     first_k_dense_replace: int = 1
     n_group: int = 1
@@ -283,8 +284,12 @@ def write_tiny_dense(directory: Path, spec: TinyDenseSpec = TinyDenseSpec()) -> 
         else:  # stacked [experts, rows, ...], each expert quantized on its own
             weight, scales, biases = map(np.stack, zip(*(_quantized(rng, rows, cols, qspec, std) for _ in range(experts))))
         tensors[f"{module}.weight"] = ("U32", weight)
-        tensors[f"{module}.scales"] = ("BF16", scales)
-        tensors[f"{module}.biases"] = ("BF16", biases)
+        if spec.f16_scales:
+            tensors[f"{module}.scales"] = ("F16", bf16_to_f32(scales).astype(np.float16))
+            tensors[f"{module}.biases"] = ("F16", bf16_to_f32(biases).astype(np.float16))
+        else:
+            tensors[f"{module}.scales"] = ("BF16", scales)
+            tensors[f"{module}.biases"] = ("BF16", biases)
 
     def vector(name: str, size: int, mean: float, std: float) -> None:
         tensors[name] = ("BF16", f32_to_bf16(rng.normal(mean, std, size).astype(np.float32)))

@@ -196,6 +196,7 @@ struct QmvParams { int rows; int cols; };
 struct GluParams { int rows; int cols; int silu; };
 struct QkvParams { int q_rows; int kv_rows; int cols; };
 struct QmmParams { int n; int rows; int cols; };
+struct QmmGluParams { int n; int rows; int cols; int silu; };
 struct QmvNParams { int rows; int cols; int n; };
 constexpr int kQmvNMax = 8;  // QMV_N_MAX in decoder_kernels.metal
 // From this many tokens, 4-bit short passes run qmv_mma (simdgroup matrices)
@@ -970,6 +971,8 @@ class DecoderMetal final : public Model {
     attn_ = private_buffer(chunk * H * D * f);
     const size_t widest = static_cast<size_t>(std::max(max_inter_, c_.shared_intermediate));
     gate_ = private_buffer(chunk * widest * f);
+    // qmm_glu's half output, which a float16 checkpoint's down projection reads.
+    gate16_ = private_buffer(chunk * widest * sizeof(uint16_t));
     up_ = private_buffer(chunk * widest * f);
     if (c_.shared_intermediate > 0) shared_out_ = private_buffer(chunk * hidden * f);
     if (c_.experts_beside_mlp) {
@@ -2102,6 +2105,32 @@ class DecoderMetal final : public Model {
       bytes(enc, GluParams{G.gate.rows, G.gate.cols, silu}, 8);
       [enc dispatchThreadgroups:MTLSizeMake(qmv_groups(G.gate.rows), 1, 1)
           threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    } else if (n > kQmvNMax && G.gate.same_format(G.up) && !G.gate.mxfp4) {
+      // Gate and up in one pass over the staged input (qmm_glu), staged as
+      // encode_qmm would stage h_. A float16 checkpoint's down projection
+      // stages its input in half anyway, so the product goes to it in half.
+      const bool dense = c_.num_experts == 0;
+      const bool half_down = dense && !G.down.bf16 && !G.down.mxfp4;
+      [enc setComputePipelineState:quant_pipeline(half_down ? "qmm_glu_hh" : dense ? "qmm_glu_h" : "qmm_glu_f", G.gate)];
+      bind_weights(enc, G.gate, 0);
+      bind_weights(enc, G.up, 3);
+      bind(enc, h_, 0, 6);
+      bind(enc, half_down ? gate16_ : gate_, 0, 7);
+      bytes(enc, QmmGluParams{n, G.gate.rows, G.gate.cols, silu}, 8);
+      [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((G.gate.rows + 31) / 32),
+                                            static_cast<NSUInteger>((n + 31) / 32), 1)
+          threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+      if (half_down) {
+        [enc setComputePipelineState:quant_pipeline("qmm_hx", G.down)];
+        bind_weights(enc, G.down, 0);
+        bind(enc, gate16_, 0, 3);
+        bind(enc, r_, 0, 4);
+        bytes(enc, QmmParams{n, G.down.rows, G.down.cols}, 5);
+        [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((G.down.rows + 31) / 32),
+                                              static_cast<NSUInteger>((n + 31) / 32), 1)
+            threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        return;
+      }
     } else {
       encode_qmm(enc, G.gate, h_, n, gate_);
       encode_qmm(enc, G.up, h_, n, up_);
@@ -2446,6 +2475,7 @@ class DecoderMetal final : public Model {
   size_t device_weight_bytes_ = 0;
 
   id<MTLBuffer> x_ = nil, h_ = nil, r_ = nil, q_ = nil, kt_ = nil, vt_ = nil, attn_ = nil, gate_ = nil, up_ = nil;
+  id<MTLBuffer> gate16_ = nil;  // qmm_glu_hh's output [chunk, widest] in half
   id<MTLBuffer> part_o_ = nil, part_ml_ = nil;
   id<MTLBuffer> attn_scores_ = nil;  // [heads, rows, keys] for encode_attention_mm, grown on demand
   size_t attn_scores_bytes_ = 0;

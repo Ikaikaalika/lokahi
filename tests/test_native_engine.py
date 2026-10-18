@@ -85,6 +85,11 @@ DENSE_VARIANTS = {
     # Llama 3.2: llama3 RoPE scaling, tied embeddings, 4 query heads per kv head.
     "llama3-tied-rope-llama3": TinyDenseSpec(num_attention_heads=8, num_key_value_heads=2, head_dim=64,
                                              hidden_size=256, rope_scaling=LLAMA3_SCALING, seed=3),
+    # Llama 3.2's MLX checkpoints store affine scales and biases in F16, which
+    # Metal stages in half throughout (its down projection's input in half).
+    "llama3-f16-scales": TinyDenseSpec(num_attention_heads=8, num_key_value_heads=2, head_dim=64, hidden_size=256,
+                                       rope_scaling=LLAMA3_SCALING, f16_scales=True, eight_bit_mlp_layers=(),
+                                       seed=13),
     # Qwen 3: per-head q/k norm and head_dim * heads != hidden_size.
     "qwen3-qk-norm-hd128": TinyDenseSpec(model_type="qwen3", num_attention_heads=4, num_key_value_heads=2,
                                          head_dim=128, rope_theta=1e6, seed=4),
@@ -361,7 +366,7 @@ def _write_named(directory: Path, name: str):
 @pytest.mark.parametrize("name", ["llama3-tied-rope-llama3", "qwen3-qk-norm-hd128", "gemma3-tied-hd256-rope-scaled",
                                   "mistral-sliding-untied", "gemma4-e2b-shape", "gemma4-wide-heads",
                                   "qwen3-moe-top2-of-8", "gpt-oss-mxfp4-yarn", "gemma4-26b-a4b-moe",
-                                  "deepseek-v3-absorbed-grouped", "deepseek-v2-lite-geometry"])
+                                  "deepseek-v3-absorbed-grouped", "deepseek-v2-lite-geometry", "llama3-f16-scales"])
 def test_long_prefill_matches_oracle_closely(native_cli, name, backend, chunk, tmp_path):
     oracle = _write_named(tmp_path / "model", name)
     tokens = (TOKENS * 4)[:80]
