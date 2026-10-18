@@ -339,6 +339,9 @@ def _write_named(directory: Path, name: str):
     if name in GEMMA4_VARIANTS:
         write_tiny_gemma4(directory, GEMMA4_VARIANTS[name])
         return Gemma4Reference.load(directory)
+    if name in DEEPSEEK_VARIANTS:
+        write_tiny_deepseek(directory, DEEPSEEK_VARIANTS[name])
+        return DeepseekReference.load(directory)
     write_tiny_dense(directory, DENSE_VARIANTS[name])
     return LlamaFamilyReference.load(directory)
 
@@ -348,14 +351,17 @@ def _write_named(directory: Path, name: str):
 # (chunks of 33) and sliding windows whose rings wrap, at 64-, 128-, 256- and
 # 512-wide heads, and mixtures of experts, whose passes of 16 tokens or more
 # run grouped by expert (moe_sort, moe_qmm): affine and MXFP4 experts and
-# Gemma 4's beside its MLP. The 2% tolerance above misses a 1% error in
+# Gemma 4's beside its MLP; and multi-head latent attention (attn_flash over
+# the latent cache, at the fixtures' 64 + 32 and the released models' 512 +
+# 64). The 2% tolerance above misses a 1% error in
 # attention's output (it moved these logits by 0.6% of their scale); the
 # paths measured 2e-5 to 6.5e-4 of it (correctness evidence).
 @pytest.mark.parametrize("backend", _backends())
 @pytest.mark.parametrize("chunk", [512, 33])
 @pytest.mark.parametrize("name", ["llama3-tied-rope-llama3", "qwen3-qk-norm-hd128", "gemma3-tied-hd256-rope-scaled",
                                   "mistral-sliding-untied", "gemma4-e2b-shape", "gemma4-wide-heads",
-                                  "qwen3-moe-top2-of-8", "gpt-oss-mxfp4-yarn", "gemma4-26b-a4b-moe"])
+                                  "qwen3-moe-top2-of-8", "gpt-oss-mxfp4-yarn", "gemma4-26b-a4b-moe",
+                                  "deepseek-v3-absorbed-grouped", "deepseek-v2-lite-geometry"])
 def test_long_prefill_matches_oracle_closely(native_cli, name, backend, chunk, tmp_path):
     oracle = _write_named(tmp_path / "model", name)
     tokens = (TOKENS * 4)[:80]
