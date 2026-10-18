@@ -260,6 +260,9 @@ constexpr int kPrefillMaxBlocks = 8;
 // Passes of at least this many tokens attend on simdgroup matrices (attn_qk,
 // softmax_rows, attn_pv), their scores held in at most this many floats.
 constexpr int kAttnMmMinRows = 16;
+// The most query and accumulator values per lane attn_partial takes before
+// a kv head's query heads split over threadgroups (encode_attention).
+constexpr int kAttnLaneValues = 16;
 constexpr size_t kAttnScoresBudget = size_t{1} << 24;
 constexpr int kInflightSteps = 2;
 
@@ -1527,9 +1530,15 @@ class DecoderMetal final : public Model {
     const int min_block = n == 1 ? 32 : 64;
     const int block = std::max(min_block, (keys_max + max_blocks - 1) / max_blocks);
     const int n_blocks = (keys_max + block - 1) / block;
+    // A threadgroup takes g of a kv head's query heads, each lane holding g *
+    // head_dim / 32 query and accumulator values; past kAttnLaneValues they
+    // spill (Gemma 4's 8 heads of 512 ran at 2.4 GB/s), so wide heads split
+    // their group over threadgroups that each re-read the keys (from cache).
     const int group = c_.num_heads / G.kv_heads;
+    int g = group;
+    while (g > 1 && (g * (G.head_dim / 32) > kAttnLaneValues || group % g != 0)) --g;
     const std::string name =
-        "attn_partial_g" + std::to_string(group) + "_d" + std::to_string(G.head_dim / 32) + (kv_f16_ ? "_h" : "");
+        "attn_partial_g" + std::to_string(g) + "_d" + std::to_string(G.head_dim / 32) + (kv_f16_ ? "_h" : "");
     [enc setComputePipelineState:pipeline(name)];
     bind(enc, q_, 0, 0);
     bind(enc, G.k_cache, 0, 1);
@@ -1538,11 +1547,11 @@ class DecoderMetal final : public Model {
     bind(enc, part_ml_, 0, 4);
     bytes(enc,
           AttnParams{c_.num_heads, G.kv_heads, G.head_dim, start, window, G.capacity, block, n_blocks,
-                     c_.attn_scale, c_.attn_logit_softcapping, blocks ? 1 : 0, 1},
+                     c_.attn_scale, c_.attn_logit_softcapping, blocks ? 1 : 0, group / g},
           5);
     bind(enc, last_key_, blocks ? sizeof(int32_t) * static_cast<size_t>(start - plan_.base) : 0, 6);
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(n_blocks),
-                                          static_cast<NSUInteger>(G.kv_heads), static_cast<NSUInteger>(n))
+                                          static_cast<NSUInteger>(G.kv_heads * (group / g)), static_cast<NSUInteger>(n))
         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     [enc setComputePipelineState:pipeline("attn_reduce")];
     bind(enc, part_o_, 0, 0);
