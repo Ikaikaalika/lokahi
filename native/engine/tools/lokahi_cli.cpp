@@ -9,6 +9,9 @@
 //                                       # greedy: verify up to N drafts a pass
 //                     [--mtp-probe K [--mtp-logits FILE]]   # the MTP head's next K drafts
 //   (every command)   [--draft-model DIR]   # a qwen3_5_mtp drafter for --drafter mtp
+//   lokahi generate-batch --model DIR --prompts-file F --max-new N [--sequences S] [--out FILE]
+//                                       # each prompt its own sequence, decoded together (greedy)
+//   (every command)   [--sequences S]   # sequences (KV caches) the model holds at once
 //   lokahi image-features --model DIR --images A.ppm[,B.ppm] --out FILE [--backend B]
 //   lokahi image-geometry --model DIR --width W --height H   # the processor's resize target
 //   lokahi sample     --logits-file F.f32 --vocab V [sampling flags] [--steps N] [--first-step S]
@@ -133,6 +136,7 @@ LoadOptions load_options(const Args& args) {
   options.cpu_threads = static_cast<unsigned>(args.get_int("threads", 0));
   options.kv_cache = args.get("kv-cache", "auto");
   options.draft_model = args.get("draft-model", "");
+  options.max_sequences = args.get_int("sequences", 1);
   return options;
 }
 
@@ -352,6 +356,77 @@ int cmd_logits(const Args& args) {
   }
   std::printf("{\"backend\":\"%s\",\"rows\":%d,\"vocab_size\":%d,\"prefill\":%d}\n", model->backend(),
               rows, vocab, prefill);
+  return 0;
+}
+
+// Every prompt of --prompts-file (one comma-separated prompt per line) in its
+// own sequence (the model loads --sequences of them, by default one per
+// prompt), prefilled one after another, then decoded together greedily for
+// --max-new tokens in all, one decode_batch per step. --out FILE writes each
+// batched step's logits, [prompts, vocab] floats per step. --warmups W runs
+// the whole of it W times first (pipelines are created on first use);
+// --profile reports the measured batched steps' sections (each its own
+// command buffer, so not fast-path wall time).
+std::string json_sections(const Profiler& profiler);
+
+int cmd_generate_batch(const Args& args) {
+  LK_CHECK(args.has("prompts-file"), "generate-batch needs --prompts-file");
+  std::vector<std::vector<int32_t>> prompts;
+  std::istringstream lines(read_text_file(args.get("prompts-file")));
+  for (std::string line; std::getline(lines, line);) {
+    if (line.find_first_not_of(" \t\r") != std::string::npos) prompts.push_back(parse_tokens(line));
+  }
+  LK_CHECK(!prompts.empty(), "--prompts-file holds no prompts");
+  LoadOptions options = load_options(args);
+  if (!args.has("sequences")) options.max_sequences = static_cast<int>(prompts.size());
+  auto model = load_model(args.get("model"), options);
+  const int n = static_cast<int>(prompts.size());
+  LK_CHECK(n <= model->max_sequences(), "more prompts than --sequences");
+  const int max_new = args.get_int("max-new", 16);
+  LK_CHECK(max_new >= 1, "--max-new must be at least 1");
+  std::vector<std::vector<int32_t>> out;
+  Profiler profiler;
+  double prefill_start = 0.0, decode_start = 0.0;
+  std::ofstream logits;
+  for (int run = 0; run <= args.get_int("warmups", 0); ++run) {
+  const bool measured = run == args.get_int("warmups", 0);
+  out.assign(static_cast<size_t>(n), {});
+  prefill_start = now_seconds();
+  for (int i = 0; i < n; ++i) {
+    model->select_sequence(i);
+    model->reset();
+    const auto& prompt = prompts[static_cast<size_t>(i)];
+    out[static_cast<size_t>(i)].push_back(
+        argmax(model->prefill(prompt.data(), static_cast<int>(prompt.size())), model->vocab_size()));
+  }
+  if (measured && args.has("profile")) model->set_profiler(&profiler);
+  decode_start = now_seconds();
+  if (measured && args.has("out")) {
+    logits.open(args.get("out"), std::ios::binary);
+    LK_CHECK(logits.good(), "cannot write " + args.get("out"));
+  }
+  for (int step = 1; step < max_new; ++step) {
+    std::vector<BatchStep> steps;
+    for (int i = 0; i < n; ++i) steps.push_back(BatchStep{i, out[static_cast<size_t>(i)].back(), SamplingParams{}, step});
+    const std::vector<int32_t> next = model->decode_batch(steps);
+    if (logits.is_open()) {
+      logits.write(reinterpret_cast<const char*>(model->batch_logits()),
+                   static_cast<std::streamsize>(sizeof(float) * static_cast<size_t>(n) *
+                                                static_cast<size_t>(model->vocab_size())));
+    }
+    for (int i = 0; i < n; ++i) out[static_cast<size_t>(i)].push_back(next[static_cast<size_t>(i)]);
+  }
+  }
+  const double decode_seconds = now_seconds() - decode_start;
+  model->set_profiler(nullptr);
+  const std::string sections = args.has("profile") ? ",\"decode_sections\":" + json_sections(profiler) : "";
+  std::string tokens = "[";
+  for (int i = 0; i < n; ++i) tokens += (i ? "," : "") + json_tokens(out[static_cast<size_t>(i)]);
+  tokens += "]";
+  std::printf("{\"backend\":\"%s\",\"sequences\":%d,\"prefill_seconds\":%.6f,\"batched_steps\":%d,"
+              "\"decode_seconds\":%.6f,\"decode_tokens_per_second\":%.3f%s,\"tokens\":%s}\n",
+              model->backend(), n, decode_start - prefill_start, max_new - 1, decode_seconds,
+              max_new > 1 ? n * (max_new - 1) / decode_seconds : 0.0, sections.c_str(), tokens.c_str());
   return 0;
 }
 
@@ -976,6 +1051,7 @@ int main(int argc, char** argv) {
     if (args.command == "image-geometry") return cmd_image_geometry(args);
     if (args.command == "logits") return cmd_logits(args);
     if (args.command == "generate") return cmd_generate(args);
+    if (args.command == "generate-batch") return cmd_generate_batch(args);
     if (args.command == "sample") return cmd_sample(args);
     if (args.command == "serve") return cmd_serve(args);
     if (args.command == "bench") return cmd_bench(args);

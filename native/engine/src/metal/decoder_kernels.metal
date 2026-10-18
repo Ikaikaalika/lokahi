@@ -563,17 +563,20 @@ constant constexpr int QMV_MMA_RB = 2;  // 8-row blocks per simdgroup
 constant constexpr int QMV_MMA_SG = 8;  // simdgroups splitting K
 constant constexpr int QMV_MMA_ROWS = 8 * QMV_MMA_RB;
 
-kernel void qmv_mma(const device uint* w [[buffer(0)]],
-                    const device ushort* scales [[buffer(1)]],
-                    const device ushort* biases [[buffer(2)]],
-                    const device float* x [[buffer(3)]],
-                    device float* y [[buffer(4)]],
-                    constant QmvNParams& p [[buffer(5)]],
-                    uint tg [[threadgroup_position_in_grid]],
-                    uint tid [[thread_index_in_threadgroup]],
-                    uint sg [[simdgroup_index_in_threadgroup]],
-                    uint lane [[thread_index_in_simdgroup]]) {
-  threadgroup float partial[QMV_MMA_SG * QMV_MMA_RB * 64];
+// TB blocks of 8 tokens (qmv_mma: 8, qmv_mma16: 16, a batched decode's rows
+// past 8) share each dequantized A fragment.
+template <int TB>
+[[kernel]] void qmv_mma(const device uint* w [[buffer(0)]],
+                        const device ushort* scales [[buffer(1)]],
+                        const device ushort* biases [[buffer(2)]],
+                        const device float* x [[buffer(3)]],
+                        device float* y [[buffer(4)]],
+                        constant QmvNParams& p [[buffer(5)]],
+                        uint tg [[threadgroup_position_in_grid]],
+                        uint tid [[thread_index_in_threadgroup]],
+                        uint sg [[simdgroup_index_in_threadgroup]],
+                        uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float partial[QMV_MMA_SG * QMV_MMA_RB * TB * 64];
   const int fm = int((lane / 4) & 4) + int((lane / 2) % 4);
   const int fn = int((lane / 4) & 2) * 2 + int(lane % 2) * 2;
   const int row_base = int(tg) * QMV_MMA_ROWS;
@@ -585,32 +588,42 @@ kernel void qmv_mma(const device uint* w [[buffer(0)]],
   const int s1 = min(steps, s0 + per);
   int row[QMV_MMA_RB];
   QMV_N_UNROLL for (int rb = 0; rb < QMV_MMA_RB; ++rb) row[rb] = min(row_base + 8 * rb + fm, p.rows - 1);
-  // This lane's B elements: tokens fn and fn + 1 at codes x_at ... x_at + 3
-  // of each step (k-blocks 0 to 3).
+  // This lane's B elements: tokens 8 tb + fn and 8 tb + fn + 1 at codes
+  // x_at ... x_at + 3 of each step (k-blocks 0 to 3).
   const int x_at = 8 * (fm / 2) + 4 * (fm % 2);
-  const bool t0 = fn < p.n, t1 = fn + 1 < p.n;
-  const device float* x0 = x + (t0 ? fn : 0) * p.cols + x_at;
-  const device float* x1 = x + (t1 ? fn + 1 : 0) * p.cols + x_at;
-  simdgroup_float8x8 acc[QMV_MMA_RB];
-  QMV_N_UNROLL for (int rb = 0; rb < QMV_MMA_RB; ++rb) acc[rb] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  bool t0[TB], t1[TB];
+  const device float* x0[TB];
+  const device float* x1[TB];
+  QMV_N_UNROLL for (int tb = 0; tb < TB; ++tb) {
+    t0[tb] = 8 * tb + fn < p.n;
+    t1[tb] = 8 * tb + fn + 1 < p.n;
+    x0[tb] = x + (t0[tb] ? 8 * tb + fn : 0) * p.cols + x_at;
+    x1[tb] = x + (t1[tb] ? 8 * tb + fn + 1 : 0) * p.cols + x_at;
+  }
+  simdgroup_float8x8 acc[QMV_MMA_RB][TB];
+  QMV_N_UNROLL for (int rb = 0; rb < QMV_MMA_RB; ++rb)
+    QMV_N_UNROLL for (int tb = 0; tb < TB; ++tb) acc[rb][tb] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
   for (int st = s0; st < s1; ++st) {
     const int k0 = st * 32;
-    const float4 xa = t0 ? *reinterpret_cast<const device float4*>(x0 + k0) : float4(0.0f);
-    const float4 xb = t1 ? *reinterpret_cast<const device float4*>(x1 + k0) : float4(0.0f);
     // B carries each code's 16^-nibble factor (nibble j for even rows of k,
     // j + 4 for odd), so A is the masked codes themselves.
-    simdgroup_float8x8 b[4];
+    simdgroup_float8x8 b[TB][4];
+    float2 xs[TB];
     const float odd = (fm % 2) ? (1.0f / 65536.0f) : 1.0f;
-    QMV_N_UNROLL for (int j = 0; j < 4; ++j) {
-      const float f = odd * (1.0f / float(1u << (4 * j)));
-      FRAG_ELEMS(b[j]) = float2(xa[j] * f, xb[j] * f);
+    QMV_N_UNROLL for (int tb = 0; tb < TB; ++tb) {
+      const float4 xa = t0[tb] ? *reinterpret_cast<const device float4*>(x0[tb] + k0) : float4(0.0f);
+      const float4 xb = t1[tb] ? *reinterpret_cast<const device float4*>(x1[tb] + k0) : float4(0.0f);
+      QMV_N_UNROLL for (int j = 0; j < 4; ++j) {
+        const float f = odd * (1.0f / float(1u << (4 * j)));
+        FRAG_ELEMS(b[tb][j]) = float2(xa[j] * f, xb[j] * f);
+      }
+      // Each token's sum of this step's 32 x: this lane holds 4 of them, the
+      // 8 lanes with its fn (lane bits 1, 2 and 4 differ) the rest.
+      xs[tb] = float2(xa[0] + xa[1] + xa[2] + xa[3], xb[0] + xb[1] + xb[2] + xb[3]);
+      xs[tb] += simd_shuffle_xor(xs[tb], ushort(2));
+      xs[tb] += simd_shuffle_xor(xs[tb], ushort(4));
+      xs[tb] += simd_shuffle_xor(xs[tb], ushort(16));
     }
-    // Each token's sum of this step's 32 x: this lane holds 4 of them, the 8
-    // lanes with its fn (lane bits 1, 2 and 4 differ) the rest.
-    float2 xs = float2(xa[0] + xa[1] + xa[2] + xa[3], xb[0] + xb[1] + xb[2] + xb[3]);
-    xs += simd_shuffle_xor(xs, ushort(2));
-    xs += simd_shuffle_xor(xs, ushort(4));
-    xs += simd_shuffle_xor(xs, ushort(16));
     // This lane's word: codes k0 + 8 (fn / 2) ... + 7, all in one group.
     const int word = k0 / 8 + fn / 2;
     const int group = (k0 + 8 * (fn / 2)) / QGROUP;
@@ -621,28 +634,33 @@ kernel void qmv_mma(const device uint* w [[buffer(0)]],
       const float bias = scale_at(biases, gi);
       // The step's codes all share this row's group: its products take the
       // scale once, and the bias times the step's x sums.
-      simdgroup_float8x8 part = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+      simdgroup_float8x8 part[TB];
+      QMV_N_UNROLL for (int tb = 0; tb < TB; ++tb) part[tb] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
       QMV_N_UNROLL for (int j = 0; j < 4; ++j) {
         simdgroup_float8x8 a;
         FRAG_ELEMS(a) = float2(float(code & (0xFu << (4 * j))), float(code & (0xFu << (4 * j + 16))));
-        simdgroup_multiply_accumulate(part, a, b[j], part);
+        QMV_N_UNROLL for (int tb = 0; tb < TB; ++tb) simdgroup_multiply_accumulate(part[tb], a, b[tb][j], part[tb]);
       }
-      FRAG_ELEMS(acc[rb]) += FRAG_ELEMS(part) * s + xs * bias;
+      QMV_N_UNROLL for (int tb = 0; tb < TB; ++tb) FRAG_ELEMS(acc[rb][tb]) += FRAG_ELEMS(part[tb]) * s + xs[tb] * bias;
     }
   }
   // Sum the simdgroups' partial products: rows by tokens, 8 x 8 per block.
   QMV_N_UNROLL for (int rb = 0; rb < QMV_MMA_RB; ++rb)
-    simdgroup_store(acc[rb], partial + (int(sg) * QMV_MMA_RB + rb) * 64, 8);
+    QMV_N_UNROLL for (int tb = 0; tb < TB; ++tb)
+      simdgroup_store(acc[rb][tb], partial + ((int(sg) * QMV_MMA_RB + rb) * TB + tb) * 64, 8);
   threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (int i = int(tid); i < QMV_MMA_RB * 64; i += QMV_MMA_SG * 32) {
-    const int rb = i / 64, r = (i % 64) / 8, t = i % 8;
+  for (int i = int(tid); i < QMV_MMA_RB * TB * 64; i += QMV_MMA_SG * 32) {
+    const int rb = i / (TB * 64), tb = (i / 64) % TB, r = (i % 64) / 8, t = 8 * tb + i % 8;
     const int out_row = row_base + 8 * rb + r;
     if (t >= p.n || out_row >= p.rows) continue;
     float total = 0.0f;
-    QMV_N_UNROLL for (int g = 0; g < QMV_MMA_SG; ++g) total += partial[(g * QMV_MMA_RB + rb) * 64 + r * 8 + t];
+    QMV_N_UNROLL for (int g = 0; g < QMV_MMA_SG; ++g) total += partial[((g * QMV_MMA_RB + rb) * TB + tb) * 64 + r * 8 + i % 8];
     y[t * p.rows + out_row] = total;
   }
 }
+
+template LOKAHI_INSTANCE_ATTRS("qmv_mma") decltype(qmv_mma<1>) qmv_mma<1>;
+template LOKAHI_INSTANCE_ATTRS("qmv_mma16") decltype(qmv_mma<2>) qmv_mma<2>;
 
 // q, k and v projections of one token in one dispatch. Row space is the
 // concatenation [q_rows | kv_rows | kv_rows]; every 4-row block lies in one
@@ -1666,6 +1684,10 @@ struct RopeParams {
   // The head the grid's first threadgroup column handles: 0, or heads to
   // store only keys and values (an MTP head following a pass).
   int first_head;
+  // A batch of sequences' decode steps: row t is sequence rows[t].x's token
+  // at KV position rows[t].y (RoPE position rows[t].z), in that sequence's
+  // slot of the caches (kv_heads * capacity * head_dim elements each).
+  int batched;
 };
 
 // A token's (temporal, row, column) RoPE positions.
@@ -1707,6 +1729,7 @@ template <typename KV>
                                const device float* v_bias [[buffer(11)]],
                                const device int* rope_pos [[buffer(12)]],
                                const device int* rope_axes [[buffer(13)]],
+                               const device int4* rows [[buffer(14)]],
                                uint2 tgp [[threadgroup_position_in_grid]],
                                uint2 tid2 [[thread_position_in_threadgroup]],
                                uint2 tpg2 [[threads_per_threadgroup]],
@@ -1720,9 +1743,15 @@ template <typename KV>
   const int head = int(tgp.x) + p.first_head;
   const int t = int(tgp.y);
   const int half_dim = p.head_dim / 2;
-  const int pos = p.start_pos + t;
-  const RopePos rpos = p.rope_given != 0 ? RopePos{rope_pos[3 * t], rope_pos[3 * t + 1], rope_pos[3 * t + 2]}
-                                         : RopePos{pos + p.rope_offset, pos + p.rope_offset, pos + p.rope_offset};
+  const int pos = p.batched != 0 ? rows[t].y : p.start_pos + t;
+  const int rp = p.batched != 0 ? rows[t].z : pos + p.rope_offset;
+  const RopePos rpos =
+      p.rope_given != 0 ? RopePos{rope_pos[3 * t], rope_pos[3 * t + 1], rope_pos[3 * t + 2]} : RopePos{rp, rp, rp};
+  if (p.batched != 0) {  // this row's sequence's slot of the caches
+    const size_t base = size_t(rows[t].x) * size_t(p.kv_heads) * size_t(p.capacity) * size_t(p.head_dim);
+    k_cache += base;
+    v_cache += base;
+  }
   const bool is_q = head < p.heads;
   const int kvh = head - p.heads;
   const device float* src = is_q ? q + (t * p.heads + head) * p.head_dim
@@ -2360,6 +2389,8 @@ struct AttnParams {
   float softcap;  // 0 disables
   int has_last_key;  // last_key[t] extends query t's keys (Gemma 3's image blocks)
   int groups_per_kv;  // threadgroups of G query heads per kv head: 1, or heads / G for latent attention
+  int batched;        // row t is sequence rows[t].x's query at position rows[t].y, over that
+                      // sequence's slot of the caches (qk_norm_rope_store's batched)
 };
 
 // KV is the cache's element type: half (the _h instances) or float.
@@ -2371,6 +2402,7 @@ template <int G, int DPL, typename KV>
                              device float* part_ml [[buffer(4)]],
                              constant AttnParams& p [[buffer(5)]],
                              const device int* last_key [[buffer(6)]],
+                             const device int4* rows [[buffer(7)]],
                              uint3 tgp [[threadgroup_position_in_grid]],
                              uint sg [[simdgroup_index_in_threadgroup]],
                              uint lane [[thread_index_in_simdgroup]]) {
@@ -2383,7 +2415,12 @@ template <int G, int DPL, typename KV>
   const int kvh = qg / p.groups_per_kv;
   const int t = int(tgp.z);
   const int D = p.head_dim;
-  const int pos = p.start_pos + t;
+  const int pos = p.batched != 0 ? rows[t].y : p.start_pos + t;
+  if (p.batched != 0) {  // this row's sequence's slot of the caches
+    const size_t base = size_t(rows[t].x) * size_t(p.kv_heads) * size_t(p.capacity) * size_t(D);
+    k_cache += base;
+    v_cache += base;
+  }
   const int lo = max(0, pos - p.window + 1);
   const int hi = p.has_last_key != 0 ? max(pos, last_key[t]) : pos;
   const int kb = lo + blk * p.block;
