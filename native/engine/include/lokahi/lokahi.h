@@ -105,7 +105,12 @@ int lokahi_detokenize(const lokahi_tokenizer* tokenizer, const int32_t* ids, int
  *
  * config_json is a UTF-8 JSON object:
  *   {"models": [{"id", "revision", "artifact_digest", "adapter_id"?, "directory"}],
- *    "backend"?, "max_context"?, "queue_limit"?, "text_flush_ms"?, "runtime_revision"?} */
+ *    "backend"?, "max_context"?, "kv_cache"?, "queue_limit"?, "max_sequences"?, "text_flush_ms"?,
+ *    "runtime_revision"?}
+ * max_sequences (default 1) is how many requests each model runs at once:
+ * each holds its own KV cache of max_context tokens, and every step decodes
+ * the running ones in one batched pass (Metal; standard attention models).
+ * The KV memory is reserved at load: max_sequences times one context's. */
 typedef struct lokahi_service lokahi_service;
 
 /* Receives one encoded event or receipt: `length` bytes of UTF-8 JSON, not

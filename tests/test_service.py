@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -344,6 +345,63 @@ def test_deadline_stops_a_running_request(native_cli, tiny, tmp_path):
 
 
 ENVELOPE = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(ctypes.c_char), ctypes.c_size_t)
+
+
+# Continuous batching (max_sequences > 1, Metal): requests share the model,
+# each in its own sequence, and every step decodes the running ones in one
+# pass. Each must stream exactly what it streams served alone.
+def _metal_or_skip():
+    if "metal" not in os.environ.get("LOKAHI_TEST_BACKENDS", "cpu"):
+        pytest.skip("Metal only")
+
+
+def _alone(native_cli, tiny, tmp_path, docs) -> dict[str, tuple[str, dict]]:
+    """Each request served by itself (max_sequences 1): its text and receipt."""
+    out = {}
+    for doc in docs:
+        server = _serve(native_cli, _config(tmp_path / f"alone-{doc['request_id']}.json", tiny[0], backend="metal",
+                                            text_flush_ms=0), [doc])
+        out[doc["request_id"]] = (server.streams.text(doc["request_id"]), server.streams.receipt(doc["request_id"]))
+    return out
+
+
+def test_batched_requests_stream_what_each_streams_alone(native_cli, tiny, tmp_path):
+    _metal_or_skip()
+    docs = [_start("batch-a", 16), _start("batch-b", 9), _start("batch-c", 12),
+            _start("batch-d", 16, sampling={"temperature": 0.8, "top_p": 0.9, "seed": 7}),
+            _start("batch-e", 5), _start("batch-f", 14)]
+    alone = _alone(native_cli, tiny, tmp_path, docs)
+    config = _config(tmp_path / "batched.json", tiny[0], backend="metal", text_flush_ms=0, max_sequences=4)
+    server = _serve(native_cli, config, docs)
+    largest = 0
+    for doc in docs:
+        rid = doc["request_id"]
+        text, receipt = alone[rid]
+        got = server.streams.receipt(rid)
+        assert got["status"] == "completed", got
+        assert got["output_text"] == text == server.streams.text(rid) == receipt["output_text"], rid
+        assert got["usage"] == receipt["usage"] and got["finish_reason"] == receipt["finish_reason"], rid
+        assert got["execution"]["route"] == "batch_generator"
+        largest = max(largest, got["metrics"]["maximum_batch_size"])
+    # Six requests through four sequences: some ran four at once, and the last
+    # two started as earlier ones finished.
+    assert largest == 4 and not server.errors
+
+
+def test_cancelling_one_batched_request_leaves_the_others(native_cli, tiny, tmp_path):
+    _metal_or_skip()
+    docs = [_start("keep-a", 16), _start("drop-b", 4000 - 3000), _start("keep-c", 12)]
+    alone = _alone(native_cli, tiny, tmp_path, [docs[0], docs[2]])
+    server = Server(native_cli, _config(tmp_path / "cancel.json", tiny[0], backend="metal", text_flush_ms=0,
+                                        max_sequences=4))
+    for doc in docs:
+        server.send(doc)
+    server.read_until(lambda d: d.get("request_id") == "drop-b" and d.get("kind") == "text_delta")
+    server.send(_control("cancel", "drop-b"))
+    assert server.close() == 0
+    assert server.streams.receipt("drop-b")["status"] == "cancelled"
+    for rid in ("keep-a", "keep-c"):
+        assert server.streams.receipt(rid)["output_text"] == alone[rid][0], rid
 
 
 @pytest.fixture(scope="module")
