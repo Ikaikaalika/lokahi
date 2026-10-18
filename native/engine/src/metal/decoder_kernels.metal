@@ -2232,11 +2232,11 @@ LOKAHI_ATTN_ALL_DPL(5)
 LOKAHI_ATTN_ALL_DPL(6)
 LOKAHI_ATTN_ALL_DPL(7)
 LOKAHI_ATTN_ALL_DPL(8)
-// Multi-head latent attention: four query heads per threadgroup over the
-// one latent key head, 576 wide in every released model (96 in the tiny
+// Multi-head latent attention: one query head per threadgroup over the one
+// latent key head, 576 wide in every released model (96 in the tiny
 // fixtures). Its cache stays float32.
-LOKAHI_ATTN_KV(4, 3, float, "")
-LOKAHI_ATTN_KV(4, 18, float, "")
+LOKAHI_ATTN_KV(1, 3, float, "")
+LOKAHI_ATTN_KV(1, 18, float, "")
 
 // ---------------------------------------------------------------------------
 // Prefill attention on simdgroup matrices: scores S = Q K^T (scaled, soft-capped

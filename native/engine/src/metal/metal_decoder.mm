@@ -1784,10 +1784,13 @@ class DecoderMetal final : public Model {
   }
 
   // Causal attention of the absorbed queries over the cached latents (one
-  // key head, values its first kv_lora_rank dimensions), four query heads
-  // per threadgroup, into latent_out_ (whose rope dimensions are unused).
+  // key head, values its first kv_lora_rank dimensions) into latent_out_
+  // (whose rope dimensions are unused): attn_flash for long passes, else
+  // attn_partial with one query head per threadgroup.
   void encode_latent_attention(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n, int start) {
-    constexpr int kHeadsPerGroup = 4;
+    // One query head per threadgroup: four of 576 spilled each lane's 72
+    // query and 72 accumulator values (decode 1.9x slower on M1).
+    constexpr int kHeadsPerGroup = 1;
     const int H = c_.num_heads, width = c_.latent_width();
     // A long pass on simdgroup matrices: attn_flash with values the first
     // kv_lora_rank of the latents, four simdgroups per 8 query rows.
@@ -1805,10 +1808,13 @@ class DecoderMetal final : public Model {
       return;
     }
     const int keys_max = start + n;
-    const int max_blocks = n == 1 ? kDecodeMaxBlocks : kPrefillMaxBlocks;
+    const int max_blocks =
+        n == 1 ? std::clamp(kDecodeGroupsPerCore * gpu_cores_ * kHeadsPerGroup / H, 1, kDecodeMaxBlocks)
+               : kPrefillMaxBlocks;
     const int block = std::max(n == 1 ? 32 : 64, (keys_max + max_blocks - 1) / max_blocks);
     const int n_blocks = (keys_max + block - 1) / block;
-    [enc setComputePipelineState:pipeline("attn_partial_g4_d" + std::to_string(width / 32))];
+    [enc setComputePipelineState:pipeline("attn_partial_g" + std::to_string(kHeadsPerGroup) + "_d" +
+                                          std::to_string(width / 32))];
     bind(enc, latent_q_, 0, 0);
     bind(enc, G.k_cache, 0, 1);
     bind(enc, G.k_cache, 0, 2);
