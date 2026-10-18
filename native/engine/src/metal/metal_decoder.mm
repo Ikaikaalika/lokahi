@@ -1111,11 +1111,13 @@ class DecoderMetal final : public Model {
       return;
     }
     // 4-bit weights take the pipelined kernel, staged in half for a norm's
-    // output (h_, whose values half holds) and in float for anything else.
-    // Mixture-of-experts models stage in float throughout: half's rounding
-    // reaches later layers' routers and flips their top-k near a tie.
+    // output (h_, whose values half holds), or for any input when the
+    // checkpoint itself is float16 (F16 scales: its reference runs in half,
+    // as MLX does), and in float otherwise. Mixture-of-experts models stage
+    // in float throughout: half's rounding reaches later layers' routers and
+    // flips their top-k near a tie.
     const bool four_bit = l.bits == 4 && !l.mxfp4;
-    const bool half_staging = x == h_ && c_.num_experts == 0;
+    const bool half_staging = (x == h_ || !l.bf16) && c_.num_experts == 0;
     [enc setComputePipelineState:quant_pipeline(!four_bit ? "qmm" : half_staging ? "qmm4_h" : "qmm4_f", l)];
     bind_weights(enc, l, 0);
     bind(enc, x, 0, 3);
