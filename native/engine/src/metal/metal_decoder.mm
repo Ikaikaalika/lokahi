@@ -33,6 +33,35 @@ std::string ns_error(NSError* error) {
   return error ? std::string([[error localizedDescription] UTF8String]) : std::string("unknown error");
 }
 
+void check_fragment_layout(id<MTLDevice> device, id<MTLCommandQueue> queue, id<MTLLibrary> library) {
+  NSError* error = nil;
+  id<MTLFunction> function = [library newFunctionWithName:@"simdgroup_layout_probe"];
+  LK_CHECK(function != nil, "metal: missing kernel simdgroup_layout_probe");
+  id<MTLComputePipelineState> probe = [device newComputePipelineStateWithFunction:function error:&error];
+  LK_CHECK(probe != nil, "metal: pipeline simdgroup_layout_probe: " + ns_error(error));
+  id<MTLBuffer> out = [device newBufferWithLength:128 * sizeof(float) options:MTLResourceStorageModeShared];
+  id<MTLCommandBuffer> cb = [queue commandBuffer];
+  id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+  [enc setComputePipelineState:probe];
+  [enc setBuffer:out offset:0 atIndex:0];
+  [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+  [enc endEncoding];
+  [cb commit];
+  [cb waitUntilCompleted];
+  bool matches = cb.status == MTLCommandBufferStatusCompleted;
+  const float* got = static_cast<const float*>(out.contents);
+  for (int lane = 0; matches && lane < 32; ++lane) {
+    const int row = (lane / 4 & 4) + lane / 2 % 4;
+    const int col = (lane / 4 & 2) * 2 + lane % 2 * 2;
+    for (int j = 0; j < 2; ++j) {
+      const float want = static_cast<float>(row * 8 + col + j);
+      if (got[lane * 4 + j] != want || got[lane * 4 + 2 + j] != want) matches = false;
+    }
+  }
+  LK_CHECK(matches, std::string("metal: ") + [[device name] UTF8String] +
+                        " holds simdgroup matrix elements in a layout the kernels do not assume; use --backend cpu");
+}
+
 id<MTLLibrary> compile_kernels(id<MTLDevice> device) {
   MTLCompileOptions* compile = [MTLCompileOptions new];
   compile.languageVersion = MTLLanguageVersion3_0;
@@ -295,17 +324,11 @@ class DecoderMetal final : public Model {
       queue_ = [device_ newCommandQueue];
       gpu_cores_ = gpu_core_count();
       library_ = compile_kernels(device_);
+      check_fragment_layout(device_, queue_, library_);
       validate();
       upload();
       allocate_state();
       zero_states();
-      fragments_ = fragment_layout_matches();
-      if (!fragments_) {
-        std::fprintf(stderr,
-                     "metal: %s holds simdgroup matrix elements in another layout; "
-                     "attention and short passes keep their unfused kernels\n",
-                     [[device_ name] UTF8String]);
-      }
     }
   }
 
@@ -1151,7 +1174,7 @@ class DecoderMetal final : public Model {
     if (n <= kQmvNMax && !l.mxfp4) {  // a short pass: read the weights once for all n tokens
       // 4-bit weights on simdgroup matrices: one dequantization for all n
       // (its 32-code steps need groups of a multiple of 32).
-      if (fragments_ && l.bits == 4 && l.group % 32 == 0 && n >= kQmvMmaMinRows) {
+      if (l.bits == 4 && l.group % 32 == 0 && n >= kQmvMmaMinRows) {
         [enc setComputePipelineState:quant_pipeline("qmv_mma", l)];
         bind_weights(enc, l, 0);
         bind(enc, x, 0, 3);
@@ -1392,7 +1415,7 @@ class DecoderMetal final : public Model {
     // A long pass in chunks of 8 tokens on simdgroup matrices (gdn_chunk),
     // for the key widths it is built for.
     const int dk = c_.linear_k_dim;
-    const bool chunked = fragments_ && n >= kGdnChunkMinRows && c_.linear_v_dim % 8 == 0 &&
+    const bool chunked = n >= kGdnChunkMinRows && c_.linear_v_dim % 8 == 0 &&
                          (dk == 16 || dk == 32 || dk == 64 || dk == 128 || dk == 256);
     [enc setComputePipelineState:pipeline(chunked ? "gdn_chunk_k" + std::to_string(dk) : std::string("gdn_recurrence"))];
     bind(enc, rows, 0, 0);
@@ -1578,7 +1601,7 @@ class DecoderMetal final : public Model {
       // 512-wide heads need the half cache (8 float keys of 512 would not fit).
       const bool flash_width =
           G.head_dim == 64 || G.head_dim == 128 || G.head_dim == 256 || (G.head_dim == 512 && kv_f16_);
-      if (fragments_ && flash_width) {
+      if (flash_width) {
         encode_attention_flash(enc, G, n, start, window, blocks);
         return;
       }
@@ -1622,35 +1645,6 @@ class DecoderMetal final : public Model {
     bind(enc, G.sinks, 4);
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(c_.num_heads), static_cast<NSUInteger>(n), 1)
         threadsPerThreadgroup:MTLSizeMake(static_cast<NSUInteger>(G.head_dim), 1, 1)];
-  }
-
-  // Whether this GPU's simdgroup matrices hold the elements attn_flash and
-  // qmv_mma assume: lane l, two adjacent elements of row (l / 4 & 4) +
-  // (l / 2 % 4) from column (l / 4 & 2) * 2 + (l % 2) * 2, for loaded
-  // matrices and for products alike. Checked once at load (one dispatch) so
-  // a GPU that lays them out otherwise keeps the other kernels instead of
-  // computing wrong results.
-  bool fragment_layout_matches() {
-    id<MTLBuffer> out = [device_ newBufferWithLength:128 * sizeof(float) options:MTLResourceStorageModeShared];
-    id<MTLCommandBuffer> cb = [queue_ commandBuffer];
-    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
-    [enc setComputePipelineState:pipeline("simdgroup_layout_probe")];
-    [enc setBuffer:out offset:0 atIndex:0];
-    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-    [enc endEncoding];
-    [cb commit];
-    [cb waitUntilCompleted];
-    if (cb.status != MTLCommandBufferStatusCompleted) return false;
-    const float* got = static_cast<const float*>(out.contents);
-    for (int lane = 0; lane < 32; ++lane) {
-      const int row = (lane / 4 & 4) + lane / 2 % 4;
-      const int col = (lane / 4 & 2) * 2 + lane % 2 * 2;
-      for (int j = 0; j < 2; ++j) {
-        const float want = static_cast<float>(row * 8 + col + j);
-        if (got[lane * 4 + j] != want || got[lane * 4 + 2 + j] != want) return false;
-      }
-    }
-    return true;
   }
 
   // A long pass's attention in one fused kernel (attn_flash), 32 query rows
@@ -1838,7 +1832,7 @@ class DecoderMetal final : public Model {
     // A long pass on simdgroup matrices: attn_flash with values the first
     // kv_lora_rank of the latents, four simdgroups per 8 query rows.
     const bool flash_shape = (width == 576 && c_.kv_lora_rank == 512) || (width == 96 && c_.kv_lora_rank == 64);
-    if (fragments_ && n >= kAttnMmMinRows && flash_shape) {
+    if (n >= kAttnMmMinRows && flash_shape) {
       [enc setComputePipelineState:pipeline("attn_flash_mla_" + std::to_string(width))];
       bind(enc, latent_q_, 0, 0);
       bind(enc, G.k_cache, 0, 1);
@@ -1852,7 +1846,7 @@ class DecoderMetal final : public Model {
           threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
       return;
     }
-    if (fragments_ && n == 1 && flash_shape) {
+    if (n == 1 && flash_shape) {
       // A decode step: the heads as attn_flash's rows over one shared cache,
       // read once per 32 heads (attn_partial read it once per head), split
       // into key blocks sized to the GPU, then attn_reduce over the values.
@@ -2580,7 +2574,6 @@ class DecoderMetal final : public Model {
   id<MTLDevice> device_ = nil;
   id<MTLCommandQueue> queue_ = nil;
   id<MTLLibrary> library_ = nil;
-  bool fragments_ = false;  // fragment_layout_matches(): attn_flash and qmv_mma may run
   int gpu_cores_ = 8;       // gpu_core_count(), for sizing decode attention
   std::map<std::string, id<MTLComputePipelineState>> pipelines_;
 

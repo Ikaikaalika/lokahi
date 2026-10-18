@@ -66,6 +66,7 @@ class MetalKit {
     LK_CHECK(device_ != nil, "metal: no Metal device");
     queue_ = [device_ newCommandQueue];
     library_ = compile_kernels(device_);
+    check_fragment_layout(device_, queue_, library_);
     // Bound where a kernel's optional input is unused, and filled with NaN so
     // a kernel that reads it anyway (a bias flagged present but nil) fails
     // every check instead of adding whatever the recycled page held.

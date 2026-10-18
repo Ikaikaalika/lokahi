@@ -2913,8 +2913,9 @@ decltype(attn_flash<float, 96, 64, 8, 4, true>) attn_flash<float, 96, 64, 8, 4, 
 
 // One simdgroup writes, per lane, the two elements thread_elements() holds of
 // a loaded 8x8 matrix (element r * 8 + c holds r * 8 + c) and of its product
-// with the identity, so the host can check the fragment layout attn_flash
-// assumes before using it on this GPU.
+// with the identity, so the host can check the fragment layout every
+// per-lane matrix kernel assumes (check_fragment_layout), and refuse the GPU
+// otherwise.
 kernel void simdgroup_layout_probe(device float* out [[buffer(0)]], uint lane [[thread_index_in_simdgroup]]) {
   threadgroup float m[64];
   threadgroup float eye[64];
