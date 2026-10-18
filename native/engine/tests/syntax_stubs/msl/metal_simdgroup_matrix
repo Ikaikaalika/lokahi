@@ -6,7 +6,7 @@ template <typename T, int C, int R> struct simdgroup_matrix {
   T (&thread_elements())[C * R] { return v; }
 };
 typedef simdgroup_matrix<float, 8, 8> simdgroup_float8x8;
-template <typename T, int C, int R> simdgroup_matrix<T, C, R> make_filled_simdgroup_matrix(T) { return {}; }
+template <typename T, int C, int R = C> simdgroup_matrix<T, C, R> make_filled_simdgroup_matrix(T) { return {}; }
 template <typename T, int C, int R>
 void simdgroup_load(simdgroup_matrix<T, C, R>&, const T*, unsigned long = C, ulong2 = ulong2(0, 0), bool = false) {}
 template <typename T, int C, int R> void simdgroup_store(const simdgroup_matrix<T, C, R>&, T*, unsigned long = C) {}
@@ -14,3 +14,6 @@ template <typename T, int C, int R> void simdgroup_store(const simdgroup_matrix<
 template <typename TD, typename TA, typename TB, typename TC, int C, int R>
 void simdgroup_multiply_accumulate(simdgroup_matrix<TD, C, R>&, const simdgroup_matrix<TA, C, R>&,
                                    const simdgroup_matrix<TB, C, R>&, const simdgroup_matrix<TC, C, R>&) {}
+template <typename TD, typename TA, typename TB, int C, int R>
+void simdgroup_multiply(simdgroup_matrix<TD, C, R>&, const simdgroup_matrix<TA, C, R>&,
+                        const simdgroup_matrix<TB, C, R>&) {}

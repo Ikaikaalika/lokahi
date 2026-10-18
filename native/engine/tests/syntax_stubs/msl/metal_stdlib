@@ -27,6 +27,11 @@ struct float2 {
   float2& operator*=(float v) { x *= v; y *= v; return *this; }
   float2& operator+=(float2 o) { x += o.x; y += o.y; return *this; }
   float2 operator+(float2 o) const { return {x + o.x, y + o.y}; }
+  float2 operator-(float2 o) const { return {x - o.x, y - o.y}; }
+  float2 operator*(float2 o) const { return {x * o.x, y * o.y}; }
+  float2& operator-=(float2 o) { x -= o.x; y -= o.y; return *this; }
+  float2& operator*=(float2 o) { x *= o.x; y *= o.y; return *this; }
+  friend float2 operator*(float v, float2 o) { return {v * o.x, v * o.y}; }
   float2(float a, float b) : x(a), y(b) {}
 };
 struct float4 {
@@ -79,6 +84,8 @@ template <typename T> T simd_min(T v) { return v; }
 inline uint mulhi(uint a, uint b) { return static_cast<uint>((static_cast<unsigned long long>(a) * b) >> 32); }
 template <typename T> T simd_shuffle_down(T v, ushort) { return v; }
 template <typename T> T simd_shuffle_xor(T v, ushort) { return v; }
+template <typename T> T simd_shuffle(T v, ushort) { return v; }
+template <typename T> T simd_prefix_inclusive_sum(T v) { return v; }
 template <typename T, typename U> T as_type(U v) { T out; std::memcpy(&out, &v, sizeof(T)); return out; }
 template <typename T> T max(T a, T b) { return a > b ? a : b; }
 template <typename T> T min(T a, T b) { return a < b ? a : b; }

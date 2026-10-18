@@ -2073,6 +2073,146 @@ kernel void gdn_recurrence(const device float* mixed [[buffer(0)]],
   for (int r = 0; r < rows; ++r) state_out[column + lane + 32 * r] = s[r];
 }
 
+// gdn_recurrence's rule over a long pass in chunks of 8 tokens on simdgroup
+// matrices (the WY form). One simdgroup per (value head h, 8 value columns)
+// holds those columns of S as DK / 8 tiles (rows: key dimension). With a
+// chunk's keys K, queries Q, values V (rows: tokens), betas b, cumulative
+// log decays c (G = exp c), S0 the state before it, and
+// A = strictly-lower(diag(b) K K^T) (nilpotent):
+//   T = (I + A)^-1 = (I - A)(I + A^2)(I + A^4)
+//   D = (T o e^(c_i - c_j)) (b V) - diag(G) T (b K) S0  (the chunk's deltas)
+//   O = diag(G) Q S0 + (Q K^T o e^(c_i - c_j), j <= i) D
+//   S = G_last S0 + K^T diag(e^(c_last - c_j)) D
+// which is the token-by-token rule regrouped (diag(G) conjugates A's decays
+// out of the inverse). Grid: threadgroups (ceil(dv / 32), Hv) of 4
+// simdgroups; dv % 8 == 0.
+// A tile of 8 tokens' rows (row fm) or, transposed, of their columns (fn,
+// fn + 1) from columns col ... col + 7 of mixed, zero past the chunk's end.
+inline simdgroup_float8x8 gdn_rows(const device float* row_m, bool m_ok, int col, short fn) {
+  simdgroup_float8x8 m;
+  FRAG_ELEMS(m) = m_ok ? float2(row_m[col + fn], row_m[col + fn + 1]) : float2(0.0f);
+  return m;
+}
+
+inline simdgroup_float8x8 gdn_cols(const device float* row_n0, const device float* row_n1, bool n0_ok, bool n1_ok,
+                                   int col, short fm) {
+  simdgroup_float8x8 m;
+  FRAG_ELEMS(m) = float2(n0_ok ? row_n0[col + fm] : 0.0f, n1_ok ? row_n1[col + fm] : 0.0f);
+  return m;
+}
+
+template <short DK>
+[[kernel]] void gdn_chunk(const device float* mixed [[buffer(0)]],
+                          const device float* beta [[buffer(1)]],
+                          const device float* decay [[buffer(2)]],
+                          const device float* state_in [[buffer(3)]],
+                          device float* state_out [[buffer(4)]],
+                          device float* out [[buffer(5)]],
+                          constant GdnRecurrenceParams& p [[buffer(6)]],
+                          uint2 tgp [[threadgroup_position_in_grid]],
+                          uint sg [[simdgroup_index_in_threadgroup]],
+                          uint lane [[thread_index_in_simdgroup]]) {
+  constexpr short KT = DK / 8;
+  const int j0 = (int(tgp.x) * GDN_SIMDGROUPS + int(sg)) * 8, h = int(tgp.y);
+  if (j0 >= p.value_dim) return;  // uniform across the simdgroup
+  const int hv = p.value_heads, kh = h / (hv / p.key_heads);
+  const short fm = short((lane / 4) & 4) + short((lane / 2) % 4);
+  const short fn = short((lane / 4) & 2) * 2 + short(lane % 2) * 2;
+  const int q_col = kh * DK, k_col = (p.key_heads + kh) * DK, v_col = 2 * p.key_heads * DK + h * p.value_dim + j0;
+  simdgroup_float8x8 S[KT];
+  const device float* s_in = state_in + (size_t(h) * p.value_dim + j0) * DK;
+  QMM_UNROLL for (short kk = 0; kk < KT; ++kk) {
+    FRAG_ELEMS(S[kk]) = float2(s_in[fn * DK + kk * 8 + fm], s_in[(fn + 1) * DK + kk * 8 + fm]);
+  }
+  for (int t0 = 0; t0 < p.n; t0 += 8) {
+    const short valid = short(min(8, p.n - t0));
+    // Cumulative log decays of the chunk's tokens (0 past its end).
+    const int t_lane = t0 + int(lane);
+    const float lg = int(lane) < valid ? precise::log(max(decay[t_lane * hv + h], 1e-30f)) : 0.0f;
+    const float c = simd_prefix_inclusive_sum(lg);
+    const float c_m = simd_shuffle(c, ushort(fm)), c_n0 = simd_shuffle(c, ushort(fn)),
+                c_n1 = simd_shuffle(c, ushort(fn + 1)), c_last = simd_shuffle(c, ushort(7));
+    const float g_m = precise::exp(c_m), g_last = precise::exp(c_last);
+    const float e0 = fn > fm ? 0.0f : precise::exp(c_m - c_n0), e1 = fn + 1 > fm ? 0.0f : precise::exp(c_m - c_n1);
+    const float l0 = precise::exp(c_last - c_n0), l1 = precise::exp(c_last - c_n1);
+    const bool m_ok = fm < valid, n0_ok = fn < valid, n1_ok = fn + 1 < valid;
+    const float b_m = m_ok ? beta[(t0 + fm) * hv + h] : 0.0f;
+    const device float* row_m = mixed + (t0 + fm) * p.channels;
+    const device float* row_n0 = mixed + (t0 + fn) * p.channels;
+    const device float* row_n1 = mixed + (t0 + fn + 1) * p.channels;
+    simdgroup_float8x8 kkt = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    QMM_UNROLL for (short kk = 0; kk < KT; ++kk) {
+      simdgroup_multiply_accumulate(kkt, gdn_rows(row_m, m_ok, k_col + kk * 8, fn),
+                                    gdn_cols(row_n0, row_n1, n0_ok, n1_ok, k_col + kk * 8, fm), kkt);
+    }
+    // A, then T = (I - A)(I + A^2)(I + A^4).
+    simdgroup_float8x8 a, tinv, pw;
+    {
+      const float2 v = FRAG_ELEMS(kkt);
+      FRAG_ELEMS(a) = float2(fn >= fm ? 0.0f : b_m * v.x, fn + 1 >= fm ? 0.0f : b_m * v.y);
+      FRAG_ELEMS(tinv) = float2((fn == fm ? 1.0f : 0.0f), (fn + 1 == fm ? 1.0f : 0.0f)) - FRAG_ELEMS(a);
+    }
+    pw = a;
+    QMM_UNROLL for (short step = 0; step < 2; ++step) {
+      simdgroup_multiply(pw, pw, pw);
+      simdgroup_multiply_accumulate(tinv, tinv, pw, tinv);
+    }
+    // W S0 with W = diag(G) T (b K).
+    simdgroup_float8x8 ws = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    QMM_UNROLL for (short kk = 0; kk < KT; ++kk) {
+      simdgroup_float8x8 bk = gdn_rows(row_m, m_ok, k_col + kk * 8, fn), w;
+      FRAG_ELEMS(bk) *= b_m;
+      simdgroup_multiply(w, tinv, bk);
+      FRAG_ELEMS(w) *= g_m;
+      simdgroup_multiply_accumulate(ws, w, S[kk], ws);
+    }
+    // D = (T o decays) (b V) - W S0.
+    simdgroup_float8x8 vb = gdn_rows(row_m, m_ok, v_col, fn), delta;
+    FRAG_ELEMS(vb) *= b_m;
+    FRAG_ELEMS(tinv) *= float2(e0, e1);
+    simdgroup_multiply(delta, tinv, vb);
+    FRAG_ELEMS(delta) -= FRAG_ELEMS(ws);
+    // O = diag(G) Q S0 + (Q K^T o decays) D.
+    simdgroup_float8x8 qkt = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    simdgroup_float8x8 o = make_filled_simdgroup_matrix<float, 8>(0.0f);
+    QMM_UNROLL for (short kk = 0; kk < KT; ++kk) {
+      simdgroup_float8x8 q = gdn_rows(row_m, m_ok, q_col + kk * 8, fn);
+      simdgroup_multiply_accumulate(qkt, q, gdn_cols(row_n0, row_n1, n0_ok, n1_ok, k_col + kk * 8, fm), qkt);
+      FRAG_ELEMS(q) *= g_m;
+      simdgroup_multiply_accumulate(o, q, S[kk], o);
+    }
+    FRAG_ELEMS(qkt) *= float2(e0, e1);
+    simdgroup_multiply_accumulate(o, qkt, delta, o);
+    if (m_ok) {
+      device float* y = out + ((t0 + fm) * hv + h) * p.value_dim + j0 + fn;
+      y[0] = FRAG_ELEMS(o).x;
+      y[1] = FRAG_ELEMS(o).y;
+    }
+    // S = G_last S0 + K^T diag(e^(c_last - c_j)) D.
+    QMM_UNROLL for (short kk = 0; kk < KT; ++kk) {
+      simdgroup_float8x8 kt = gdn_cols(row_n0, row_n1, n0_ok, n1_ok, k_col + kk * 8, fm), kd;
+      FRAG_ELEMS(kt) *= float2(l0, l1);
+      simdgroup_multiply(kd, kt, delta);
+      FRAG_ELEMS(S[kk]) = g_last * FRAG_ELEMS(S[kk]) + FRAG_ELEMS(kd);
+    }
+  }
+  device float* s_out = state_out + (size_t(h) * p.value_dim + j0) * DK;
+  QMM_UNROLL for (short kk = 0; kk < KT; ++kk) {
+    const float2 v = FRAG_ELEMS(S[kk]);
+    s_out[fn * DK + kk * 8 + fm] = v.x;
+    s_out[(fn + 1) * DK + kk * 8 + fm] = v.y;
+  }
+}
+
+#define LOKAHI_GDN_CHUNK(DK) \
+  template LOKAHI_INSTANCE_ATTRS("gdn_chunk_k" #DK) decltype(gdn_chunk<DK>) gdn_chunk<DK>;
+LOKAHI_GDN_CHUNK(16)
+LOKAHI_GDN_CHUNK(32)
+LOKAHI_GDN_CHUNK(64)
+LOKAHI_GDN_CHUNK(128)
+LOKAHI_GDN_CHUNK(256)
+#undef LOKAHI_GDN_CHUNK
+
 // Gated DeltaNet's output norm: out = rms(o) * w * silu(z) per row of
 // p.cols (one value head), with a plain weight. One threadgroup per row.
 kernel void gated_rms_norm_rows(device float* o [[buffer(0)]],

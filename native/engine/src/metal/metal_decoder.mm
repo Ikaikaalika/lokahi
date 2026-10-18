@@ -220,6 +220,8 @@ struct HeadTilesParams { int n; int heads; };
 // From this many tokens, a pass's experts run grouped by expert (moe_sort,
 // moe_qmm) instead of one matrix-vector product per (token, slot) pair.
 constexpr int kMoeGroupedMinTokens = 16;
+// From this many tokens, Gated DeltaNet's rule runs in chunks of 8 (gdn_chunk).
+constexpr int kGdnChunkMinRows = 16;
 struct AbsorbParams { int heads; int nope; int head_rows; int cols; int x_stride; int y_stride; };
 struct MlaRopeParams { int heads; int nope; int rope; int rank; int start_pos; float eps; int pairs; float factor; };
 struct MoeCombineParams { int cols; int k; int count; int has_shared; };
@@ -1384,7 +1386,12 @@ class DecoderMetal final : public Model {
   // decays, from state_in into state_out; the outputs go to lin_out_.
   void encode_delta_rule(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> rows, id<MTLBuffer> beta,
                          id<MTLBuffer> decay, id<MTLBuffer> state_in, id<MTLBuffer> state_out, int n) {
-    [enc setComputePipelineState:pipeline("gdn_recurrence")];
+    // A long pass in chunks of 8 tokens on simdgroup matrices (gdn_chunk),
+    // for the key widths it is built for.
+    const int dk = c_.linear_k_dim;
+    const bool chunked = fragments_ && n >= kGdnChunkMinRows && c_.linear_v_dim % 8 == 0 &&
+                         (dk == 16 || dk == 32 || dk == 64 || dk == 128 || dk == 256);
+    [enc setComputePipelineState:pipeline(chunked ? "gdn_chunk_k" + std::to_string(dk) : std::string("gdn_recurrence"))];
     bind(enc, rows, 0, 0);
     bind(enc, beta, 0, 1);
     bind(enc, decay, 0, 2);
@@ -1394,7 +1401,10 @@ class DecoderMetal final : public Model {
     bytes(enc, GdnRecurrenceParams{c_.linear_k_heads, c_.linear_v_heads, c_.linear_k_dim, c_.linear_v_dim,
                                    c_.linear_channels(), n},
           6);
-    [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((c_.linear_v_dim + 3) / 4),
+    // Four simdgroups per threadgroup: four value columns each, or four
+    // blocks of 8 chunked.
+    const int columns = chunked ? 32 : 4;
+    [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((c_.linear_v_dim + columns - 1) / columns),
                                           static_cast<NSUInteger>(c_.linear_v_heads), 1)
         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
   }
