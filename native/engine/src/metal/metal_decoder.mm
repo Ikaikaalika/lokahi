@@ -277,6 +277,7 @@ struct AttnParams {
 struct AttnMmParams {
   int heads; int kv_heads; int head_dim; int start_pos; int row0; int rows; int key_base; int keys; int window;
   int capacity; float scale; float softcap; int has_last_key; int head_rows = 0; int block_keys = 0; int has_bounds = 0;
+  int batched = 0;
 };
 struct ReplaceParams { int cols; int n; };
 struct ReduceParams { int heads; int head_dim; int n_blocks; int has_sinks; };
@@ -1235,6 +1236,21 @@ class DecoderMetal final : public Model {
     wait(cb);
   }
 
+  // pipeline(name), failing closed unless this GPU's compile of it takes
+  // `threads` per threadgroup: Metal runs a larger dispatch without an error
+  // and computes garbage (attn_flash_mla_576 once fell to 448 of its 512).
+  id<MTLComputePipelineState> pipeline(const std::string& name, NSUInteger threads) {
+    return checked(pipeline(name), name, threads);
+  }
+
+  static id<MTLComputePipelineState> checked(id<MTLComputePipelineState> pso, const std::string& name,
+                                             NSUInteger threads) {
+    LK_CHECK(threads <= [pso maxTotalThreadsPerThreadgroup],
+             "metal: " + name + " compiles for at most " + std::to_string([pso maxTotalThreadsPerThreadgroup]) +
+                 " threads per threadgroup; its dispatch needs " + std::to_string(threads));
+    return pso;
+  }
+
   id<MTLComputePipelineState> pipeline(const std::string& name) {
     auto it = pipelines_.find(name);
     if (it != pipelines_.end()) return it->second;
@@ -1320,7 +1336,7 @@ class DecoderMetal final : public Model {
       return;
     }
     if (short_mma16(l, n) && x != h16_) {  // two 8-token blocks per dequantized fragment (qmv_mma16)
-      [enc setComputePipelineState:quant_pipeline("qmv_mma16", l)];
+      [enc setComputePipelineState:checked(quant_pipeline("qmv_mma16", l), "qmv_mma16", 256)];
       bind_weights(enc, l, 0);
       bind(enc, x, 0, 3);
       bind(enc, y, 0, 4);
@@ -1348,7 +1364,7 @@ class DecoderMetal final : public Model {
       // 4-bit weights on simdgroup matrices: one dequantization for all n
       // (its 32-code steps need groups of a multiple of 32).
       if (l.bits == 4 && l.group % 32 == 0 && n >= kQmvMmaMinRows) {
-        [enc setComputePipelineState:quant_pipeline("qmv_mma", l)];
+        [enc setComputePipelineState:checked(quant_pipeline("qmv_mma", l), "qmv_mma", 256)];
         bind_weights(enc, l, 0);
         bind(enc, x, 0, 3);
         bind(enc, y, 0, 4);
@@ -1870,7 +1886,8 @@ class DecoderMetal final : public Model {
     const int key_base = std::max(0, start - window + 1);  // the earliest key any row of the pass sees
     const AttnMmParams params{c_.num_heads, G.kv_heads, G.head_dim, start, 0, n, key_base, start + n - key_base,
                               window, G.capacity, c_.attn_scale, c_.attn_logit_softcapping, blocks ? 1 : 0};
-    [enc setComputePipelineState:pipeline("attn_flash_d" + std::to_string(G.head_dim) + (kv_f16_ ? "_h" : ""))];
+    const NSUInteger threads = G.head_dim == 512 ? 256 : 128;
+    [enc setComputePipelineState:pipeline("attn_flash_d" + std::to_string(G.head_dim) + (kv_f16_ ? "_h" : ""), threads)];
     bind(enc, q_, 0, 0);
     bind(enc, G.k_cache, kv_offset(G), 1);
     bind(enc, G.v_cache, kv_offset(G), 2);
@@ -1879,9 +1896,10 @@ class DecoderMetal final : public Model {
     bind(enc, last_key_, blocks ? sizeof(int32_t) * static_cast<size_t>(start - plan_.base) : 0, 5);
     bind(enc, placeholder_, 6);
     bind(enc, placeholder_, 7);
+    bind(enc, placeholder_, 8);
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((n + 31) / 32), static_cast<NSUInteger>(c_.num_heads),
                                           1)
-        threadsPerThreadgroup:MTLSizeMake(G.head_dim == 512 ? 256 : 128, 1, 1)];
+        threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
   }
 
   // A long pass's attention as S = Q K^T, softmax, P V on simdgroup matrices,
@@ -2054,7 +2072,7 @@ class DecoderMetal final : public Model {
     const bool flash_shape = (width == 576 && c_.kv_lora_rank == 512) || (width == 96 && c_.kv_lora_rank == 64);
     // A batched pass's rows are different sequences: attn_partial, row by row.
     if (n >= kAttnMmMinRows && flash_shape && !batched_) {
-      [enc setComputePipelineState:pipeline("attn_flash_mla_" + std::to_string(width))];
+      [enc setComputePipelineState:pipeline("attn_flash_mla_" + std::to_string(width), 512)];
       bind(enc, latent_q_, 0, 0);
       bind(enc, G.k_cache, kv_offset(G), 1);
       bind(enc, G.k_cache, kv_offset(G), 2);
@@ -2063,29 +2081,40 @@ class DecoderMetal final : public Model {
       bind(enc, placeholder_, 5);
       bind(enc, placeholder_, 6);
       bind(enc, placeholder_, 7);
+      bind(enc, placeholder_, 8);
       [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((n + 31) / 32), static_cast<NSUInteger>(H), 1)
           threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
       return;
     }
-    if (n == 1 && flash_shape && !batched_) {
-      // A decode step: the heads as attn_flash's rows over one shared cache,
-      // read once per 32 heads (attn_partial read it once per head), split
-      // into key blocks sized to the GPU, then attn_reduce over the values.
-      const int row_tiles = (H + 31) / 32, keys = start + 1;
-      const int wanted = std::clamp(kDecodeGroupsPerCore * gpu_cores_ / row_tiles, 1, kDecodeMaxBlocks);
+    if (flash_shape && (n == 1 || batched_)) {
+      // A decode step, or a batched pass's rows (each its own sequence, grid
+      // z): the heads as attn_flash's rows over the shared cache, read once
+      // per 32 heads (attn_partial read it once per head), split into key
+      // blocks sized to the GPU, then attn_reduce over the values.
+      const int row_tiles = (H + 31) / 32, keys = batched_ ? batch_keys_ : start + 1;
+      const int wanted = std::clamp(kDecodeGroupsPerCore * gpu_cores_ / (row_tiles * n), 1,
+                                    batched_ ? kPrefillMaxBlocks : kDecodeMaxBlocks);
       const int block = (std::max(kLatentMinBlockKeys, (keys + wanted - 1) / wanted) + 7) / 8 * 8;
       const int n_blocks = (keys + block - 1) / block;
-      [enc setComputePipelineState:pipeline("attn_flash_mla_" + std::to_string(width))];
+      [enc setComputePipelineState:pipeline("attn_flash_mla_" + std::to_string(width) + (batched_ ? "_rows" : ""), 512)];
       bind(enc, latent_q_, 0, 0);
       bind(enc, G.k_cache, kv_offset(G), 1);
       bind(enc, G.k_cache, kv_offset(G), 2);
       bind(enc, latent_out_, 0, 3);
-      bytes(enc, AttnMmParams{1, 1, width, start, 0, H, 0, keys, 1 << 30, G.capacity, c_.attn_scale, 0.0f, 0, 1, block},
+      bytes(enc,
+            AttnMmParams{1, 1, width, start, 0, H, 0, keys, 1 << 30, G.capacity, c_.attn_scale, 0.0f, 0, 1, block, 0,
+                         batched_ ? 1 : 0},
             4);
       bind(enc, placeholder_, 5);
       bind(enc, part_o_, 0, 6);
       bind(enc, part_ml_, 0, 7);
-      [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(row_tiles), static_cast<NSUInteger>(n_blocks), 1)
+      if (batched_) {
+        bind(enc, batch_rows_, 0, 8);
+      } else {
+        bind(enc, placeholder_, 8);
+      }
+      [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(row_tiles), static_cast<NSUInteger>(n_blocks),
+                                            static_cast<NSUInteger>(n))
           threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
       [enc setComputePipelineState:pipeline("attn_reduce")];
       bind(enc, part_o_, 0, 0);
@@ -2093,7 +2122,7 @@ class DecoderMetal final : public Model {
       bind(enc, latent_out_, 0, 2);
       bytes(enc, ReduceParams{H, width, n_blocks, 0}, 3);
       bind(enc, placeholder_, 4);
-      [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(H), 1, 1)
+      [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(H), static_cast<NSUInteger>(n), 1)
           threadsPerThreadgroup:MTLSizeMake(static_cast<NSUInteger>(c_.kv_lora_rank), 1, 1)];
       return;
     }

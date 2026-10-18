@@ -2636,6 +2636,9 @@ struct AttnMmParams {
                      // and leaves its rows' partial output for attn_reduce
   int has_bounds;    // attn_flash: row t sees keys [bounds[2t], bounds[2t + 1]) only (buffer 5;
                      // Qwen2.5-VL's windows), whatever its position
+  int batched;       // the _rows instances' passes (attn_flash's ROWS): grid z is a batched
+                     // decode's row r, sequence rows[r].x's query at position rows[r].y over that
+                     // sequence's slot of the cache (buffer 8), its heads' rows at q + r * rows * D
 };
 
 #define ATT_MM_UNROLL _Pragma("clang loop unroll(full)")
@@ -2833,8 +2836,12 @@ inline float att_fl_row_sum(float v) {
 // y splits the keys into blocks whose unnormalized outputs and (max, sum),
 // in natural-log units, go to part_o and part_ml as attn_partial leaves them
 // for attn_reduce: grid (ceil(heads / 32), blocks).
-template <typename KV, int D, int DV, int BK, int SPLIT, bool VK>
-[[kernel]] void attn_flash(const device float* q [[buffer(0)]],
+// ROWS compiles in p.batched (the _rows instances): its registers would
+// otherwise cost every instance. The compile must hold 128 * SPLIT threads
+// per threadgroup (the 576-wide instances' 512, which they fell below to 448
+// without the bound: the compiler spills instead).
+template <typename KV, int D, int DV, int BK, int SPLIT, bool VK, bool ROWS = false>
+[[kernel, max_total_threads_per_threadgroup(512)]] void attn_flash(const device float* q [[buffer(0)]],
                            const device KV* k_cache [[buffer(1)]],
                            const device KV* v_cache [[buffer(2)]],
                            device float* out [[buffer(3)]],
@@ -2842,8 +2849,9 @@ template <typename KV, int D, int DV, int BK, int SPLIT, bool VK>
                            const device int* last_key [[buffer(5)]],
                            device float* part_o [[buffer(6)]],
                            device float* part_ml [[buffer(7)]],
-                           uint2 tg [[threadgroup_position_in_grid]],
-                           uint2 tgs [[threadgroups_per_grid]],
+                           const device int4* rows [[buffer(8)]],
+                           uint3 tg [[threadgroup_position_in_grid]],
+                           uint3 tgs [[threadgroups_per_grid]],
                            uint tid [[thread_index_in_threadgroup]],
                            uint sg [[simdgroup_index_in_threadgroup]],
                            uint lane [[thread_index_in_simdgroup]]) {
@@ -2858,8 +2866,17 @@ template <typename KV, int D, int DV, int BK, int SPLIT, bool VK>
   const int kvh = h / (p.heads / p.kv_heads);
   const int t0 = int(tg.x) * ATT_FL_Q;
   const int t_last = min(t0 + ATT_FL_Q, p.rows) - 1;
+  // A batched decode's row (head_rows): its sequence's position, slot and queries.
+  const int batch_row = ROWS ? int(tg.z) : 0;
+  const int start_pos = ROWS ? rows[batch_row].y : p.start_pos;
+  if (ROWS) {
+    const size_t slot = size_t(rows[batch_row].x) * size_t(p.kv_heads) * size_t(p.capacity) * size_t(D);
+    k_cache += slot;
+    v_cache += slot;
+    q += size_t(batch_row) * size_t(p.rows) * size_t(D);
+  }
   // Positions of the tile's first and last rows.
-  const int pos_first = p.start_pos + (head_rows ? 0 : t0), pos_last = p.start_pos + (head_rows ? 0 : t_last);
+  const int pos_first = start_pos + (head_rows ? 0 : t0), pos_last = start_pos + (head_rows ? 0 : t_last);
   // This thread's row and first column within every 8x8 fragment.
   const int fm = int((lane / 4) & 4) + int((lane / 2) % 4);
   const int fn = int((lane / 4) & 2) * 2 + int(lane % 2) * 2;
@@ -2867,7 +2884,7 @@ template <typename KV, int D, int DV, int BK, int SPLIT, bool VK>
   const int d0 = part * DH, dv0 = part * DVH;
   const int t = t0 + group * 8 + fm;  // query row within the pass
   const bool row_ok = t < p.rows;
-  const int qpos = p.start_pos + (head_rows ? 0 : t);
+  const int qpos = start_pos + (head_rows ? 0 : t);
   int lo = qpos - p.window + 1;  // first key the row may see
   int hi = p.has_last_key != 0 && row_ok ? max(qpos, last_key[t]) : qpos;
 
@@ -3007,7 +3024,7 @@ template <typename KV, int D, int DV, int BK, int SPLIT, bool VK>
 
   if (!row_ok) return;
   if (p.block_keys > 0) {
-    const size_t entry = size_t(t) * tgs.y + tg.y;
+    const size_t entry = ROWS ? (size_t(batch_row) * size_t(p.rows) + size_t(t)) * tgs.y + tg.y : size_t(t) * tgs.y + tg.y;
     device float* prow = part_o + entry * D + dv0 + fn;
     ATT_MM_UNROLL for (int d = 0; d < DVH / 8; ++d) *reinterpret_cast<device float2*>(prow + 8 * d) = FRAG_ELEMS(o[d]);
     if (fn == 0 && part == 0) {
@@ -3052,6 +3069,11 @@ template LOKAHI_INSTANCE_ATTRS("attn_flash_mla_576")
 decltype(attn_flash<float, 576, 512, 8, 4, true>) attn_flash<float, 576, 512, 8, 4, true>;
 template LOKAHI_INSTANCE_ATTRS("attn_flash_mla_96")
 decltype(attn_flash<float, 96, 64, 8, 4, true>) attn_flash<float, 96, 64, 8, 4, true>;
+// A batched decode's rows, each its own sequence (head_rows, grid z).
+template LOKAHI_INSTANCE_ATTRS("attn_flash_mla_576_rows")
+decltype(attn_flash<float, 576, 512, 8, 4, true, true>) attn_flash<float, 576, 512, 8, 4, true, true>;
+template LOKAHI_INSTANCE_ATTRS("attn_flash_mla_96_rows")
+decltype(attn_flash<float, 96, 64, 8, 4, true, true>) attn_flash<float, 96, 64, 8, 4, true, true>;
 
 // One simdgroup writes, per lane, the two elements thread_elements() holds of
 // a loaded 8x8 matrix (element r * 8 + c holds r * 8 + c) and of its product
