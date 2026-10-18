@@ -1147,23 +1147,20 @@ class DecoderMetal final : public Model {
       [enc dispatchThreadgroups:MTLSizeMake(qmv_groups(l.rows), 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
       return;
     }
-    // 4-bit weights take qmm4 (32x32 tiles), staged in half for a norm's
-    // output (h_, whose values half holds), or for any input when the
-    // checkpoint itself is float16 (F16 scales: its reference runs in half,
-    // as MLX does), and in float otherwise. Mixture-of-experts models stage
-    // in float throughout: half's rounding reaches later layers' routers and
-    // flips their top-k near a tie.
-    const bool four_bit = l.bits == 4 && !l.mxfp4;
+    // qmm (32x32 tiles, any width of affine codes; validate() refuses dense
+    // MXFP4), staged in half for a norm's output (h_, whose values half
+    // holds), or for any input when the checkpoint itself is float16 (F16
+    // scales: its reference runs in half, as MLX does), and in float
+    // otherwise. Mixture-of-experts models stage in float throughout: half's
+    // rounding reaches later layers' routers and flips their top-k near a tie.
     const bool half_staging = (x == h_ || !l.bf16) && c_.num_experts == 0;
-    [enc setComputePipelineState:quant_pipeline(!four_bit ? "qmm" : half_staging ? "qmm4_h" : "qmm4_f", l)];
+    [enc setComputePipelineState:quant_pipeline(half_staging ? "qmm_h" : "qmm_f", l)];
     bind_weights(enc, l, 0);
     bind(enc, x, 0, 3);
     bind(enc, y, 0, 4);
     bytes(enc, QmmParams{n, l.rows, l.cols}, 5);
-    // qmm4's 32x32 tiles, or qmm's 64x64 (QMM_TILE_M and QMM_TILE_N).
-    const int tile = four_bit ? 32 : 64;
-    [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((l.rows + tile - 1) / tile),
-                                          static_cast<NSUInteger>((n + tile - 1) / tile), 1)
+    [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((l.rows + 31) / 32),
+                                          static_cast<NSUInteger>((n + 31) / 32), 1)
         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
   }
 

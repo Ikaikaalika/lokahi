@@ -1106,18 +1106,11 @@ kernel void moe_combine(const device float* slots [[buffer(0)]],
 }
 
 // ---------------------------------------------------------------------------
-// Quantized matrix-matrix product for prefill: Y[n, rows] = X[n, cols] W^T.
-//
-// 64x64 output tiles (tokens x rows). Four simdgroups each own a 32x32
-// quadrant, a 4x4 grid of 8x8 simdgroup matrices, so every K step of 32 does
-// 64 multiply-accumulates per simdgroup between two barriers. X arrives as
-// float4 loads; each thread dequantizes 16 consecutive codes of one row, which
-// share one scale and bias because QGROUP is a multiple of 32. Whole tiles
-// store straight to Y; edge tiles go through threadgroup memory, reusing the
-// staging arrays. Requires cols % 32 == 0 and QGROUP % 32 == 0.
+// Quantized matrix-matrix product for prefill: Y[n, rows] = X[n, cols] W^T
+// (qmm, below dequant16).
 // ---------------------------------------------------------------------------
 
-// dense_mm's 32x32 tiles (below); qmm's own tile is QMM_TILE_*.
+// dense_mm's 32x32 tiles (below).
 constant constexpr int QMM_BM = 32;
 constant constexpr int QMM_BN = 32;
 constant constexpr int QMM_BK = 32;
@@ -1126,12 +1119,6 @@ constant constexpr int QMM_PAD = 4;
 // Fixed-trip loops over simdgroup matrices must unroll fully, or the matrices
 // are indexed dynamically and spill.
 #define QMM_UNROLL _Pragma("clang loop unroll(full)")
-
-constant constexpr int QMM_TILE_M = 64;
-constant constexpr int QMM_TILE_N = 64;
-constant constexpr int QMM_TILE_K = 32;
-constant constexpr int QMM_TILE_LD = QMM_TILE_K + 4;  // staging row stride, padded against bank conflicts
-constant constexpr int QMM_TILE_OUT_LD = QMM_TILE_N + 4;
 
 struct QmmParams {
   int n;
@@ -1161,95 +1148,7 @@ inline void dequant16(const device uint* row, int k0, float s, float b, thread f
   }
 }
 
-kernel void qmm(const device uint* w [[buffer(0)]],
-                const device ushort* scales [[buffer(1)]],
-                const device ushort* biases [[buffer(2)]],
-                const device float* x [[buffer(3)]],
-                device float* y [[buffer(4)]],
-                constant QmmParams& p [[buffer(5)]],
-                uint2 tg [[threadgroup_position_in_grid]],
-                uint tid [[thread_index_in_threadgroup]],
-                uint sg [[simdgroup_index_in_threadgroup]]) {
-  // xs and ws back to back; the edge-tile epilogue reuses them as one tile.
-  threadgroup float stage[2 * QMM_TILE_M * QMM_TILE_LD];
-  threadgroup float* xs = stage;
-  threadgroup float* ws = stage + QMM_TILE_M * QMM_TILE_LD;
-
-  const int m0 = int(tg.y) * QMM_TILE_M;  // first token of the tile
-  const int n0 = int(tg.x) * QMM_TILE_N;  // first output row of the tile
-  const int sm = int(sg / 2) * 32;
-  const int sn = int(sg % 2) * 32;
-  const int words_per_row = p.cols * QBITS / 32;
-  const int groups_per_row = p.cols / QGROUP;
-
-  simdgroup_float8x8 acc[4][4];
-  QMM_UNROLL for (int i = 0; i < 4; ++i)
-    QMM_UNROLL for (int j = 0; j < 4; ++j) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-
-  // Each thread dequantizes half a row of the 64x32 W block: 16 codes.
-  const int w_row = int(tid) / 2;
-  const int w_col = (int(tid) % 2) * 16;
-  const int row = n0 + w_row;
-  const bool row_ok = row < p.rows;
-  const device uint* wr = w + (row_ok ? row : 0) * words_per_row;
-
-  for (int k0 = 0; k0 < p.cols; k0 += QMM_TILE_K) {
-    // X block: 64 tokens x 32 columns = 512 float4, four per thread.
-    QMM_UNROLL for (int i = int(tid); i < QMM_TILE_M * QMM_TILE_K / 4; i += 128) {
-      const int r = i / (QMM_TILE_K / 4);
-      const int c = (i % (QMM_TILE_K / 4)) * 4;
-      const int token = m0 + r;
-      float4 v = {0.0f, 0.0f, 0.0f, 0.0f};
-      if (token < p.n) v = *reinterpret_cast<const device float4*>(x + token * p.cols + k0 + c);
-      *reinterpret_cast<threadgroup float4*>(xs + r * QMM_TILE_LD + c) = v;
-    }
-    {
-      float vals[16];
-      if (row_ok) {
-        const int gi = row * groups_per_row + (k0 + w_col) / QGROUP;
-        dequant16(wr, k0 + w_col, scale_at(scales, gi), scale_at(biases, gi), vals);
-      } else {
-        for (int j = 0; j < 16; ++j) vals[j] = 0.0f;
-      }
-      threadgroup float* dst = ws + w_row * QMM_TILE_LD + w_col;
-      QMM_UNROLL for (int j = 0; j < 16; j += 4) {
-        const float4 v = {vals[j], vals[j + 1], vals[j + 2], vals[j + 3]};
-        *reinterpret_cast<threadgroup float4*>(dst + j) = v;
-      }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    QMM_UNROLL for (int kk = 0; kk < QMM_TILE_K; kk += 8) {
-      simdgroup_float8x8 a[4];
-      simdgroup_float8x8 b[4];
-      QMM_UNROLL for (int i = 0; i < 4; ++i) simdgroup_load(a[i], xs + (sm + 8 * i) * QMM_TILE_LD + kk, QMM_TILE_LD);
-      QMM_UNROLL for (int j = 0; j < 4; ++j) simdgroup_load(b[j], ws + (sn + 8 * j) * QMM_TILE_LD + kk, QMM_TILE_LD, ulong2(0, 0), true);
-      QMM_UNROLL for (int i = 0; i < 4; ++i)
-        QMM_UNROLL for (int j = 0; j < 4; ++j) simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-  }
-
-  if (m0 + QMM_TILE_M <= p.n && n0 + QMM_TILE_N <= p.rows) {
-    device float* out = y + (m0 + sm) * p.rows + n0 + sn;
-    QMM_UNROLL for (int i = 0; i < 4; ++i)
-      QMM_UNROLL for (int j = 0; j < 4; ++j) simdgroup_store(acc[i][j], out + 8 * i * p.rows + 8 * j, p.rows);
-    return;
-  }
-  // The last loop iteration ended on a barrier, so the staging arrays are free.
-  threadgroup float* tile = stage;
-  QMM_UNROLL for (int i = 0; i < 4; ++i)
-    QMM_UNROLL for (int j = 0; j < 4; ++j) simdgroup_store(acc[i][j], tile + (sm + 8 * i) * QMM_TILE_OUT_LD + sn + 8 * j, QMM_TILE_OUT_LD);
-  threadgroup_barrier(mem_flags::mem_threadgroup);
-  for (int i = int(tid); i < QMM_TILE_M * QMM_TILE_N; i += 128) {
-    const int r = i / QMM_TILE_N;
-    const int c = i % QMM_TILE_N;
-    const int token = m0 + r;
-    const int out_row = n0 + c;
-    if (token < p.n && out_row < p.rows) y[token * p.rows + out_row] = tile[r * QMM_TILE_OUT_LD + c];
-  }
-}
-
-// 4-bit affine qmm (most checkpoints) on 32x32 tiles: four simdgroups whose
+// Affine qmm of any QBITS on 32x32 tiles: four simdgroups whose
 // 8x8 fragments interleave (rows tm + 16 i, columns tn + 16 j, as MLX's
 // qmm_t lays them out), K in steps of 32 staged in threadgroup memory as T.
 // Each lane loads its two elements of a fragment from the staging as float,
@@ -1258,15 +1157,16 @@ kernel void qmm(const device uint* w [[buffer(0)]],
 // to 9728x2560, X staged in half) this ran 1.8-1.9 TFLOPS: simdgroup_load of
 // half fragments ran 1.4 on the same tile, the same per-lane loads with
 // their indices recomputed each step 1.8, and the previous software-
-// pipelined 64x64 kernel 1.6. T is the staging type: half (for inputs a
-// norm just produced, whose values half holds, and for float16
-// checkpoints) or float. 128 threads; requires cols % 32 == 0 and
-// QGROUP % 32 == 0.
+// pipelined 64x64 kernel 1.6. Four-bit weights dequantize one word (8
+// codes) per thread; other widths 16 codes on each of 64 threads
+// (dequant16). T is the staging type: half (for inputs a norm just
+// produced, whose values half holds, and for float16 checkpoints) or
+// float. 128 threads; requires cols % 32 == 0 and QGROUP % 32 == 0.
 // The K loop of one tile. EDGE guards every load for a tile that runs past
 // the tokens or rows; an interior tile runs unguarded (the guards cost 10%
 // even when a uniform test made them all true).
 template <typename T, bool EDGE>
-inline void qmm4_tile(const device uint* w, const device ushort* scales, const device ushort* biases,
+inline void qmm_tile(const device uint* w, const device ushort* scales, const device ushort* biases,
                       const device float* x, constant QmmParams& p, threadgroup T* xs, threadgroup T* ws,
                       int m0, int n0, short tid, short a_off, short b_off, thread float2 (&c)[2][2]) {
   constexpr short TK = 32, LD = TK + 16 / short(sizeof(T));
@@ -1275,10 +1175,15 @@ inline void qmm4_tile(const device uint* w, const device ushort* scales, const d
   const short st_row = tid / 4, st_col = (tid % 4) * 8;
   const bool x_ok = !EDGE || m0 + st_row < p.n;
   const device float* xr = x + (x_ok ? m0 + st_row : 0) * p.cols + st_col;
-  const int row = n0 + st_row;
+  // Weights: 4-bit, word tid % 4 of row tid / 4; else 16 codes of row
+  // tid / 2 from column (tid % 2) * 16, on threads 0-63.
+  const short w_row = QBITS == 4 ? st_row : tid / 2;
+  const short w_col = QBITS == 4 ? st_col : (tid % 2) * 16;
+  const bool w_thread = QBITS == 4 || tid < 64;
+  const int row = n0 + w_row;
   const bool row_ok = !EDGE || row < p.rows;
-  const int words_per_row = p.cols / 8, groups_per_row = p.cols / QGROUP;
-  const device uint* wr = w + (row_ok ? row : 0) * words_per_row + st_col / 8;
+  const int words_per_row = p.cols * QBITS / 32, groups_per_row = p.cols / QGROUP;
+  const device uint* wr = w + (row_ok ? row : 0) * words_per_row;
   const int g_row = (row_ok ? row : 0) * groups_per_row;
   for (int k0 = 0; k0 < p.cols; k0 += TK) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1290,12 +1195,24 @@ inline void qmm4_tile(const device uint* w, const device ushort* scales, const d
       }
       *reinterpret_cast<threadgroup vec<T, 4>*>(xs + st_row * LD + st_col) = vec<T, 4>(v0);
       *reinterpret_cast<threadgroup vec<T, 4>*>(xs + st_row * LD + st_col + 4) = vec<T, 4>(v1);
-      const uint word = row_ok ? wr[k0 / 8] : 0u;
-      const int gi = g_row + (k0 + st_col) / QGROUP;
-      const float s = row_ok ? scale_at(scales, gi) : 0.0f;
-      const float b = row_ok ? scale_at(biases, gi) : 0.0f;
-      threadgroup T* d = ws + st_row * LD + st_col;
-      QMM_UNROLL for (int j = 0; j < 8; ++j) d[j] = T(s * float((word >> (4 * j)) & 0xFu) + b);
+      if (w_thread) {
+        const int gi = g_row + (k0 + w_col) / QGROUP;
+        const float s = row_ok ? scale_at(scales, gi) : 0.0f;
+        const float b = row_ok ? scale_at(biases, gi) : 0.0f;
+        threadgroup T* d = ws + w_row * LD + w_col;
+        if (QBITS == 4) {
+          const uint word = row_ok ? wr[(k0 + w_col) / 8] : 0u;
+          QMM_UNROLL for (int j = 0; j < 8; ++j) d[j] = T(s * float((word >> (4 * j)) & 0xFu) + b);
+        } else {
+          float vals[16];
+          if (row_ok) {
+            dequant16(wr, k0 + w_col, s, b, vals);
+          } else {
+            QMM_UNROLL for (int j = 0; j < 16; ++j) vals[j] = 0.0f;
+          }
+          QMM_UNROLL for (int j = 0; j < 16; ++j) d[j] = T(vals[j]);
+        }
+      }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const threadgroup T* as = xs + a_off;
@@ -1320,16 +1237,16 @@ inline void qmm4_tile(const device uint* w, const device ushort* scales, const d
 }
 
 template <typename T>
-[[kernel]] void qmm4(const device uint* w [[buffer(0)]],
-                     const device ushort* scales [[buffer(1)]],
-                     const device ushort* biases [[buffer(2)]],
-                     const device float* x [[buffer(3)]],
-                     device float* y [[buffer(4)]],
-                     constant QmmParams& p [[buffer(5)]],
-                     uint2 tg [[threadgroup_position_in_grid]],
-                     uint tid [[thread_index_in_threadgroup]],
-                     uint sg [[simdgroup_index_in_threadgroup]],
-                     uint lane [[thread_index_in_simdgroup]]) {
+[[kernel]] void qmm(const device uint* w [[buffer(0)]],
+                    const device ushort* scales [[buffer(1)]],
+                    const device ushort* biases [[buffer(2)]],
+                    const device float* x [[buffer(3)]],
+                    device float* y [[buffer(4)]],
+                    constant QmmParams& p [[buffer(5)]],
+                    uint2 tg [[threadgroup_position_in_grid]],
+                    uint tid [[thread_index_in_threadgroup]],
+                    uint sg [[simdgroup_index_in_threadgroup]],
+                    uint lane [[thread_index_in_simdgroup]]) {
   constexpr short TILE = 32, LD = 32 + 16 / short(sizeof(T));
   threadgroup T xs[TILE * LD];
   threadgroup T ws[TILE * LD];
@@ -1340,9 +1257,9 @@ template <typename T>
   const short a_off = (tm + fm) * LD + fn, b_off = (tn + fn) * LD + fm;
   float2 c[2][2] = {{float2(0.0f), float2(0.0f)}, {float2(0.0f), float2(0.0f)}};
   if (m0 + TILE <= p.n && n0 + TILE <= p.rows) {
-    qmm4_tile<T, false>(w, scales, biases, x, p, xs, ws, m0, n0, short(tid), a_off, b_off, c);
+    qmm_tile<T, false>(w, scales, biases, x, p, xs, ws, m0, n0, short(tid), a_off, b_off, c);
   } else {
-    qmm4_tile<T, true>(w, scales, biases, x, p, xs, ws, m0, n0, short(tid), a_off, b_off, c);
+    qmm_tile<T, true>(w, scales, biases, x, p, xs, ws, m0, n0, short(tid), a_off, b_off, c);
   }
   QMM_UNROLL for (short i = 0; i < 2; ++i) {
     const int token = m0 + tm + 16 * i + fm;
@@ -1356,8 +1273,8 @@ template <typename T>
   }
 }
 
-template LOKAHI_INSTANCE_ATTRS("qmm4_h") decltype(qmm4<half>) qmm4<half>;
-template LOKAHI_INSTANCE_ATTRS("qmm4_f") decltype(qmm4<float>) qmm4<float>;
+template LOKAHI_INSTANCE_ATTRS("qmm_h") decltype(qmm<half>) qmm<half>;
+template LOKAHI_INSTANCE_ATTRS("qmm_f") decltype(qmm<float>) qmm<float>;
 
 struct ElementwiseParams {
   int count;
@@ -2285,7 +2202,7 @@ template LOKAHI_INSTANCE_ATTRS("attn_pv_h") decltype(attn_pv<half>) attn_pv<half
 // MLX's steel attention relies on the same layout). Every fragment a thread
 // holds is therefore in the same row, the row's four threads differ in lane
 // bits 0 and 3, and the per-row max, sum and rescale take two shuffles each.
-// K and V fragments are loaded per lane as float from the staging (as qmm4
+// K and V fragments are loaded per lane as float from the staging (as qmm
 // does: 10-21% faster than simdgroup_load of half fragments at every head
 // width on M1). Takes AttnMmParams with row0 = 0 and rows = the pass.
 // ---------------------------------------------------------------------------
