@@ -2187,7 +2187,13 @@ class DecoderMetal final : public Model {
 
   // Layer l over the pass's n rows (h_ holds their norm), at positions
   // [start, start + n); its residual leaves norm `next` of x_ in h_.
-  void encode_layer(__strong id<MTLComputeCommandEncoder>& enc, size_t l, int n, int start, const BufRef* next) {
+  // Which rows of a pass a layer carries past its keys and values: all of
+  // them, only the last (the final layer of a pass whose logits are wanted
+  // for its last row alone), or none (the final layer of an earlier chunk).
+  enum class Rows { All, Last, None };
+
+  void encode_layer(__strong id<MTLComputeCommandEncoder>& enc, size_t l, int n, int start, const BufRef* next,
+                    Rows rows = Rows::All) {
     const bool profiling = profiler_ != nullptr;
     const int64_t hidden = c_.hidden_size;
     const GpuLayer& G = layers_[l];
@@ -2195,7 +2201,7 @@ class DecoderMetal final : public Model {
     const int layer = static_cast<int>(l);
     // The residual kernel adds the sublayer output (normalized first with
     // sandwich norms) and applies the next norm in one pass.
-    const double residual_bytes = profiling ? traffic::rows(hidden, n, 4) + 8.0 * hidden : 0.0;
+    auto residual_bytes = [&] { return profiling ? traffic::rows(hidden, n, 4) + 8.0 * hidden : 0.0; };
     if (G.linear) {
       encode_gdn_projections(enc, G, n);
       section(enc, "qkv", profiling ? traffic::linear_projections(L, n) : 0.0);
@@ -2240,6 +2246,20 @@ class DecoderMetal final : public Model {
               profiling ? traffic::rows(G.head_dim, n, 2 * c_.num_heads + (G.own_kv ? 2 * G.kv_heads : 0)) +
                               (G.own_kv ? kv_bytes() / 4.0 * traffic::rows(G.head_dim, n, 2 * G.kv_heads) : 0.0)
                         : 0.0);
+      if (rows == Rows::None) return;
+      if (rows == Rows::Last && n > 1) {
+        // The cache holds every row's keys and values; the last row's query,
+        // residual and output gate go on alone, as row 0.
+        const size_t q_width = static_cast<size_t>(c_.num_heads) * static_cast<size_t>(G.head_dim);
+        const size_t last = static_cast<size_t>(n - 1);
+        encode_copy(enc, q_, q_, static_cast<int>(q_width), last * q_width * sizeof(float), 0);
+        encode_copy(enc, x_, x_, c_.hidden_size, last * static_cast<size_t>(hidden) * sizeof(float), 0);
+        if (c_.attn_output_gate) {
+          encode_copy(enc, out_gate_, out_gate_, static_cast<int>(q_width), last * q_width * sizeof(float), 0);
+        }
+        start += n - 1;
+        n = 1;
+      }
       encode_attention(enc, G, n, start);
       section(enc, "attention", profiling ? traffic::attention(c_, layer, start, n, kv_bytes()) : 0.0);
       const int gated = n * c_.num_heads * G.head_dim;
@@ -2258,7 +2278,7 @@ class DecoderMetal final : public Model {
                         : 0.0);
     }
     encode_residual_norm(enc, G.attn_post_norm, &G.mlp_norm, n);
-    section(enc, "residual_norm", residual_bytes);
+    section(enc, "residual_norm", residual_bytes());
     if (G.moe && c_.experts_beside_mlp) {
       // Gemma 4: r_ = mlp_post_norm_1(mlp(h_)) + expert_post_norm(experts(expert_norm(x))),
       // routed on rms(x) * router_input_scale.
@@ -2295,7 +2315,7 @@ class DecoderMetal final : public Model {
     if (c_.per_layer_input > 0) {
       // x += post_ff_norm(mlp); x += norm(per-layer input); x *= scalar.
       encode_residual_norm(enc, G.mlp_post_norm, nullptr, n);
-      section(enc, "residual_norm", residual_bytes);
+      section(enc, "residual_norm", residual_bytes());
       encode_per_layer_gate(enc, G, layer, n);
       section(enc, "per_layer_input",
               profiling ? traffic::linear(L.per_layer_gate, n) + traffic::linear(L.per_layer_proj, n) +
@@ -2317,7 +2337,7 @@ class DecoderMetal final : public Model {
     } else {
       encode_residual_norm(enc, G.mlp_post_norm, next, n, G.scalar);
     }
-    section(enc, "residual_norm", residual_bytes);
+    section(enc, "residual_norm", residual_bytes());
   }
 
   // Encodes n tokens at positions [start, start + n) whose ids are at
@@ -2361,7 +2381,21 @@ class DecoderMetal final : public Model {
     // KV-shared trailing layers write no cache: a plain pass skips them
     // without logits and runs them on its last row with (shared_suffix()).
     const size_t full = verifying_ || mtp_on_ ? decoder_layers : static_cast<size_t>(c_.shared_suffix());
-    for (size_t l = 0; l < full; ++l) encode_layer(enc, l, n, start, next_norm(l));
+    // A plain pass wants its final layer's keys and values for every row but
+    // its output for the last row only, and only in the last chunk (as MLX's
+    // lazy graph computes it); attention layers that own their cache.
+    const GpuLayer& final_layer = layers_[decoder_layers - 1];
+    const bool tail = full == decoder_layers && !verifying_ && !mtp_on_ && n > 1 && plan_.empty() &&
+                      c_.per_layer_input == 0 && !c_.mla() && !final_layer.linear && final_layer.own_kv;
+    for (size_t l = 0; l < full; ++l) {
+      if (tail && l + 1 == full) {
+        encode_layer(enc, l, n, start, next_norm(l), last ? Rows::Last : Rows::None);
+        if (!last) return;
+        n = 1;
+      } else {
+        encode_layer(enc, l, n, start, next_norm(l));
+      }
+    }
     if (full < decoder_layers) {
       if (!last) return;
       if (n > 1) {  // the last row of x, of its normed copy and of the per-layer inputs into row 0
