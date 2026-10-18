@@ -24,6 +24,20 @@ struct LoadOptions {
   // A qwen3_5_mtp drafter directory: a multi-token prediction head split
   // from the checkpoint (DecoderWeights::mtp).
   std::string draft_model;
+  // Independent sequences (each its own KV cache of max_context positions)
+  // the model holds at once over one copy of the weights (Model::
+  // select_sequence, Model::decode_batch). Backends that hold one refuse more.
+  int max_sequences = 1;
+};
+
+// One sequence's step of a batched decode: feed `token` at that sequence's
+// position and draw its next token with `sampling` as generation step `step`
+// (the step that keys seeded sampling).
+struct BatchStep {
+  int sequence = 0;
+  int32_t token = 0;
+  SamplingParams sampling;
+  int step = 0;
 };
 
 struct GenerationTiming {
@@ -131,6 +145,19 @@ class Model {
   virtual const std::vector<int32_t>& eos_token_ids() const = 0;
 
   virtual void reset() = 0;
+
+  // Sequences. A backend may hold several independent contexts (KV caches,
+  // positions) over one copy of the weights; select_sequence makes every
+  // single-sequence call (reset, prefill, decode, verify, generate, ...) act
+  // on that one. decode_batch then advances several sequences by one token
+  // in one pass, reading the weights once for all of them, and returns each
+  // one's next token; batch_logits holds the pass's logits, a row per step in
+  // order, until the next call.
+  virtual int max_sequences() const { return 1; }
+  virtual void select_sequence(int sequence);
+  virtual int sequence() const { return 0; }
+  virtual std::vector<int32_t> decode_batch(const std::vector<BatchStep>& steps);
+  virtual const float* batch_logits() const { return nullptr; }
 
   // While set, the backend times every section of each forward pass into
   // `profiler` (nullptr turns it off). Profiling serializes GPU work per

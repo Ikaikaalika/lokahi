@@ -130,6 +130,14 @@ void Model::follow_mtp(bool on) {
   LK_CHECK(!on, std::string(backend()) + ": multi-token prediction is not supported on this backend");
 }
 
+void Model::select_sequence(int sequence) {
+  LK_CHECK(sequence == 0, std::string(backend()) + ": this backend holds one sequence");
+}
+
+std::vector<int32_t> Model::decode_batch(const std::vector<BatchStep>&) {
+  throw Error(std::string(backend()) + ": batched decoding is not supported on this backend");
+}
+
 std::vector<int32_t> Model::mtp_draft(int32_t, int, std::vector<float>*) {
   throw Error(std::string(backend()) + ": multi-token prediction is not supported on this backend");
 }

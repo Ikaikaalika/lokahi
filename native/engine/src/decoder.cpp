@@ -2888,6 +2888,7 @@ class DecoderCpu final : public Model {
 }  // namespace
 
 std::unique_ptr<Model> make_decoder_cpu(std::shared_ptr<DecoderWeights> weights, const LoadOptions& options) {
+  LK_CHECK(options.max_sequences == 1, "cpu: the CPU backend holds one sequence");
   return std::make_unique<DecoderCpu>(std::move(weights), options);
 }
 

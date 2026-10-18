@@ -153,10 +153,12 @@ struct GpuLayer {
   std::array<id<MTLBuffer>, 2> conv_history = {nil, nil};
   std::array<id<MTLBuffer>, 2> delta_state = {nil, nil};
   GpuLinear shared_expert_gate;  // Qwen's [1, hidden] gate on the shared expert
-  // A KV-shared layer's caches and capacity are its source layer's.
+  // A KV-shared layer's caches and capacity are its source layer's. Each
+  // holds one slot of slot_bytes per sequence, one after another.
   id<MTLBuffer> k_cache = nil;
   id<MTLBuffer> v_cache = nil;
   int capacity = 0;
+  size_t slot_bytes = 0;
   bool sliding = false;
   int head_dim = 0, kv_heads = 0, inter = 0;
   bool own_kv = true;  // computes and stores its own keys and values
@@ -235,7 +237,7 @@ struct ElementwiseParams { int count; };
 struct GluMulParams { int count; int silu; };
 struct RopeParams {
   int heads; int kv_heads; int head_dim; int start_pos; int capacity; float eps; float offset; int qk_norm;
-  int qkv_bias; int v_norm; int rotary; int mrope; int rope_given; int rope_offset; int first_head;
+  int qkv_bias; int v_norm; int rotary; int mrope; int rope_given; int rope_offset; int first_head; int batched = 0;
 };
 struct PerLayerCombineParams { int size; int layers; float eps; float offset; float proj_scale; float input_scale; };
 struct PerLayerGateParams { int size; int layers; int layer; int count; };
@@ -266,7 +268,7 @@ struct MoeGroupedParams { int experts; int k; int groups; int topk_groups; int n
 struct DenseParams { int rows; int cols; int dtype; };
 struct AttnParams {
   int heads; int kv_heads; int head_dim; int start_pos; int window; int capacity; int block; int n_blocks;
-  float scale; float softcap; int has_last_key; int groups_per_kv;
+  float scale; float softcap; int has_last_key; int groups_per_kv; int batched = 0;
 };
 struct AttnMmParams {
   int heads; int kv_heads; int head_dim; int start_pos; int row0; int rows; int key_base; int keys; int window;
@@ -315,7 +317,7 @@ constexpr int kInflightSteps = 2;
 class DecoderMetal final : public Model {
  public:
   DecoderMetal(std::shared_ptr<DecoderWeights> weights, const LoadOptions& options)
-      : w_(std::move(weights)), c_(w_->config), max_context_(options.max_context),
+      : w_(std::move(weights)), c_(w_->config), max_context_(options.max_context), sequences_(options.max_sequences),
         chunk_(std::max(1, std::min(options.prefill_chunk, options.max_context))),
         kv_f16_(kv_cache_f16(options, c_, true)) {
     @autoreleasepool {
@@ -345,8 +347,25 @@ class DecoderMetal final : public Model {
   double kv_bytes() const { return kv_f16_ ? 2.0 : 4.0; }
   int position() const override { return position_; }
   size_t weight_bytes() const override { return w_->matrix_bytes(); }
+
+  int max_sequences() const override { return sequences_; }
+  int sequence() const override { return current_; }
+
+  // Each sequence keeps its own position and RoPE offset (and its slot of
+  // every cache); the selected one's live in position_ and rope_offset_.
+  void select_sequence(int sequence) override {
+    LK_CHECK(sequence >= 0 && sequence < sequences_, "metal: sequence out of range");
+    if (sequence == current_) return;
+    drain();
+    LK_CHECK(verify_n_ == 0, "metal: accept or decode before selecting another sequence");
+    sequence_state_[static_cast<size_t>(current_)] = SequenceState{position_, rope_offset_};
+    current_ = sequence;
+    position_ = sequence_state_[static_cast<size_t>(current_)].position;
+    rope_offset_ = sequence_state_[static_cast<size_t>(current_)].rope_offset;
+  }
   const std::vector<int32_t>& eos_token_ids() const override { return c_.eos_token_ids; }
 
+  // The selected sequence's; the others keep their contexts.
   void reset() override {
     drain();
     position_ = 0;
@@ -456,6 +475,94 @@ class DecoderMetal final : public Model {
     }
     position_ = verify_start_ + kept;
     parity_ = static_cast<int>((written + static_cast<size_t>(position_)) % 2);
+  }
+
+  // One pass over every step's token, each row at its own sequence's
+  // position and slot of the caches (batched_: qk_norm_rope_store and
+  // attn_partial read batch_rows_), then lm_head over every row and each
+  // row's sampling.
+  std::vector<int32_t> decode_batch(const std::vector<BatchStep>& steps) override {
+    @autoreleasepool {
+      const int n = static_cast<int>(steps.size());
+      LK_CHECK(sequences_ > 1, "metal: decode_batch needs a model loaded with several sequences");
+      LK_CHECK(n >= 1 && n <= sequences_, "metal: decode_batch takes 1 to max_sequences steps");
+      LK_CHECK(!mtp_on_, "metal: decode_batch cannot run while the MTP head follows");
+      drain();
+      LK_CHECK(verify_n_ == 0, "metal: accept before decode_batch");
+      sequence_state_[static_cast<size_t>(current_)] = SequenceState{position_, rope_offset_};
+      int32_t* tokens = static_cast<int32_t*>([batch_tokens_ contents]);
+      int32_t* rows = static_cast<int32_t*>([batch_rows_ contents]);
+      std::vector<bool> seen(static_cast<size_t>(sequences_), false);
+      int keys = 0;
+      for (int i = 0; i < n; ++i) {
+        const BatchStep& step = steps[static_cast<size_t>(i)];
+        LK_CHECK(step.sequence >= 0 && step.sequence < sequences_, "metal: sequence out of range");
+        LK_CHECK(!seen[static_cast<size_t>(step.sequence)], "metal: decode_batch takes each sequence once");
+        seen[static_cast<size_t>(step.sequence)] = true;
+        LK_CHECK(step.token >= 0 && step.token < c_.vocab_size, "token id out of range");
+        LK_CHECK(step.step >= 0 && step.step < max_context_, "metal: generation step out of range");
+        validate_sampling(step.sampling);
+        const SequenceState& state = sequence_state_[static_cast<size_t>(step.sequence)];
+        LK_CHECK(state.position + 1 <= max_context_, "context length exceeded");
+        tokens[i] = step.token;
+        rows[4 * i] = step.sequence;
+        rows[4 * i + 1] = state.position;
+        rows[4 * i + 2] = state.position + state.rope_offset;
+        rows[4 * i + 3] = 0;
+        keys = std::max(keys, state.position + 1);
+      }
+      struct Clear {
+        bool& flag;
+        ~Clear() { flag = false; }
+      } clear{batched_};
+      batched_ = true;
+      batch_keys_ = keys;
+      active_cb_ = [queue_ commandBuffer];
+      id<MTLComputeCommandEncoder> enc = [active_cb_ computeCommandEncoder];
+      encode_forward(enc, batch_tokens_, 0, n, 0, false, 0);
+      // The last layer's residual leaves every row final-normed in h_.
+      encode_qmm(enc, lm_head_, h_, n, batch_logits_);
+      if (c_.final_logit_softcapping > 0.0f) {
+        [enc setComputePipelineState:pipeline("softcap")];
+        bind(enc, batch_logits_, 0, 0);
+        bytes(enc, c_.final_logit_softcapping, 1);
+        bytes(enc, ElementwiseParams{n * c_.vocab_size}, 2);
+        encode_elementwise(enc, n * c_.vocab_size);
+      }
+      section(enc, "lm_head", profiler_ != nullptr ? traffic::linear(w_->lm_head, n) : 0.0);
+      const size_t vocab_bytes = static_cast<size_t>(c_.vocab_size) * sizeof(float);
+      const size_t history_bytes = static_cast<size_t>(max_context_) * sizeof(int32_t);
+      for (int i = 0; i < n; ++i) {
+        const BatchStep& step = steps[static_cast<size_t>(i)];
+        const bool greedy = step.sampling.greedy();
+        id<MTLComputePipelineState> pick = pipeline(greedy ? "argmax_vocab" : "sample_vocab");
+        [enc setComputePipelineState:pick];
+        bind(enc, batch_logits_, static_cast<size_t>(i) * vocab_bytes, 0);
+        bind(enc, batch_out_, static_cast<size_t>(i) * sizeof(int32_t), 1);
+        bind(enc, batch_history_, static_cast<size_t>(i) * history_bytes, 2);
+        if (greedy) {
+          bytes(enc, ArgmaxParams{c_.vocab_size, step.step}, 3);
+        } else {
+          bytes(enc, sample_params(step.sampling, c_.vocab_size, step.step), 3);
+        }
+        [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(std::min<NSUInteger>(1024, [pick maxTotalThreadsPerThreadgroup] / 32 * 32),
+                                              1, 1)];
+      }
+      section(enc, "sample", profiler_ != nullptr ? 4.0 * c_.vocab_size * n : 0.0);
+      [enc endEncoding];
+      id<MTLCommandBuffer> cb = active_cb_;
+      [cb commit];
+      wait(cb);
+      const int32_t* out = static_cast<const int32_t*>([batch_out_ contents]);
+      for (const BatchStep& step : steps) sequence_state_[static_cast<size_t>(step.sequence)].position += 1;
+      position_ = sequence_state_[static_cast<size_t>(current_)].position;
+      return std::vector<int32_t>(out, out + n);
+    }
+  }
+
+  const float* batch_logits() const override {
+    return batch_logits_ != nil ? static_cast<const float*>([batch_logits_ contents]) : nullptr;
   }
 
   bool has_mtp() const override { return layers_.size() > static_cast<size_t>(c_.num_layers); }
@@ -605,6 +712,13 @@ class DecoderMetal final : public Model {
   // ---- setup --------------------------------------------------------------
 
   void validate() {
+    LK_CHECK(sequences_ >= 1 && sequences_ <= chunk_, "metal: max_sequences must be 1 to prefill_chunk");
+    if (sequences_ > 1) {
+      // Each sequence needs its own recurrent states, latent attention its
+      // batched kernels, and the MTP head its own pending rows: not yet.
+      LK_CHECK(!c_.has_linear(), "metal: several sequences need standard attention; Gated DeltaNet holds one");
+      LK_CHECK(!c_.mla(), "metal: several sequences need standard attention; latent attention holds one");
+    }
     if (c_.has_linear()) {
       // The conv keeps its taps in registers, and each lane of the recurrence
       // at most 8 rows of a state column.
@@ -964,9 +1078,11 @@ class DecoderMetal final : public Model {
         }
         continue;
       }
+      const size_t slots = static_cast<size_t>(sequences_);
       if (c_.mla()) {  // one latent per position, whose prefix is also the value
         G.capacity = max_context_;
-        G.k_cache = private_buffer(static_cast<size_t>(c_.latent_width()) * static_cast<size_t>(G.capacity) * f);
+        G.slot_bytes = static_cast<size_t>(c_.latent_width()) * static_cast<size_t>(G.capacity) * f;
+        G.k_cache = private_buffer(slots * G.slot_bytes);
         G.v_cache = G.k_cache;
         continue;
       }
@@ -975,6 +1091,7 @@ class DecoderMetal final : public Model {
         G.k_cache = source.k_cache;
         G.v_cache = source.v_cache;
         G.capacity = source.capacity;
+        G.slot_bytes = source.slot_bytes;
         continue;
       }
       // Sliding layers keep window + chunk slots so a whole chunk can be
@@ -982,8 +1099,18 @@ class DecoderMetal final : public Model {
       G.capacity = G.sliding ? std::min(max_context_, c_.sliding_window + chunk_) : max_context_;
       const size_t width = static_cast<size_t>(G.kv_heads) * static_cast<size_t>(G.head_dim);
       const size_t element = kv_f16_ ? sizeof(uint16_t) : sizeof(float);
-      G.k_cache = private_buffer(width * static_cast<size_t>(G.capacity) * element);
-      G.v_cache = private_buffer(width * static_cast<size_t>(G.capacity) * element);
+      G.slot_bytes = width * static_cast<size_t>(G.capacity) * element;
+      G.k_cache = private_buffer(slots * G.slot_bytes);
+      G.v_cache = private_buffer(slots * G.slot_bytes);
+    }
+    sequence_state_.assign(static_cast<size_t>(sequences_), SequenceState{});
+    if (sequences_ > 1) {  // decode_batch's tokens, rows, logits, sampled tokens and sampling history
+      const size_t slots = static_cast<size_t>(sequences_);
+      batch_tokens_ = shared_buffer(slots * sizeof(int32_t));
+      batch_rows_ = shared_buffer(slots * 4 * sizeof(int32_t));
+      batch_logits_ = shared_buffer(slots * static_cast<size_t>(c_.vocab_size) * f);
+      batch_out_ = shared_buffer(slots * sizeof(int32_t));
+      batch_history_ = shared_buffer(slots * static_cast<size_t>(max_context_) * sizeof(int32_t));
     }
     if (has_mtp()) {
       mtp_h_ = private_buffer((chunk + 1) * hidden * f);
@@ -1165,10 +1292,48 @@ class DecoderMetal final : public Model {
 
   // exact: a router's logits, staged in float throughout (a top-k choice
   // near a tie must not move).
+  // Whether an n-row pass is a batched decode's that keeps decode's float
+  // kernels (up to 16 rows: the same results as each sequence alone); larger
+  // batches take prefill's (qmm, half-staged inputs) for their throughput.
+  bool decode_rows(int n) const { return batched_ && n <= 2 * kQmvNMax; }
+
+  // Whether a pass of n tokens over l runs qmv_mma16: 9 to 16 tokens (a
+  // batched decode's rows past 8, or a short prefill) of 4-bit affine
+  // weights, whose x stays float. On M1 16 rows cost 2.8x one row's qmv,
+  // against 3.2x for two qmv_mma passes and a whole 32-row qmm tile's 3.4x.
+  static bool short_mma16(const GpuLinear& l, int n) {
+    return n > kQmvNMax && n <= 2 * kQmvNMax && l.bits == 4 && !l.mxfp4 && l.group % 32 == 0;
+  }
+
   void encode_qmm(id<MTLComputeCommandEncoder> enc, const GpuLinear& l, id<MTLBuffer> x, int n,
                   id<MTLBuffer> y, bool exact = false) {
     if (n == 1) {
       encode_qmv(enc, l, x, 0, y, 0);
+      return;
+    }
+    if (short_mma16(l, n) && x != h16_) {  // two 8-token blocks per dequantized fragment (qmv_mma16)
+      [enc setComputePipelineState:quant_pipeline("qmv_mma16", l)];
+      bind_weights(enc, l, 0);
+      bind(enc, x, 0, 3);
+      bind(enc, y, 0, 4);
+      bytes(enc, QmvNParams{l.rows, l.cols, n}, 5);
+      [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((l.rows + 15) / 16), 1, 1)
+          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+      return;
+    }
+    if (decode_rows(n) && n > kQmvNMax && !l.mxfp4) {
+      // A batched decode's rows past 8 over weights qmv_mma16 does not take:
+      // qmv_n per 8 rows, in float as one sequence's decode would compute them.
+      const size_t x_row = static_cast<size_t>(l.cols) * sizeof(float);
+      const size_t y_row = static_cast<size_t>(l.rows) * sizeof(float);
+      [enc setComputePipelineState:quant_pipeline("qmv_n", l)];
+      bind_weights(enc, l, 0);
+      for (int first = 0; first < n; first += kQmvNMax) {
+        bind(enc, x, x_row * static_cast<size_t>(first), 3);
+        bind(enc, y, y_row * static_cast<size_t>(first), 4);
+        bytes(enc, QmvNParams{l.rows, l.cols, std::min(kQmvNMax, n - first)}, 5);
+        [enc dispatchThreadgroups:MTLSizeMake(qmv_groups(l.rows), 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+      }
       return;
     }
     if (n <= kQmvNMax && !l.mxfp4) {  // a short pass: read the weights once for all n tokens
@@ -1222,8 +1387,9 @@ class DecoderMetal final : public Model {
   // it: a dense model's prefill reads it in half (h16_, converted once per
   // group of projections), which qmm would round it to while staging anyway
   // -- the same products, at 2.05 TFLOPS against 1.89 reading float on M1.
-  id<MTLBuffer> prefill_input(id<MTLComputeCommandEncoder> enc, int n) {
-    if (n <= kQmvNMax || h16_ == nil) return h_;
+  // Passes that l (the group's first matrix) takes on qmv_mma16 keep float.
+  id<MTLBuffer> prefill_input(id<MTLComputeCommandEncoder> enc, int n, const GpuLinear& l) {
+    if (n <= kQmvNMax || short_mma16(l, n) || decode_rows(n) || h16_ == nil) return h_;
     [enc setComputePipelineState:pipeline("floats_to_half")];
     bind(enc, h_, 0, 0);
     bind(enc, h16_, 0, 1);
@@ -1303,7 +1469,7 @@ class DecoderMetal final : public Model {
 
   void encode_qkv_into(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n, id<MTLBuffer> q_out) {
     if (!G.own_kv || G.k_eq_v) {  // queries only, or queries and the keys that double as values
-      const id<MTLBuffer> x = prefill_input(enc, n);
+      const id<MTLBuffer> x = prefill_input(enc, n, G.q);
       encode_qmm(enc, G.q, x, n, q_out);
       if (G.own_kv) encode_qmm(enc, G.k, x, n, kt_);
       return;
@@ -1322,7 +1488,7 @@ class DecoderMetal final : public Model {
           threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
       return;
     }
-    const id<MTLBuffer> x = prefill_input(enc, n);
+    const id<MTLBuffer> x = prefill_input(enc, n, G.q);
     encode_qmm(enc, G.q, x, n, q_out);
     encode_qmm(enc, G.k, x, n, kt_);
     encode_qmm(enc, G.v, x, n, vt_);
@@ -1342,7 +1508,7 @@ class DecoderMetal final : public Model {
   // The input projections into mixed_ ([q | k | v] channels), lin_z_, and the
   // raw b and a in lin_b_ and lin_a_; Qwen3-Next's grouped rows are split.
   void encode_gdn_projections(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n) {
-    const id<MTLBuffer> x = prefill_input(enc, n);
+    const id<MTLBuffer> x = prefill_input(enc, n, G.grouped ? G.in_qkvz : G.in_qkv);
     if (!G.grouped) {
       encode_qmm(enc, G.in_qkv, x, n, mixed_);
       encode_qmm(enc, G.in_z, x, n, lin_z_);
@@ -1560,8 +1726,8 @@ class DecoderMetal final : public Model {
     bind(enc, q_, 0, 0);
     bind(enc, kt_, 0, 1);
     bind(enc, vt_, 0, 2);
-    bind(enc, G.k_cache, 0, 3);
-    bind(enc, G.v_cache, 0, 4);
+    bind(enc, G.k_cache, kv_offset(G), 3);
+    bind(enc, G.v_cache, kv_offset(G), 4);
     bind(enc, G.q_norm, 5);
     bind(enc, G.k_norm, 6);
     bind(enc, G.sliding ? inv_freq_local_buf_ : inv_freq_global_buf_, 7);
@@ -1571,8 +1737,13 @@ class DecoderMetal final : public Model {
     bytes(enc, RopeParams{c_.num_heads, G.kv_heads, G.head_dim, start, G.capacity, c_.rms_norm_eps,
                           c_.norm_offset, c_.qk_norm ? 1 : 0, c_.qkv_bias ? 1 : 0, c_.v_norm ? 1 : 0,
                           c_.rotary_dim > 0 ? c_.rotary_dim : G.head_dim, rope_axes_ != nil ? 1 : 0, given ? 1 : 0,
-                          rope_offset_, kv_only ? c_.num_heads : 0},
+                          rope_offset_, kv_only ? c_.num_heads : 0, batched_ ? 1 : 0},
           8);
+    if (batched_) {
+      bind(enc, batch_rows_, 0, 14);
+    } else {
+      bind(enc, placeholder_, 14);
+    }
     bind(enc, G.q_bias, 9);
     bind(enc, G.k_bias, 10);
     bind(enc, G.v_bias, 11);
@@ -1597,7 +1768,8 @@ class DecoderMetal final : public Model {
     const int window = G.sliding ? c_.sliding_window : (1 << 30);
     // Image blocks let a query also see up to plan_.reach later keys.
     const bool blocks = !plan_.empty() && plan_.reach > 0 && c_.image_blocks_apply(G.sliding);
-    if (n >= kAttnMmMinRows && !c_.attention_sinks) {
+    // A batched pass's rows are different sequences: attn_partial, row by row.
+    if (n >= kAttnMmMinRows && !c_.attention_sinks && !batched_) {
       // 512-wide heads need the half cache (8 float keys of 512 would not fit).
       const bool flash_width =
           G.head_dim == 64 || G.head_dim == 128 || G.head_dim == 256 || (G.head_dim == 512 && kv_f16_);
@@ -1607,7 +1779,8 @@ class DecoderMetal final : public Model {
       }
       if (G.head_dim % 64 == 0 && encode_attention_mm(enc, G, n, start, window, blocks)) return;
     }
-    const int keys_max = std::min(window + (blocks ? plan_.reach : 0), start + n);  // the most keys a query sees
+    // The most keys a query sees (a batched pass: its furthest sequence's).
+    const int keys_max = std::min(window + (blocks ? plan_.reach : 0), batched_ ? batch_keys_ : start + n);
     // A threadgroup takes g of a kv head's query heads, each lane holding g *
     // head_dim / 32 query and accumulator values; past kAttnLaneValues they
     // spill (Gemma 4's 8 heads of 512 ran at 2.4 GB/s), so wide heads split
@@ -1625,15 +1798,20 @@ class DecoderMetal final : public Model {
         "attn_partial_g" + std::to_string(g) + "_d" + std::to_string(G.head_dim / 32) + (kv_f16_ ? "_h" : "");
     [enc setComputePipelineState:pipeline(name)];
     bind(enc, q_, 0, 0);
-    bind(enc, G.k_cache, 0, 1);
-    bind(enc, G.v_cache, 0, 2);
+    bind(enc, G.k_cache, kv_offset(G), 1);
+    bind(enc, G.v_cache, kv_offset(G), 2);
     bind(enc, part_o_, 0, 3);
     bind(enc, part_ml_, 0, 4);
     bytes(enc,
           AttnParams{c_.num_heads, G.kv_heads, G.head_dim, start, window, G.capacity, block, n_blocks,
-                     c_.attn_scale, c_.attn_logit_softcapping, blocks ? 1 : 0, group / g},
+                     c_.attn_scale, c_.attn_logit_softcapping, blocks ? 1 : 0, group / g, batched_ ? 1 : 0},
           5);
     bind(enc, last_key_, blocks ? sizeof(int32_t) * static_cast<size_t>(start - plan_.base) : 0, 6);
+    if (batched_) {
+      bind(enc, batch_rows_, 0, 7);
+    } else {
+      bind(enc, placeholder_, 7);
+    }
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(n_blocks),
                                           static_cast<NSUInteger>(head_groups), static_cast<NSUInteger>(n))
         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
@@ -1657,8 +1835,8 @@ class DecoderMetal final : public Model {
                               window, G.capacity, c_.attn_scale, c_.attn_logit_softcapping, blocks ? 1 : 0};
     [enc setComputePipelineState:pipeline("attn_flash_d" + std::to_string(G.head_dim) + (kv_f16_ ? "_h" : ""))];
     bind(enc, q_, 0, 0);
-    bind(enc, G.k_cache, 0, 1);
-    bind(enc, G.v_cache, 0, 2);
+    bind(enc, G.k_cache, kv_offset(G), 1);
+    bind(enc, G.v_cache, kv_offset(G), 2);
     bind(enc, attn_, 0, 3);
     bytes(enc, params, 4);
     bind(enc, last_key_, blocks ? sizeof(int32_t) * static_cast<size_t>(start - plan_.base) : 0, 5);
@@ -1694,7 +1872,7 @@ class DecoderMetal final : public Model {
       const NSUInteger row_tiles = static_cast<NSUInteger>((rows + 63) / 64);
       [enc setComputePipelineState:pipeline("attn_qk" + kv)];
       bind(enc, q_, 0, 0);
-      bind(enc, G.k_cache, 0, 1);
+      bind(enc, G.k_cache, kv_offset(G), 1);
       bind(enc, attn_scores_, 0, 2);
       bytes(enc, params, 3);
       bind(enc, last_key_, blocks ? sizeof(int32_t) * static_cast<size_t>(start - plan_.base) : 0, 4);
@@ -1708,7 +1886,7 @@ class DecoderMetal final : public Model {
           threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
       [enc setComputePipelineState:pipeline("attn_pv" + kv)];
       bind(enc, attn_scores_, 0, 0);
-      bind(enc, G.v_cache, 0, 1);
+      bind(enc, G.v_cache, kv_offset(G), 1);
       bind(enc, attn_, 0, 2);
       bytes(enc, params, 3);
       [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(D / 64), row_tiles, static_cast<NSUInteger>(H))
@@ -1724,7 +1902,7 @@ class DecoderMetal final : public Model {
   // latent_q_[t, h, :rank]: through the stacked embed_q, or straight from
   // kv_b_proj's key rows.
   void encode_latent_qkv(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n) {
-    const id<MTLBuffer> x = prefill_input(enc, n);
+    const id<MTLBuffer> x = prefill_input(enc, n, G.kv_a);
     if (c_.q_lora_rank > 0) {
       encode_qmm(enc, G.q_a, x, n, q_latent_);
       encode_rms_norm(enc, q_latent_, G.q_a_norm, q_latent_, n, NormParams{c_.q_lora_rank, c_.latent_norm_eps, 0.0f});
@@ -1810,7 +1988,7 @@ class DecoderMetal final : public Model {
     bind(enc, q_, 0, 0);
     bind(enc, latent_q_, 0, 1);
     bind(enc, kt_, 0, 2);
-    bind(enc, G.k_cache, 0, 3);
+    bind(enc, G.k_cache, kv_offset(G), 3);
     bind(enc, G.kv_a_norm, 4);
     bind(enc, inv_freq_global_buf_, 5);
     bytes(enc, MlaRopeParams{c_.num_heads, c_.qk_nope_dim, c_.qk_rope_dim, c_.kv_lora_rank, start,
@@ -1835,8 +2013,8 @@ class DecoderMetal final : public Model {
     if (n >= kAttnMmMinRows && flash_shape) {
       [enc setComputePipelineState:pipeline("attn_flash_mla_" + std::to_string(width))];
       bind(enc, latent_q_, 0, 0);
-      bind(enc, G.k_cache, 0, 1);
-      bind(enc, G.k_cache, 0, 2);
+      bind(enc, G.k_cache, kv_offset(G), 1);
+      bind(enc, G.k_cache, kv_offset(G), 2);
       bind(enc, latent_out_, 0, 3);
       bytes(enc, AttnMmParams{H, 1, width, start, 0, n, 0, start + n, 1 << 30, G.capacity, c_.attn_scale, 0.0f, 0}, 4);
       bind(enc, placeholder_, 5);
@@ -1856,8 +2034,8 @@ class DecoderMetal final : public Model {
       const int n_blocks = (keys + block - 1) / block;
       [enc setComputePipelineState:pipeline("attn_flash_mla_" + std::to_string(width))];
       bind(enc, latent_q_, 0, 0);
-      bind(enc, G.k_cache, 0, 1);
-      bind(enc, G.k_cache, 0, 2);
+      bind(enc, G.k_cache, kv_offset(G), 1);
+      bind(enc, G.k_cache, kv_offset(G), 2);
       bind(enc, latent_out_, 0, 3);
       bytes(enc, AttnMmParams{1, 1, width, start, 0, H, 0, keys, 1 << 30, G.capacity, c_.attn_scale, 0.0f, 0, 1, block},
             4);
@@ -1885,8 +2063,8 @@ class DecoderMetal final : public Model {
     [enc setComputePipelineState:pipeline("attn_partial_g" + std::to_string(kHeadsPerGroup) + "_d" +
                                           std::to_string(width / 32))];
     bind(enc, latent_q_, 0, 0);
-    bind(enc, G.k_cache, 0, 1);
-    bind(enc, G.k_cache, 0, 2);
+    bind(enc, G.k_cache, kv_offset(G), 1);
+    bind(enc, G.k_cache, kv_offset(G), 2);
     bind(enc, part_o_, 0, 3);
     bind(enc, part_ml_, 0, 4);
     bytes(enc, AttnParams{H, 1, width, start, 1 << 30, G.capacity, block, n_blocks, c_.attn_scale, 0.0f, 0,
@@ -2171,12 +2349,13 @@ class DecoderMetal final : public Model {
       bytes(enc, GluParams{G.gate.rows, G.gate.cols, silu}, 8);
       [enc dispatchThreadgroups:MTLSizeMake(qmv_groups(G.gate.rows), 1, 1)
           threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
-    } else if (n > kQmvNMax && G.gate.same_format(G.up) && !G.gate.mxfp4) {
+    } else if (n > kQmvNMax && !short_mma16(G.gate, n) && !decode_rows(n) && G.gate.same_format(G.up) &&
+               !G.gate.mxfp4) {
       // Gate and up in one pass over the staged input (qmm_glu), which is
       // half for a dense model (prefill_input) and float otherwise. A
       // float16 checkpoint's down projection stages its input in half
       // anyway, so the product goes to it in half.
-      const id<MTLBuffer> x = prefill_input(enc, n);
+      const id<MTLBuffer> x = prefill_input(enc, n, G.gate);
       const bool half_x = x == h16_;
       const bool half_down = half_x && !G.down.bf16 && !G.down.mxfp4;
       [enc setComputePipelineState:quant_pipeline(half_down ? "qmm_glu_hxh" : half_x ? "qmm_glu_hx" : "qmm_glu_f", G.gate)];
@@ -2200,7 +2379,7 @@ class DecoderMetal final : public Model {
         return;
       }
     } else {
-      const id<MTLBuffer> x = prefill_input(enc, n);
+      const id<MTLBuffer> x = prefill_input(enc, n, G.gate);
       encode_qmm(enc, G.gate, x, n, gate_);
       encode_qmm(enc, G.up, x, n, up_);
       [enc setComputePipelineState:pipeline("glu_mul")];
@@ -2211,6 +2390,12 @@ class DecoderMetal final : public Model {
       encode_elementwise(enc, count);
     }
     encode_qmm(enc, G.down, gate_, n, r_);
+  }
+
+  // The selected sequence's slot of G's caches (a batched pass binds them
+  // whole: its kernels find each row's slot).
+  size_t kv_offset(const GpuLayer& G) const {
+    return batched_ ? 0 : static_cast<size_t>(current_) * G.slot_bytes;
   }
 
   // While profiling, ends the work encoded since the previous section in its
@@ -2431,13 +2616,14 @@ class DecoderMetal final : public Model {
     auto next_norm = [&](size_t l) { return l + 1 < decoder_layers ? &layers_[l + 1].attn_norm : &final_norm_; };
     // KV-shared trailing layers write no cache: a plain pass skips them
     // without logits and runs them on its last row with (shared_suffix()).
-    const size_t full = verifying_ || mtp_on_ ? decoder_layers : static_cast<size_t>(c_.shared_suffix());
+    const size_t full =
+        verifying_ || mtp_on_ || batched_ ? decoder_layers : static_cast<size_t>(c_.shared_suffix());
     // A plain pass wants its final layer's keys and values for every row but
     // its output for the last row only, and only in the last chunk (as MLX's
     // lazy graph computes it); attention layers (standard or latent) that own
     // their cache.
     const GpuLayer& final_layer = layers_[decoder_layers - 1];
-    const bool tail = full == decoder_layers && !verifying_ && !mtp_on_ && n > 1 && plan_.empty() &&
+    const bool tail = full == decoder_layers && !verifying_ && !mtp_on_ && !batched_ && n > 1 && plan_.empty() &&
                       c_.per_layer_input == 0 && !final_layer.linear && (c_.mla() || final_layer.own_kv);
     for (size_t l = 0; l < full; ++l) {
       if (tail && l + 1 == full) {
@@ -2567,6 +2753,18 @@ class DecoderMetal final : public Model {
   std::shared_ptr<DecoderWeights> w_;
   const DecoderConfig& c_;
   int max_context_;
+  // Sequences (select_sequence): the selected one, and every one's position
+  // and RoPE offset while another is selected.
+  struct SequenceState {
+    int position = 0;
+    int rope_offset = 0;
+  };
+  int sequences_ = 1;
+  int current_ = 0;
+  std::vector<SequenceState> sequence_state_;
+  bool batched_ = false;  // decode_batch's pass: rows are sequences (batch_rows_)
+  int batch_keys_ = 0;    // and the most keys any of its rows attends to
+  id<MTLBuffer> batch_tokens_ = nil, batch_rows_ = nil, batch_logits_ = nil, batch_out_ = nil, batch_history_ = nil;
   int chunk_;
   bool kv_f16_;  // standard attention's keys and values stored as FP16
   int position_ = 0;
