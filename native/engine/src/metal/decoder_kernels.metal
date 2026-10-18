@@ -2285,7 +2285,9 @@ template LOKAHI_INSTANCE_ATTRS("attn_pv_h") decltype(attn_pv<half>) attn_pv<half
 // MLX's steel attention relies on the same layout). Every fragment a thread
 // holds is therefore in the same row, the row's four threads differ in lane
 // bits 0 and 3, and the per-row max, sum and rescale take two shuffles each.
-// Takes AttnMmParams with row0 = 0 and rows = the pass.
+// K and V fragments are loaded per lane as float from the staging (as qmm4
+// does: 10-21% faster than simdgroup_load of half fragments at every head
+// width on M1). Takes AttnMmParams with row0 = 0 and rows = the pass.
 // ---------------------------------------------------------------------------
 
 constant constexpr int ATT_FL_Q = 32;  // query rows per threadgroup
@@ -2348,6 +2350,7 @@ template <typename KV, int D, int BK, int SPLIT>
   // Q, prescaled so the scores come out in log2 units (softcap applies the
   // log2 factor after its tanh instead).
   const float q_scale = p.softcap > 0.0f ? p.scale : p.scale * M_LOG2E_F;
+  const short k_lane = short(fn * LD + d0 + fm), v_lane = short(fm * LD + d0 + fn);
   simdgroup_float8x8 qf[DH / 8];
   simdgroup_float8x8 o[DH / 8];
   const device float* qrow = q + (size_t(row_ok ? t : 0) * size_t(p.heads) + size_t(h)) * D + d0 + fn;
@@ -2381,11 +2384,15 @@ template <typename KV, int D, int BK, int SPLIT>
 
     simdgroup_float8x8 s[BK / 8];
     ATT_MM_UNROLL for (int j = 0; j < BK / 8; ++j) s[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    ATT_MM_UNROLL for (int d = 0; d < DH / 8; ++d) {
-      ATT_MM_UNROLL for (int j = 0; j < BK / 8; ++j) {
-        simdgroup_matrix<KV, 8, 8> kf;
-        simdgroup_load(kf, ks + 8 * j * LD + d0 + 8 * d, LD, ulong2(0, 0), true);
-        simdgroup_multiply_accumulate(s[j], qf[d], kf, s[j]);
+    {
+      // K^T fragment (dims x keys): lane (dim fm, keys fn, fn + 1).
+      const threadgroup KV* kp = ks + k_lane;
+      ATT_MM_UNROLL for (short d = 0; d < DH / 8; ++d) {
+        ATT_MM_UNROLL for (short j = 0; j < BK / 8; ++j) {
+          simdgroup_float8x8 kf;
+          FRAG_ELEMS(kf) = float2(float(kp[8 * j * LD + 8 * d]), float(kp[8 * j * LD + 8 * d + LD]));
+          simdgroup_multiply_accumulate(s[j], qf[d], kf, s[j]);
+        }
       }
     }
     if (SPLIT > 1) {  // add the other half's share of the scores
@@ -2430,11 +2437,15 @@ template <typename KV, int D, int BK, int SPLIT>
     l = l * factor + att_fl_row_sum(block_sum);
     m = m_new;
     ATT_MM_UNROLL for (int d = 0; d < DH / 8; ++d) FRAG_ELEMS(o[d]) *= factor;
-    ATT_MM_UNROLL for (int j = 0; j < BK / 8; ++j) {
-      ATT_MM_UNROLL for (int d = 0; d < DH / 8; ++d) {
-        simdgroup_matrix<KV, 8, 8> vf;
-        simdgroup_load(vf, vs + 8 * j * LD + d0 + 8 * d, LD);
-        simdgroup_multiply_accumulate(o[d], s[j], vf, o[d]);
+    {
+      // V fragment (keys x dims): lane (key fm, dims fn, fn + 1).
+      const threadgroup KV* vp = vs + v_lane;
+      ATT_MM_UNROLL for (short j = 0; j < BK / 8; ++j) {
+        ATT_MM_UNROLL for (short d = 0; d < DH / 8; ++d) {
+          simdgroup_float8x8 vf;
+          FRAG_ELEMS(vf) = float2(float(vp[8 * j * LD + 8 * d]), float(vp[8 * j * LD + 8 * d + 1]));
+          simdgroup_multiply_accumulate(o[d], s[j], vf, o[d]);
+        }
       }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
