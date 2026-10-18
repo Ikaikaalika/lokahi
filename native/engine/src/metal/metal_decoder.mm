@@ -1135,8 +1135,10 @@ class DecoderMetal final : public Model {
     [enc dispatchThreadgroups:MTLSizeMake(qmv_groups(l.rows), 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
   }
 
+  // exact: a router's logits, staged in float throughout (a top-k choice
+  // near a tie must not move).
   void encode_qmm(id<MTLComputeCommandEncoder> enc, const GpuLinear& l, id<MTLBuffer> x, int n,
-                  id<MTLBuffer> y) {
+                  id<MTLBuffer> y, bool exact = false) {
     if (n == 1) {
       encode_qmv(enc, l, x, 0, y, 0);
       return;
@@ -1168,10 +1170,10 @@ class DecoderMetal final : public Model {
     // holds), or for any input when the checkpoint itself is float16 (F16
     // scales: its reference runs in half, as MLX does). A bfloat16
     // checkpoint's other inputs keep float (their range may exceed half's)
-    // beside half weights (qmm_fh). Mixture-of-experts models stage in float
-    // throughout: half's rounding reaches later layers' routers and flips
-    // their top-k near a tie.
-    const char* kernel = "qmm_f";
+    // beside half weights (qmm_fh). Mixture-of-experts models stage X in
+    // float (half X's rounding reached later layers' routers and flipped
+    // their top-k near a tie) beside half weights, and routers in float.
+    const char* kernel = exact ? "qmm_f" : "qmm_fh";
     if (c_.num_experts == 0) kernel = x == h16_ ? "qmm_hx" : (x == h_ || !l.bf16) ? "qmm_h" : "qmm_fh";
     [enc setComputePipelineState:quant_pipeline(kernel, l)];
     bind_weights(enc, l, 0);
@@ -1926,7 +1928,7 @@ class DecoderMetal final : public Model {
                                             static_cast<NSUInteger>(n), 1)
           threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
     } else {
-      encode_qmm(enc, G.router, input, n, route_);
+      encode_qmm(enc, G.router, input, n, route_, /*exact=*/true);
     }
     if (c_.router == DecoderConfig::Router::SigmoidGrouped) {
       [enc setComputePipelineState:pipeline("moe_route_grouped")];
@@ -1974,7 +1976,7 @@ class DecoderMetal final : public Model {
     bytes(enc, MoeSortParams{pairs, c_.num_experts}, 4);
     [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
     const NSUInteger tiles = static_cast<NSUInteger>(moe_tile_capacity(static_cast<size_t>(n)));
-    [enc setComputePipelineState:quant_pipeline("moe_qmm_glu", G.expert_gate.format())];
+    [enc setComputePipelineState:quant_pipeline("moe_qmm_glu_h", G.expert_gate.format())];
     bind(enc, G.expert_gate.words, 0);
     bind(enc, G.expert_gate.scales, 1);
     bind(enc, G.expert_gate.biases, 2);
@@ -1991,7 +1993,7 @@ class DecoderMetal final : public Model {
     bind(enc, G.expert_up.bias, 13);
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((I + 31) / 32), tiles, 1)
         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
-    [enc setComputePipelineState:quant_pipeline("moe_qmm", G.expert_down.format())];
+    [enc setComputePipelineState:quant_pipeline("moe_qmm_h", G.expert_down.format())];
     bind(enc, G.expert_down.words, 0);
     bind(enc, G.expert_down.scales, 1);
     bind(enc, G.expert_down.biases, 2);

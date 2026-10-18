@@ -1386,8 +1386,11 @@ template LOKAHI_INSTANCE_ATTRS("qmm_glu_hxh") decltype(qmm_glu<half, half, half>
 // the pairs by expert and cuts each expert's run into tiles of at most 32;
 // moe_qmm then runs qmm's 32x32 tiles over a tile's gathered rows against
 // that expert's matrix (with GLU, gate and up together then the activation),
-// so each expert's weights are read once per 32 of its pairs. Staging is
-// float, as for every mixture-of-experts matrix.
+// so each expert's weights are read once per 32 of its pairs. X stages in
+// float, as for every mixture-of-experts matrix; experts' weights in half
+// (TW), which ran the experts 11% faster at 511 tokens routed 8 of 128
+// (staging the expert's rows sets a tile's cost). Tiles of 16 pairs (fuller)
+// ran 27% slower and of 64 pairs (one per expert there) 12% slower.
 // ---------------------------------------------------------------------------
 
 struct MoeSortParams {
@@ -1427,20 +1430,21 @@ kernel void moe_sort(const device int* chosen [[buffer(0)]],
 }
 
 // Weights of expert e's rows n0 ... n0 + 31 for one 32-code step into ws
-// (float, stride LD): affine 4-bit one word per thread, MXFP4 one word per
+// (TW, stride LD): affine 4-bit one word per thread, MXFP4 one word per
 // thread (E2M1 codes times the group's E8M0 exponent), other widths 16
 // codes on each of threads 0-63.
+template <typename TW>
 inline void moe_stage_w(const device uint* w, const device ushort* scales, const device ushort* biases,
-                        int rows, int cols, int n0, int k0, short tid, threadgroup float* ws) {
-  constexpr short LD = 36;
+                        int rows, int cols, int n0, int k0, short tid, threadgroup TW* ws) {
+  constexpr short LD = 32 + 16 / short(sizeof(TW));
   const bool word = QBITS == 4;
   const short w_row = word ? tid / 4 : tid / 2;
   const short w_col = word ? (tid % 4) * 8 : (tid % 2) * 16;
   if (!word && tid >= 64) return;
   const int row = n0 + w_row;
-  threadgroup float* d = ws + w_row * LD + w_col;
+  threadgroup TW* d = ws + w_row * LD + w_col;
   if (row >= rows) {
-    for (int j = 0; j < (word ? 8 : 16); ++j) d[j] = 0.0f;
+    for (int j = 0; j < (word ? 8 : 16); ++j) d[j] = TW(0.0f);
     return;
   }
   const int words_per_row = cols * QBITS / 32, groups_per_row = cols / QGROUP;
@@ -1449,25 +1453,26 @@ inline void moe_stage_w(const device uint* w, const device ushort* scales, const
   if (QMXFP4) {
     const float s = e8m0(reinterpret_cast<const device uchar*>(scales)[gi]);
     const uint code = wr[(k0 + w_col) / 8];
-    QMM_UNROLL for (int j = 0; j < 8; ++j) d[j] = s * kFp4[(code >> (4 * j)) & 0xFu];
+    QMM_UNROLL for (int j = 0; j < 8; ++j) d[j] = TW(s * kFp4[(code >> (4 * j)) & 0xFu]);
   } else if (word) {
     const float s = scale_at(scales, gi), b = scale_at(biases, gi);
     const uint code = wr[(k0 + w_col) / 8];
-    QMM_UNROLL for (int j = 0; j < 8; ++j) d[j] = s * float((code >> (4 * j)) & 0xFu) + b;
+    QMM_UNROLL for (int j = 0; j < 8; ++j) d[j] = TW(s * float((code >> (4 * j)) & 0xFu) + b);
   } else {
     float vals[16];
     dequant16(wr, k0 + w_col, scale_at(scales, gi), scale_at(biases, gi), vals);
-    QMM_UNROLL for (int j = 0; j < 16; ++j) d[j] = vals[j];
+    QMM_UNROLL for (int j = 0; j < 16; ++j) d[j] = TW(vals[j]);
   }
 }
 
 // One 8-column step of a 32x32 tile: c += A (gathered X) B (staged W)^T,
 // through per-lane float fragments as qmm.
-inline void moe_mma_step(const threadgroup float* as, const threadgroup float* bs, thread float2 (&c)[2][2]) {
-  constexpr short LD = 36;
+template <typename TW>
+inline void moe_mma_step(const threadgroup float* as, const threadgroup TW* bs, thread float2 (&c)[2][2]) {
+  constexpr short LD = 36, LDW = 32 + 16 / short(sizeof(TW));
   float2 a[2], b[2];
   QMM_UNROLL for (short i = 0; i < 2; ++i) a[i] = float2(as[i * 16 * LD], as[i * 16 * LD + 1]);
-  QMM_UNROLL for (short j = 0; j < 2; ++j) b[j] = float2(bs[j * 16 * LD], bs[j * 16 * LD + LD]);
+  QMM_UNROLL for (short j = 0; j < 2; ++j) b[j] = float2(float(bs[j * 16 * LDW]), float(bs[j * 16 * LDW + LDW]));
   QMM_UNROLL for (short i = 0; i < 2; ++i)
     QMM_UNROLL for (short j = 0; j < 2; ++j) {
       simdgroup_float8x8 am, bm, cm;
@@ -1482,7 +1487,7 @@ inline void moe_mma_step(const threadgroup float* as, const threadgroup float* b
 // Grid (ceil(rows / 32), at most pairs / 32 + experts tiles), 128 threads.
 // y[pair, row] = (W_e x)[row] (+ bias), or with GLU act(gate_e x) * (up_e x).
 // x rows are pair / k (p.input_rows) or the pair itself.
-template <bool GLU>
+template <bool GLU, typename TW>
 [[kernel]] void moe_qmm(const device uint* wg [[buffer(0)]],
                         const device ushort* sg_scales [[buffer(1)]],
                         const device ushort* bg [[buffer(2)]],
@@ -1502,10 +1507,10 @@ template <bool GLU>
                         uint sg [[simdgroup_index_in_threadgroup]],
                         uint lane [[thread_index_in_simdgroup]]) {
   if (int(tg.y) >= *tile_count) return;
-  constexpr short LD = 36;
+  constexpr short LD = 36, LDW = 32 + 16 / short(sizeof(TW));
   threadgroup float xs[32 * LD];
-  threadgroup float wgs[32 * LD];
-  threadgroup float wus[GLU ? 32 * LD : 1];
+  threadgroup TW wgs[32 * LDW];
+  threadgroup TW wus[GLU ? 32 * LDW : 1];
   const int4 tile = tiles[tg.y];
   const int e = tile.x, first = tile.y, count = tile.z - tile.y;
   const int n0 = int(tg.x) * 32;
@@ -1519,7 +1524,7 @@ template <bool GLU>
   const short fm = short((lane / 4) & 4) + short((lane / 2) % 4);
   const short fn = short((lane / 4) & 2) * 2 + short(lane % 2) * 2;
   const short tm = 8 * short(sg / 2), tn = 8 * short(sg % 2);
-  const short a_off = (tm + fm) * LD + fn, b_off = (tn + fn) * LD + fm;
+  const short a_off = (tm + fm) * LD + fn, b_off = (tn + fn) * LDW + fm;
   // This thread stages 8 values of row tid / 4 of the gathered X.
   const short st_row = short(tid / 4), st_col = short(tid % 4) * 8;
   const bool x_ok = st_row < count;
@@ -1543,8 +1548,8 @@ template <bool GLU>
     if (GLU) moe_stage_w(wue, sue, bue, p.rows, p.cols, n0, k0, short(tid), wus);
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const threadgroup float* as = xs + a_off;
-    const threadgroup float* gs = wgs + b_off;
-    const threadgroup float* us = wus + b_off;
+    const threadgroup TW* gs = wgs + b_off;
+    const threadgroup TW* us = wus + b_off;
     QMM_UNROLL for (short kk = 0; kk < 32; kk += 8) {
       moe_mma_step(as, gs, cg);
       if (GLU) moe_mma_step(as, us, cu);
@@ -1602,8 +1607,10 @@ kernel void head_tiles(device int* order [[buffer(0)]],
   if (i == 0) *tile_count = p.heads * per_head;
 }
 
-template LOKAHI_INSTANCE_ATTRS("moe_qmm") decltype(moe_qmm<false>) moe_qmm<false>;
-template LOKAHI_INSTANCE_ATTRS("moe_qmm_glu") decltype(moe_qmm<true>) moe_qmm<true>;
+// Per-head matrices (head_tiles) stage in float; experts' weights in half.
+template LOKAHI_INSTANCE_ATTRS("moe_qmm") decltype(moe_qmm<false, float>) moe_qmm<false, float>;
+template LOKAHI_INSTANCE_ATTRS("moe_qmm_h") decltype(moe_qmm<false, half>) moe_qmm<false, half>;
+template LOKAHI_INSTANCE_ATTRS("moe_qmm_glu_h") decltype(moe_qmm<true, half>) moe_qmm<true, half>;
 
 struct ElementwiseParams {
   int count;
