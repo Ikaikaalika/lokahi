@@ -1166,11 +1166,14 @@ class DecoderMetal final : public Model {
     // qmm (32x32 tiles, any width of affine codes; validate() refuses dense
     // MXFP4), staged in half for a norm's output (h_, whose values half
     // holds), or for any input when the checkpoint itself is float16 (F16
-    // scales: its reference runs in half, as MLX does), and in float
-    // otherwise. Mixture-of-experts models stage in float throughout: half's
-    // rounding reaches later layers' routers and flips their top-k near a tie.
-    const bool half_staging = (x == h_ || !l.bf16) && c_.num_experts == 0;
-    [enc setComputePipelineState:quant_pipeline(x == h16_ ? "qmm_hx" : half_staging ? "qmm_h" : "qmm_f", l)];
+    // scales: its reference runs in half, as MLX does). A bfloat16
+    // checkpoint's other inputs keep float (their range may exceed half's)
+    // beside half weights (qmm_fh). Mixture-of-experts models stage in float
+    // throughout: half's rounding reaches later layers' routers and flips
+    // their top-k near a tie.
+    const char* kernel = "qmm_f";
+    if (c_.num_experts == 0) kernel = x == h16_ ? "qmm_hx" : (x == h_ || !l.bf16) ? "qmm_h" : "qmm_fh";
+    [enc setComputePipelineState:quant_pipeline(kernel, l)];
     bind_weights(enc, l, 0);
     bind(enc, x, 0, 3);
     bind(enc, y, 0, 4);
