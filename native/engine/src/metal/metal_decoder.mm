@@ -25,6 +25,7 @@
 #include "common.h"
 #include "decoder_kernels_source.h"
 #include "metal/metal_common.h"
+#include "metal/gpu_cores.h"
 
 namespace lokahi {
 
@@ -255,7 +256,12 @@ SampleParams sample_params(const SamplingParams& sp, int vocab, int history_inde
                       static_cast<uint32_t>(sp.seed >> 32)};
 }
 
-constexpr int kDecodeMaxBlocks = 64;
+constexpr int kDecodeMaxBlocks = 64;  // most key blocks a decode step's attention splits into
+// Decode attention aims at this many threadgroups per GPU core: on an M1,
+// 8 kv heads in 8 key blocks attended 13-45% faster than in up to 64 blocks
+// of at least 32 keys (fewer threadgroups spend less on merging partials),
+// and 1-2 blocks starved the GPU.
+constexpr int kDecodeGroupsPerCore = 8;
 constexpr int kPrefillMaxBlocks = 8;
 // Passes of at least this many tokens attend on simdgroup matrices (attn_qk,
 // softmax_rows, attn_pv), their scores held in at most this many floats.
@@ -276,6 +282,7 @@ class DecoderMetal final : public Model {
       device_ = MTLCreateSystemDefaultDevice();
       LK_CHECK(device_ != nil, "metal: no Metal device");
       queue_ = [device_ newCommandQueue];
+      gpu_cores_ = gpu_core_count();
       library_ = compile_kernels(device_);
       validate();
       upload();
@@ -298,7 +305,9 @@ class DecoderMetal final : public Model {
   int vocab_size() const override { return c_.vocab_size; }
   int max_context() const override { return max_context_; }
   const char* kv_cache() const override { return kv_f16_ ? "f16" : "f32"; }
-  std::string device() const override { return [[device_ name] UTF8String]; }
+  std::string device() const override {
+    return std::string([[device_ name] UTF8String]) + ", " + std::to_string(gpu_cores_) + "-core GPU";
+  }
   double kv_bytes() const { return kv_f16_ ? 2.0 : 4.0; }
   int position() const override { return position_; }
   size_t weight_bytes() const override { return w_->matrix_bytes(); }
@@ -1526,10 +1535,6 @@ class DecoderMetal final : public Model {
       if (G.head_dim % 64 == 0 && encode_attention_mm(enc, G, n, start, window, blocks)) return;
     }
     const int keys_max = std::min(window + (blocks ? plan_.reach : 0), start + n);  // the most keys a query sees
-    const int max_blocks = n == 1 ? kDecodeMaxBlocks : kPrefillMaxBlocks;
-    const int min_block = n == 1 ? 32 : 64;
-    const int block = std::max(min_block, (keys_max + max_blocks - 1) / max_blocks);
-    const int n_blocks = (keys_max + block - 1) / block;
     // A threadgroup takes g of a kv head's query heads, each lane holding g *
     // head_dim / 32 query and accumulator values; past kAttnLaneValues they
     // spill (Gemma 4's 8 heads of 512 ran at 2.4 GB/s), so wide heads split
@@ -1537,6 +1542,12 @@ class DecoderMetal final : public Model {
     const int group = c_.num_heads / G.kv_heads;
     int g = group;
     while (g > 1 && (g * (G.head_dim / 32) > kAttnLaneValues || group % g != 0)) --g;
+    const int head_groups = G.kv_heads * (group / g);
+    const int max_blocks = n == 1 ? std::clamp(kDecodeGroupsPerCore * gpu_cores_ / head_groups, 1, kDecodeMaxBlocks)
+                                  : kPrefillMaxBlocks;
+    const int min_block = n == 1 ? 32 : 64;
+    const int block = std::max(min_block, (keys_max + max_blocks - 1) / max_blocks);
+    const int n_blocks = (keys_max + block - 1) / block;
     const std::string name =
         "attn_partial_g" + std::to_string(g) + "_d" + std::to_string(G.head_dim / 32) + (kv_f16_ ? "_h" : "");
     [enc setComputePipelineState:pipeline(name)];
@@ -1551,7 +1562,7 @@ class DecoderMetal final : public Model {
           5);
     bind(enc, last_key_, blocks ? sizeof(int32_t) * static_cast<size_t>(start - plan_.base) : 0, 6);
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(n_blocks),
-                                          static_cast<NSUInteger>(G.kv_heads * (group / g)), static_cast<NSUInteger>(n))
+                                          static_cast<NSUInteger>(head_groups), static_cast<NSUInteger>(n))
         threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
     [enc setComputePipelineState:pipeline("attn_reduce")];
     bind(enc, part_o_, 0, 0);
@@ -2293,6 +2304,7 @@ class DecoderMetal final : public Model {
   id<MTLCommandQueue> queue_ = nil;
   id<MTLLibrary> library_ = nil;
   bool fragments_ = false;  // fragment_layout_matches(): attn_flash and qmv_mma may run
+  int gpu_cores_ = 8;       // gpu_core_count(), for sizing decode attention
   std::map<std::string, id<MTLComputePipelineState>> pipelines_;
 
   GpuLinear embed_, lm_head_, embed_per_layer_, per_layer_model_proj_;

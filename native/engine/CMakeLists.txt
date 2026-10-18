@@ -56,7 +56,8 @@ if(LOKAHI_METAL)
             -DSYMBOL=kDecoderKernelSource -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_text.cmake
     DEPENDS ${LOKAHI_SHADER} ${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed_text.cmake
     COMMENT "Embedding Metal kernels")
-  list(APPEND LOKAHI_CORE_SOURCES src/metal/metal_decoder.mm src/metal/metal_vision.mm ${LOKAHI_SHADER_HEADER})
+  list(APPEND LOKAHI_CORE_SOURCES src/metal/metal_decoder.mm src/metal/metal_vision.mm src/metal/gpu_cores.cpp
+       ${LOKAHI_SHADER_HEADER})
   if(LOKAHI_CHECK_METAL_SHADERS)
     add_custom_target(lokahi_shader_check ALL
       COMMAND xcrun -sdk macosx metal -std=metal3.0 -Werror -c ${LOKAHI_SHADER}
@@ -75,7 +76,8 @@ target_link_libraries(lokahi_core PUBLIC Threads::Threads)
 if(LOKAHI_METAL)
   target_compile_definitions(lokahi_core PUBLIC LOKAHI_WITH_METAL=1)
   set_source_files_properties(src/metal/metal_decoder.mm src/metal/metal_vision.mm PROPERTIES COMPILE_FLAGS "-fobjc-arc")
-  target_link_libraries(lokahi_core PUBLIC "-framework Foundation" "-framework Metal")
+  target_link_libraries(lokahi_core PUBLIC "-framework Foundation" "-framework Metal" "-framework IOKit"
+                        "-framework CoreFoundation")
 endif()
 
 # Shared library exposing the C ABI (include/lokahi/lokahi.h).
