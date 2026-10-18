@@ -14,7 +14,7 @@
 //   lokahi sample     --logits-file F.f32 --vocab V [sampling flags] [--steps N] [--first-step S]
 //                     [--backend cpu|metal]
 //   lokahi bench      --model DIR (--tokens ... | --tokens-file F) --max-new N
-//                     [--warmups W] [--repetitions R]
+//                     [--warmups W] [--repetitions R] [--images A.ppm,B.ppm]
 //                     [--speculate N [--draft-reference FILE] [--drafter lookup|mtp|both]]
 //   lokahi profile    --model DIR (--tokens ... | --tokens-file F | --prompt TEXT)
 //                     [--max-new N] [--warmups W]
@@ -228,16 +228,25 @@ struct EncodedImages {
   std::vector<std::pair<int, int>> grids;
 };
 
-EncodedImages encode_images(const Args& args, VisionEncoder& encoder) {
+std::vector<Image> read_images(const Args& args, const VisionEncoder& encoder) {
+  std::vector<Image> images;
+  for (const std::string& path : split_list(args.get("images"))) images.push_back(read_image(path, encoder.fixed_size()));
+  LK_CHECK(!images.empty(), "--images names no files");
+  return images;
+}
+
+EncodedImages encode_images(const std::vector<Image>& images, VisionEncoder& encoder) {
   EncodedImages out;
-  for (const std::string& path : split_list(args.get("images"))) {
-    const Image image = read_image(path, encoder.fixed_size());
+  for (const Image& image : images) {
     out.features.push_back(encoder.encode_features(image));
     const auto grid = encoder.token_grid(image.width, image.height);
     if (grid.first > 0) out.grids.push_back(grid);
   }
-  LK_CHECK(!out.features.empty(), "--images names no files");
   return out;
+}
+
+EncodedImages encode_images(const Args& args, VisionEncoder& encoder) {
+  return encode_images(read_images(args, encoder), encoder);
 }
 
 // The vision encoder on the same backend as the decoder (--backend), with at
@@ -614,6 +623,15 @@ int cmd_bench(const Args& args) {
   const std::string drafter = args.get("drafter", "lookup");
   const int max_draft = speculation.max_draft;
   model->set_speculation(std::move(speculation));
+  // --images: every run encodes them through the vision tower and hands them
+  // to its prefill; ttft_ms then counts the encoding (vision_ms) too.
+  std::unique_ptr<VisionEncoder> encoder;
+  std::vector<Image> images;
+  if (args.has("images")) {
+    LK_CHECK(!speculating, "bench takes --images or --speculate, not both");
+    encoder = load_vision(args);
+    images = read_images(args, *encoder);
+  }
 
   std::ostringstream reps;
   reps << "[";
@@ -622,6 +640,14 @@ int cmd_bench(const Args& args) {
   std::vector<int32_t> reference;
   for (int run = 0; run < warmups + repetitions; ++run) {
     model->reset();
+    double vision_seconds = 0.0;
+    if (encoder) {
+      const double start = now_seconds();
+      const EncodedImages encoded = encode_images(images, *encoder);
+      model->inject(place_images(prompt, model->position(), encoder->image_token_id(), encoder->text_hidden_size(),
+                                 encoded.features, encoded.grids));
+      vision_seconds = now_seconds() - start;
+    }
     GenerationTiming timing;
     auto tokens = model->generate_greedy(prompt, max_new, false, &timing);
     LK_CHECK(static_cast<int>(tokens.size()) == max_new, "generation stopped early");
@@ -636,8 +662,8 @@ int cmd_bench(const Args& args) {
     // A verify pass emits its tokens together, so most intervals are zero;
     // the mean is the time per token there.
     const double inter_token_ms = speculating ? 1000.0 * timing.decode_seconds / (max_new - 1) : median(intervals);
-    const double ttft_ms = 1000.0 * timing.prefill_seconds;
-    const double total = timing.prefill_seconds + timing.decode_seconds;
+    const double ttft_ms = 1000.0 * (vision_seconds + timing.prefill_seconds);
+    const double total = vision_seconds + timing.prefill_seconds + timing.decode_seconds;
     const SpeculationStats& stats = model->speculation_stats();
     reps << (run > warmups ? "," : "") << "{\"ttft_ms\":" << ttft_ms
          << ",\"inter_token_latency_ms\":" << inter_token_ms
@@ -645,6 +671,7 @@ int cmd_bench(const Args& args) {
          << ",\"decode_tokens_per_second\":" << (max_new - 1) / timing.decode_seconds
          << ",\"aggregate_tokens_per_second_including_prefill\":" << max_new / total
          << ",\"peak_memory_gb\":" << peak_rss_bytes() / 1e9;
+    if (encoder) reps << ",\"vision_ms\":" << 1000.0 * vision_seconds;
     if (speculating) {
       reps << ",\"speculation\":{\"passes\":" << stats.passes << ",\"drafted\":" << stats.drafted
            << ",\"accepted\":" << stats.accepted << "}";
