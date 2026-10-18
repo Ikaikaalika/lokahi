@@ -1513,7 +1513,10 @@ class DecoderMetal final : public Model {
     // Image blocks let a query also see up to plan_.reach later keys.
     const bool blocks = !plan_.empty() && plan_.reach > 0 && c_.image_blocks_apply(G.sliding);
     if (n >= kAttnMmMinRows && !c_.attention_sinks) {
-      if (fragments_ && (G.head_dim == 64 || G.head_dim == 128 || G.head_dim == 256)) {
+      // 512-wide heads need the half cache (8 float keys of 512 would not fit).
+      const bool flash_width =
+          G.head_dim == 64 || G.head_dim == 128 || G.head_dim == 256 || (G.head_dim == 512 && kv_f16_);
+      if (fragments_ && flash_width) {
         encode_attention_flash(enc, G, n, start, window, blocks);
         return;
       }
@@ -1581,7 +1584,8 @@ class DecoderMetal final : public Model {
   }
 
   // A long pass's attention in one fused kernel (attn_flash), 32 query rows
-  // of one head per threadgroup, for head_dim 64, 128 and 256.
+  // of one head per threadgroup, for head_dim 64, 128, 256 and 512 (two
+  // simdgroups per 8 rows, each holding half of the dimensions).
   void encode_attention_flash(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n, int start, int window,
                               bool blocks) {
     const int key_base = std::max(0, start - window + 1);  // the earliest key any row of the pass sees
@@ -1596,7 +1600,7 @@ class DecoderMetal final : public Model {
     bind(enc, last_key_, blocks ? sizeof(int32_t) * static_cast<size_t>(start - plan_.base) : 0, 5);
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((n + 31) / 32), static_cast<NSUInteger>(c_.num_heads),
                                           1)
-        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        threadsPerThreadgroup:MTLSizeMake(G.head_dim == 512 ? 256 : 128, 1, 1)];
   }
 
   // A long pass's attention as S = Q K^T, softmax, P V on simdgroup matrices,

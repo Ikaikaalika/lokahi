@@ -324,7 +324,15 @@ def test_logits_match_oracle(native_cli, fixture_model, backend, prefill, chunk,
     np.testing.assert_array_equal(got.argmax(axis=1), expected.argmax(axis=1))
 
 
+# Gemma 4's real head sizes: 256-wide sliding heads and 512-wide full-attention
+# heads, which the 64-wide fixtures above never reach.
+GEMMA4_WIDE_HEADS = TinyGemma4Spec(head_dim=256, global_head_dim=512, num_attention_heads=2, seed=12)
+
+
 def _write_named(directory: Path, name: str):
+    if name == "gemma4-wide-heads":
+        write_tiny_gemma4(directory, GEMMA4_WIDE_HEADS)
+        return Gemma4Reference.load(directory)
     if name in GEMMA3_VARIANTS:
         write_tiny_gemma3(directory, GEMMA3_VARIANTS[name])
         return Gemma3Reference.load(directory)
@@ -337,14 +345,14 @@ def _write_named(directory: Path, name: str):
 
 # Prompts long enough for Metal's fused prefill attention (attn_flash) to run
 # several 32-row tiles, a partial last tile, passes that start past position 0
-# (chunks of 33) and sliding windows whose rings wrap, at 64-, 128- and
-# 256-wide heads. The 2% tolerance above misses a 1% error in attention's
+# (chunks of 33) and sliding windows whose rings wrap, at 64-, 128-, 256- and
+# 512-wide heads. The 2% tolerance above misses a 1% error in attention's
 # output (it moved these logits by 0.6% of their scale); the paths measured
 # 2e-5 to 6.5e-4 of it (correctness evidence).
 @pytest.mark.parametrize("backend", _backends())
 @pytest.mark.parametrize("chunk", [512, 33])
 @pytest.mark.parametrize("name", ["llama3-tied-rope-llama3", "qwen3-qk-norm-hd128", "gemma3-tied-hd256-rope-scaled",
-                                  "mistral-sliding-untied", "gemma4-e2b-shape"])
+                                  "mistral-sliding-untied", "gemma4-e2b-shape", "gemma4-wide-heads"])
 def test_long_prefill_matches_oracle_closely(native_cli, name, backend, chunk, tmp_path):
     oracle = _write_named(tmp_path / "model", name)
     tokens = (TOKENS * 4)[:80]
