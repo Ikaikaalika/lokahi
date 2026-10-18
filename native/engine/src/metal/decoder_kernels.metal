@@ -1131,6 +1131,107 @@ kernel void qmm(const device uint* w [[buffer(0)]],
   }
 }
 
+// 4-bit affine qmm (most checkpoints), software-pipelined: each step's X
+// float4s and W words load into registers before the previous step's
+// multiply-accumulates, so device latency hides behind the math, and
+// threadgroup memory holds only the staging (edge tiles leave one 8x8 block
+// at a time through a per-simdgroup scratch in it), so more threadgroups fit
+// on a core. T is the staging type: half (2x less staging, ~15% faster on an
+// M1; for inputs a norm just produced, whose values half holds) or float.
+// 64x64 tiles, 128 threads, as qmm. Requires cols % 32 == 0, QGROUP % 32 == 0.
+template <typename T>
+[[kernel]] void qmm4(const device uint* w [[buffer(0)]],
+                     const device ushort* scales [[buffer(1)]],
+                     const device ushort* biases [[buffer(2)]],
+                     const device float* x [[buffer(3)]],
+                     device float* y [[buffer(4)]],
+                     constant QmmParams& p [[buffer(5)]],
+                     uint2 tg [[threadgroup_position_in_grid]],
+                     uint tid [[thread_index_in_threadgroup]],
+                     uint sg [[simdgroup_index_in_threadgroup]],
+                     uint lane [[thread_index_in_simdgroup]]) {
+  constexpr int TM = QMM_TILE_M, TN = QMM_TILE_N, TK = QMM_TILE_K, LD = TK + 8;
+  threadgroup float smem[2 * TM * LD * int(sizeof(T)) / 4];
+  threadgroup T* xs = reinterpret_cast<threadgroup T*>(smem);
+  threadgroup T* ws = xs + TM * LD;
+  const int m0 = int(tg.y) * TM, n0 = int(tg.x) * TN;
+  const int sm = int(sg / 2) * 32, sn = int(sg % 2) * 32;
+  const int words_per_row = p.cols / 8, groups_per_row = p.cols / QGROUP;
+  // This thread's W: 16 codes (two words) of row tid / 2 from column (tid % 2) * 16.
+  const int w_row = int(tid) / 2, w_col = (int(tid) % 2) * 16;
+  const int row = n0 + w_row;
+  const bool row_ok = row < p.rows;
+  const int safe_row = row_ok ? row : 0;
+  const device uint* wr = w + safe_row * words_per_row;
+  float4 xr[4];  // X float4s (tid + 128 j): row / 8, column (% 8) * 4
+  uint2 wv;
+  float ws_scale, ws_bias;
+#define QMM4_FETCH(K0)                                                                             \
+  {                                                                                                \
+    QMM_UNROLL for (int j = 0; j < 4; ++j) {                                                       \
+      const int i = int(tid) + 128 * j;                                                            \
+      const int r = i / 8, c = (i % 8) * 4;                                                        \
+      xr[j] = {0.0f, 0.0f, 0.0f, 0.0f};                                                            \
+      if (m0 + r < p.n) xr[j] = *reinterpret_cast<const device float4*>(x + (m0 + r) * p.cols + (K0) + c); \
+    }                                                                                              \
+    wv = {0u, 0u};                                                                                 \
+    if (row_ok) wv = *reinterpret_cast<const device uint2*>(wr + ((K0) + w_col) / 8);              \
+    const int gi = safe_row * groups_per_row + ((K0) + w_col) / QGROUP;                            \
+    ws_scale = row_ok ? scale_at(scales, gi) : 0.0f;                                               \
+    ws_bias = row_ok ? scale_at(biases, gi) : 0.0f;                                                \
+  }
+  simdgroup_float8x8 acc[4][4];
+  QMM_UNROLL for (int i = 0; i < 4; ++i)
+    QMM_UNROLL for (int j = 0; j < 4; ++j) acc[i][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  QMM4_FETCH(0)
+  for (int k0 = 0; k0 < p.cols; k0 += TK) {
+    QMM_UNROLL for (int j = 0; j < 4; ++j) {
+      const int i = int(tid) + 128 * j;
+      threadgroup T* d = xs + (i / 8) * LD + (i % 8) * 4;
+      d[0] = T(xr[j].x);
+      d[1] = T(xr[j].y);
+      d[2] = T(xr[j].z);
+      d[3] = T(xr[j].w);
+    }
+    {
+      threadgroup T* d = ws + w_row * LD + w_col;
+      QMM_UNROLL for (int j = 0; j < 8; ++j) d[j] = T(ws_scale * float((wv.x >> (4 * j)) & 0xFu) + ws_bias);
+      QMM_UNROLL for (int j = 0; j < 8; ++j) d[8 + j] = T(ws_scale * float((wv.y >> (4 * j)) & 0xFu) + ws_bias);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (k0 + TK < p.cols) QMM4_FETCH(k0 + TK)
+    QMM_UNROLL for (int kk = 0; kk < TK; kk += 8) {
+      simdgroup_matrix<T, 8, 8> a[4], b[4];
+      QMM_UNROLL for (int i = 0; i < 4; ++i) simdgroup_load(a[i], xs + (sm + 8 * i) * LD + kk, LD);
+      QMM_UNROLL for (int j = 0; j < 4; ++j) simdgroup_load(b[j], ws + (sn + 8 * j) * LD + kk, LD, ulong2(0, 0), true);
+      QMM_UNROLL for (int i = 0; i < 4; ++i)
+        QMM_UNROLL for (int j = 0; j < 4; ++j) simdgroup_multiply_accumulate(acc[i][j], a[i], b[j], acc[i][j]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+#undef QMM4_FETCH
+  if (m0 + TM <= p.n && n0 + TN <= p.rows) {
+    device float* out = y + (m0 + sm) * p.rows + n0 + sn;
+    QMM_UNROLL for (int i = 0; i < 4; ++i)
+      QMM_UNROLL for (int j = 0; j < 4; ++j) simdgroup_store(acc[i][j], out + 8 * i * p.rows + 8 * j, p.rows);
+    return;
+  }
+  threadgroup float* scratch = smem + int(sg) * 64;  // the staging is free after the last barrier
+  QMM_UNROLL for (int i = 0; i < 4; ++i)
+    QMM_UNROLL for (int j = 0; j < 4; ++j) {
+      simdgroup_store(acc[i][j], scratch, 8);
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+      for (int e = int(lane); e < 64; e += 32) {
+        const int r = m0 + sm + 8 * i + e / 8, c = n0 + sn + 8 * j + e % 8;
+        if (r < p.n && c < p.rows) y[r * p.rows + c] = scratch[e];
+      }
+      simdgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+template LOKAHI_INSTANCE_ATTRS("qmm4_h") decltype(qmm4<half>) qmm4<half>;
+template LOKAHI_INSTANCE_ATTRS("qmm4_f") decltype(qmm4<float>) qmm4<float>;
+
 struct ElementwiseParams {
   int count;
 };
