@@ -35,6 +35,8 @@ struct PoolParams { int cols; int side; int tokens_side; };
 struct GluMulParams { int count; int silu; };
 struct WindowAttentionParams { int dim; int stride; int hidden; float scale; };
 constexpr int kMaxWindowKeys = 1024;  // as decoder_kernels.metal
+// One page of the placeholder buffer bound for unused optional inputs.
+constexpr size_t kDummyBytes = 16384;
 // The Qwen tower's attention scores held at once by default, in floats
 // (128 MiB): a 1344 x 1344 Qwen2.5-VL image has 9216 patches, which would
 // need 324 MiB for one head's full score matrix.
@@ -64,7 +66,11 @@ class MetalKit {
     LK_CHECK(device_ != nil, "metal: no Metal device");
     queue_ = [device_ newCommandQueue];
     library_ = compile_kernels(device_);
-    dummy_ = shared_buffer(16);  // bound where a kernel's optional input is unused
+    // Bound where a kernel's optional input is unused, and filled with NaN so
+    // a kernel that reads it anyway (a bias flagged present but nil) fails
+    // every check instead of adding whatever the recycled page held.
+    dummy_ = shared_buffer(kDummyBytes);
+    std::fill_n(static_cast<float*>([dummy_ contents]), kDummyBytes / sizeof(float), std::nanf(""));
   }
 
   id<MTLBuffer> buffer_of(const void* data, size_t bytes) {
@@ -233,7 +239,7 @@ class SiglipMetal final : public SiglipEncoder, private MetalKit {
   // A [m, k] times a [n, k] weight, plus its bias, into C (or onto it).
   void linear(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> a, const GpuMatrix& w, id<MTLBuffer> bias,
               id<MTLBuffer> c, int m, int n, int k, bool accumulate) {
-    mm(enc, a, 0, w, 0, true, c, 0, MmParams{m, n, k, k, k, n, 1.0f, 1, accumulate ? 1 : 0}, bias);
+    mm(enc, a, 0, w, 0, true, c, 0, MmParams{m, n, k, k, k, n, 1.0f, bias != nil ? 1 : 0, accumulate ? 1 : 0}, bias);
   }
 
   void layer_norm(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> in, id<MTLBuffer> weight, id<MTLBuffer> bias,
@@ -679,7 +685,7 @@ class Qwen35VisionMetal final : public Qwen35VisionEncoder, private MetalKit {
   // [m, k] rows times a [n, k] weight, plus its bias, into C (or onto it).
   void linear(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> a, const GpuMatrix& w, id<MTLBuffer> bias,
               id<MTLBuffer> c, int m, int n, int k, bool accumulate) {
-    mm(enc, a, 0, w, 0, true, c, 0, MmParams{m, n, k, k, k, n, 1.0f, 1, accumulate ? 1 : 0}, bias);
+    mm(enc, a, 0, w, 0, true, c, 0, MmParams{m, n, k, k, k, n, 1.0f, bias != nil ? 1 : 0, accumulate ? 1 : 0}, bias);
   }
 
   void layer_norm(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> in, id<MTLBuffer> weight, id<MTLBuffer> bias,
