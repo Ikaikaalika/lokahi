@@ -25,6 +25,8 @@ struct float2 {
   explicit float2(float v) : x(v), y(v) {}
   float2 operator*(float v) const { return {x * v, y * v}; }
   float2& operator*=(float v) { x *= v; y *= v; return *this; }
+  float2& operator+=(float2 o) { x += o.x; y += o.y; return *this; }
+  float2 operator+(float2 o) const { return {x + o.x, y + o.y}; }
   float2(float a, float b) : x(a), y(b) {}
 };
 struct float4 {
