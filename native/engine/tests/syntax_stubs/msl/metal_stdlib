@@ -58,10 +58,20 @@ struct uint4 {
   uint operator[](int i) const { return i == 0 ? x : i == 1 ? y : i == 2 ? z : w; }
 };
 struct ulong2 { ulong x, y; ulong2(ulong a, ulong b) : x(a), y(b) {} };
+struct int4 {
+  int x, y, z, w;
+  int4() = default;
+  int4(int a, int b, int c, int d) : x(a), y(b), z(c), w(d) {}
+};
 namespace metal {
 enum class mem_flags { mem_none, mem_device, mem_threadgroup };
 inline void threadgroup_barrier(mem_flags) {}
 inline void simdgroup_barrier(mem_flags) {}
+enum memory_order { memory_order_relaxed };
+struct atomic_int { int v; };
+inline void atomic_store_explicit(threadgroup atomic_int* a, int v, memory_order) { a->v = v; }
+inline int atomic_load_explicit(threadgroup atomic_int* a, memory_order) { return a->v; }
+inline int atomic_fetch_add_explicit(threadgroup atomic_int* a, int v, memory_order) { int o = a->v; a->v += v; return o; }
 template <typename T> T simd_sum(T v) { return v; }
 template <typename T> T simd_max(T v) { return v; }
 template <typename T> T simd_min(T v) { return v; }

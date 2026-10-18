@@ -214,6 +214,10 @@ struct MoeRouteParams {
   float scaling;
 };
 struct GatherParams { int rows; int cols; int k; int input_rows; int act; int has_bias; float limit; int x_stride; int y_stride; };
+struct MoeSortParams { int pairs; int experts; };
+// From this many tokens, a pass's experts run grouped by expert (moe_sort,
+// moe_qmm) instead of one matrix-vector product per (token, slot) pair.
+constexpr int kMoeGroupedMinTokens = 16;
 struct AbsorbParams { int heads; int nope; int head_rows; int cols; int x_stride; int y_stride; };
 struct MlaRopeParams { int heads; int nope; int rope; int rank; int start_pos; float eps; int pairs; float factor; };
 struct MoeCombineParams { int cols; int k; int count; int has_shared; };
@@ -978,6 +982,10 @@ class DecoderMetal final : public Model {
       expert_weights_ = private_buffer(slots * f);
       expert_hidden_ = private_buffer(slots * static_cast<size_t>(c_.moe_intermediate) * f);
       expert_out_ = private_buffer(slots * hidden * f);
+      // moe_sort's pair order and tiles (each expert's run cut into 32s).
+      moe_order_ = private_buffer(slots * sizeof(int32_t));
+      moe_tiles_ = private_buffer(moe_tile_capacity(chunk) * 4 * sizeof(int32_t));
+      moe_tile_count_ = private_buffer(sizeof(int32_t));
     }
     if (c_.per_layer_input > 0) {
       const size_t width = static_cast<size_t>(c_.num_layers) * static_cast<size_t>(c_.per_layer_input);
@@ -1863,12 +1871,65 @@ class DecoderMetal final : public Model {
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(n), 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
   }
 
-  // `out` = the experts of the rows in `input`, weighted (plus the shared expert).
-  void encode_experts(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n, id<MTLBuffer> input,
-                      id<MTLBuffer> out) {
+  // Tiles moe_sort can cut the pairs of `tokens` tokens into: every 32
+  // pairs, plus one partial tile per expert.
+  size_t moe_tile_capacity(size_t tokens) const {
+    return (tokens * static_cast<size_t>(c_.experts_per_token) + 31) / 32 + static_cast<size_t>(c_.num_experts);
+  }
+
+  // The pass's (token, slot) pairs grouped by expert: moe_sort orders them
+  // and cuts tiles, then each tile runs as qmm tiles against its expert.
+  void encode_experts_grouped(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n, id<MTLBuffer> input,
+                              int act, int has_bias) {
     const int K = c_.experts_per_token, I = c_.moe_intermediate, pairs = n * K;
-    const int act = c_.activation == Activation::ClampedSwiglu ? 2 : c_.activation == Activation::Silu ? 1 : 0;
-    const int has_bias = c_.expert_bias ? 1 : 0;
+    [enc setComputePipelineState:pipeline("moe_sort")];
+    bind(enc, chosen_, 0, 0);
+    bind(enc, moe_order_, 0, 1);
+    bind(enc, moe_tiles_, 0, 2);
+    bind(enc, moe_tile_count_, 0, 3);
+    bytes(enc, MoeSortParams{pairs, c_.num_experts}, 4);
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(512, 1, 1)];
+    const NSUInteger tiles = static_cast<NSUInteger>(moe_tile_capacity(static_cast<size_t>(n)));
+    [enc setComputePipelineState:quant_pipeline("moe_qmm_glu", G.expert_gate.format())];
+    bind(enc, G.expert_gate.words, 0);
+    bind(enc, G.expert_gate.scales, 1);
+    bind(enc, G.expert_gate.biases, 2);
+    bind(enc, G.expert_up.words, 3);
+    bind(enc, G.expert_up.scales, 4);
+    bind(enc, G.expert_up.biases, 5);
+    bind(enc, input, 0, 6);
+    bind(enc, expert_hidden_, 0, 7);
+    bytes(enc, GatherParams{I, c_.hidden_size, K, 1, act, has_bias, c_.swiglu_limit, 0, 0}, 8);
+    bind(enc, moe_order_, 0, 9);
+    bind(enc, moe_tiles_, 0, 10);
+    bind(enc, moe_tile_count_, 0, 11);
+    bind(enc, G.expert_gate.bias, 12);
+    bind(enc, G.expert_up.bias, 13);
+    [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((I + 31) / 32), tiles, 1)
+        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+    [enc setComputePipelineState:quant_pipeline("moe_qmm", G.expert_down.format())];
+    bind(enc, G.expert_down.words, 0);
+    bind(enc, G.expert_down.scales, 1);
+    bind(enc, G.expert_down.biases, 2);
+    bind(enc, G.expert_down.words, 3);  // unused without GLU
+    bind(enc, G.expert_down.scales, 4);
+    bind(enc, G.expert_down.biases, 5);
+    bind(enc, expert_hidden_, 0, 6);
+    bind(enc, expert_out_, 0, 7);
+    bytes(enc, GatherParams{c_.hidden_size, I, K, 0, 0, has_bias, c_.swiglu_limit, 0, 0}, 8);
+    bind(enc, moe_order_, 0, 9);
+    bind(enc, moe_tiles_, 0, 10);
+    bind(enc, moe_tile_count_, 0, 11);
+    bind(enc, G.expert_down.bias, 12);
+    bind(enc, G.expert_down.bias, 13);
+    [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((c_.hidden_size + 31) / 32), tiles, 1)
+        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+  }
+
+  // One matrix-vector product per (token, slot) pair, for short passes.
+  void encode_experts_per_pair(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n, id<MTLBuffer> input,
+                               int act, int has_bias) {
+    const int K = c_.experts_per_token, I = c_.moe_intermediate, pairs = n * K;
     [enc setComputePipelineState:quant_pipeline("qmv_gather_glu", G.expert_gate.format())];
     bind(enc, G.expert_gate.words, 0);
     bind(enc, G.expert_gate.scales, 1);
@@ -1895,6 +1956,19 @@ class DecoderMetal final : public Model {
     bind(enc, G.expert_down.bias, 7);
     [enc dispatchThreadgroups:MTLSizeMake(qmv_groups(c_.hidden_size), static_cast<NSUInteger>(pairs), 1)
         threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+  }
+
+  // `out` = the experts of the rows in `input`, weighted (plus the shared expert).
+  void encode_experts(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n, id<MTLBuffer> input,
+                      id<MTLBuffer> out) {
+    const int K = c_.experts_per_token;
+    const int act = c_.activation == Activation::ClampedSwiglu ? 2 : c_.activation == Activation::Silu ? 1 : 0;
+    const int has_bias = c_.expert_bias ? 1 : 0;
+    if (n >= kMoeGroupedMinTokens) {
+      encode_experts_grouped(enc, G, n, input, act, has_bias);
+    } else {
+      encode_experts_per_pair(enc, G, n, input, act, has_bias);
+    }
     const bool shared = c_.shared_intermediate > 0;
     if (shared) encode_shared_expert(enc, G, n);
     if (shared && c_.shared_expert_gate) {  // times sigmoid(shared_expert_gate(x))
@@ -2320,6 +2394,7 @@ class DecoderMetal final : public Model {
   // Mixture of experts: router logits [chunk, E], each token's experts and
   // weights [chunk, K], and each slot's expert activations and outputs.
   id<MTLBuffer> route_ = nil, chosen_ = nil, expert_weights_ = nil, expert_hidden_ = nil, expert_out_ = nil;
+  id<MTLBuffer> moe_order_ = nil, moe_tiles_ = nil, moe_tile_count_ = nil;
   // Host copies of expert stacks, alive until the arena has copied them.
   std::deque<std::vector<uint8_t>> staged_;
   std::vector<std::pair<GpuExperts*, std::array<size_t, 3>>> expert_fix_;
