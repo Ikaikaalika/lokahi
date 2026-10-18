@@ -545,16 +545,18 @@ kernel void qmv_n(const device uint* w [[buffer(0)]],
 // nibbles j and j + 4 of word fn / 2 of its row, which puts code
 // k0 + 8 (c / 2) + 4 (c % 2) + j in column c, and B's row r holds the same
 // code, so a lane's four k-blocks of x are one float4 per token. A nibble is
-// masked in place (no shift) and its 16^p factor folded into the scale; a
-// 32-code step lies in one group (groups of 32, 64 or 128). The
-// threadgroup's simdgroups split K and add their partial sums at the end.
-// Rows of x past p.n read as zero.
+// masked in place (no shift) with its 16^p factor carried by B, and since a
+// 32-code step lies in one group (groups of 32, 64 or 128), a row's step
+// takes its scale once and its bias as bias * sum(x). The threadgroup's
+// simdgroups split K and add their partial sums at the end. Rows of x past
+// p.n read as zero.
 //
 // Measured on M1 (rows x cols from 2048 x 2048 to 9728 x 2560): 8 tokens cost
-// 1.4-1.7x one token's qmv (qmv_n: 2.7-3.5x), 4 tokens 1.4-1.6x (1.8-2.4x);
+// 1.5-1.6x one token's qmv (qmv_n: 2.7-3.5x), 4 tokens 1.4-1.5x (1.8-2.4x);
 // at 2 tokens qmv_n is as fast or faster. Two 8-row blocks per simdgroup and
 // eight simdgroups beat 1-4 blocks and 2-4 simdgroups; uint4 loads per lane
-// and one accumulator per k-block did not help.
+// and one accumulator per k-block did not help; scaling once per step
+// instead of per code saved 3-8%.
 // ---------------------------------------------------------------------------
 
 constant constexpr int QMV_MMA_RB = 2;  // 8-row blocks per simdgroup
@@ -595,8 +597,20 @@ kernel void qmv_mma(const device uint* w [[buffer(0)]],
     const int k0 = st * 32;
     const float4 xa = t0 ? *reinterpret_cast<const device float4*>(x0 + k0) : float4(0.0f);
     const float4 xb = t1 ? *reinterpret_cast<const device float4*>(x1 + k0) : float4(0.0f);
+    // B carries each code's 16^-nibble factor (nibble j for even rows of k,
+    // j + 4 for odd), so A is the masked codes themselves.
     simdgroup_float8x8 b[4];
-    QMV_N_UNROLL for (int j = 0; j < 4; ++j) FRAG_ELEMS(b[j]) = float2(xa[j], xb[j]);
+    const float odd = (fm % 2) ? (1.0f / 65536.0f) : 1.0f;
+    QMV_N_UNROLL for (int j = 0; j < 4; ++j) {
+      const float f = odd * (1.0f / float(1u << (4 * j)));
+      FRAG_ELEMS(b[j]) = float2(xa[j] * f, xb[j] * f);
+    }
+    // Each token's sum of this step's 32 x: this lane holds 4 of them, the 8
+    // lanes with its fn (lane bits 1, 2 and 4 differ) the rest.
+    float2 xs = float2(xa[0] + xa[1] + xa[2] + xa[3], xb[0] + xb[1] + xb[2] + xb[3]);
+    xs += simd_shuffle_xor(xs, ushort(2));
+    xs += simd_shuffle_xor(xs, ushort(4));
+    xs += simd_shuffle_xor(xs, ushort(16));
     // This lane's word: codes k0 + 8 (fn / 2) ... + 7, all in one group.
     const int word = k0 / 8 + fn / 2;
     const int group = (k0 + 8 * (fn / 2)) / QGROUP;
@@ -605,14 +619,15 @@ kernel void qmv_mma(const device uint* w [[buffer(0)]],
       const int gi = row[rb] * groups_per_row + group;
       const float s = scale_at(scales, gi);
       const float bias = scale_at(biases, gi);
+      // The step's codes all share this row's group: its products take the
+      // scale once, and the bias times the step's x sums.
+      simdgroup_float8x8 part = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
       QMV_N_UNROLL for (int j = 0; j < 4; ++j) {
-        // Nibbles j and j + 4, each times 16^nibble, scaled back by s / 16^nibble.
-        const float lo = float(code & (0xFu << (4 * j))) * (s * (1.0f / float(1u << (4 * j))));
-        const float hi = float(code & (0xFu << (4 * j + 16))) * (s * (1.0f / float(1u << (4 * j + 16))));
         simdgroup_float8x8 a;
-        FRAG_ELEMS(a) = float2(lo + bias, hi + bias);
-        simdgroup_multiply_accumulate(acc[rb], a, b[j], acc[rb]);
+        FRAG_ELEMS(a) = float2(float(code & (0xFu << (4 * j))), float(code & (0xFu << (4 * j + 16))));
+        simdgroup_multiply_accumulate(part, a, b[j], part);
       }
+      FRAG_ELEMS(acc[rb]) += FRAG_ELEMS(part) * s + xs * bias;
     }
   }
   // Sum the simdgroups' partial products: rows by tokens, 8 x 8 per block.
