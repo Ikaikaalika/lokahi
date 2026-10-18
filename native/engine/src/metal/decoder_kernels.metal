@@ -2312,6 +2312,32 @@ LOKAHI_ATTN_FLASH(64, 32, 32)
 LOKAHI_ATTN_FLASH(128, 16, 16)
 LOKAHI_ATTN_FLASH(256, 8, 8)
 
+// One simdgroup writes, per lane, the two elements thread_elements() holds of
+// a loaded 8x8 matrix (element r * 8 + c holds r * 8 + c) and of its product
+// with the identity, so the host can check the fragment layout attn_flash
+// assumes before using it on this GPU.
+kernel void simdgroup_layout_probe(device float* out [[buffer(0)]], uint lane [[thread_index_in_simdgroup]]) {
+  threadgroup float m[64];
+  threadgroup float eye[64];
+  for (uint i = lane; i < 64; i += 32) {
+    m[i] = float(i);
+    eye[i] = i / 8 == i % 8 ? 1.0f : 0.0f;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  simdgroup_float8x8 a;
+  simdgroup_float8x8 e;
+  simdgroup_load(a, m, 8);
+  simdgroup_load(e, eye, 8);
+  simdgroup_float8x8 p = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  simdgroup_multiply_accumulate(p, e, a, p);
+  const float2 la = ATT_FL_ELEMS(a);
+  const float2 lp = ATT_FL_ELEMS(p);
+  out[lane * 4 + 0] = la.x;
+  out[lane * 4 + 1] = la.y;
+  out[lane * 4 + 2] = lp.x;
+  out[lane * 4 + 3] = lp.y;
+}
+
 struct ReduceParams {
   int heads;
   int head_dim;

@@ -314,10 +314,11 @@ int cmd_info(const Args& args) {
              ",\"image_token_id\":" + std::to_string(encoder->image_token_id()) + "}";
   }
   std::printf(
-      "{\"architecture\":\"%s\",\"backend\":\"%s\",\"vocab_size\":%d,\"max_context\":%d,"
+      "{\"architecture\":\"%s\",\"backend\":\"%s\",\"device\":%s,\"vocab_size\":%d,\"max_context\":%d,"
       "\"kv_cache\":\"%s\",\"weight_bytes\":%zu,\"mtp\":%s%s}\n",
-      model->architecture(), model->backend(), model->vocab_size(), model->max_context(), model->kv_cache(),
-      model->weight_bytes(), model->has_mtp() ? "true" : "false", vision.c_str());
+      model->architecture(), model->backend(), json_string(model->device()).c_str(), model->vocab_size(),
+      model->max_context(), model->kv_cache(), model->weight_bytes(), model->has_mtp() ? "true" : "false",
+      vision.c_str());
   return 0;
 }
 
@@ -657,11 +658,12 @@ int cmd_bench(const Args& args) {
                         (matches_plain ? "true" : "false") + "}"
                   : "null";
   std::printf(
-      "{\"runner\":\"lokahi-native-%s\",\"backend\":\"%s\",\"architecture\":\"%s\","
+      "{\"runner\":\"lokahi-native-%s\",\"backend\":\"%s\",\"device\":%s,\"architecture\":\"%s\","
       "\"load_seconds\":%.6f,\"weight_bytes\":%zu,\"prompt_tokens\":%zu,\"output_tokens\":%d,"
       "\"warmups\":%d,\"repetition_token_invariance\":%s,\"speculation\":%s,\"peak_memory_semantics\":"
       "\"process peak resident set size\",\"repetitions\":%s}\n",
-      model->backend(), model->backend(), model->architecture(), load_seconds, model->weight_bytes(),
+      model->backend(), model->backend(), json_string(model->device()).c_str(), model->architecture(), load_seconds,
+      model->weight_bytes(),
       prompt.size(), max_new, warmups, invariant ? "true" : "false", speculated.c_str(), reps.str().c_str());
   return invariant && matches_plain ? 0 : 1;
 }

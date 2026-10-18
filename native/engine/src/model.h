@@ -125,6 +125,9 @@ class Model {
   virtual size_t weight_bytes() const = 0;
   // The KV cache's element type ("f16" or "f32").
   virtual const char* kv_cache() const { return "f32"; }
+  // What runs the model ("cpu", or the GPU's name such as "Apple M1"), so
+  // results from different Macs carry their hardware.
+  virtual std::string device() const { return "cpu"; }
   virtual const std::vector<int32_t>& eos_token_ids() const = 0;
 
   virtual void reset() = 0;

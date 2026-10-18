@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <deque>
 #include <map>
@@ -274,6 +275,11 @@ class DecoderMetal final : public Model {
       upload();
       allocate_state();
       zero_states();
+      flash_ = fragment_layout_matches();
+      if (!flash_) {
+        std::fprintf(stderr, "metal: %s holds simdgroup matrix elements in another layout; "
+                             "prefill attention stays unfused\n", [[device_ name] UTF8String]);
+      }
     }
   }
 
@@ -284,6 +290,7 @@ class DecoderMetal final : public Model {
   int vocab_size() const override { return c_.vocab_size; }
   int max_context() const override { return max_context_; }
   const char* kv_cache() const override { return kv_f16_ ? "f16" : "f32"; }
+  std::string device() const override { return [[device_ name] UTF8String]; }
   double kv_bytes() const { return kv_f16_ ? 2.0 : 4.0; }
   int position() const override { return position_; }
   size_t weight_bytes() const override { return w_->matrix_bytes(); }
@@ -1488,7 +1495,7 @@ class DecoderMetal final : public Model {
     // Image blocks let a query also see up to plan_.reach later keys.
     const bool blocks = !plan_.empty() && plan_.reach > 0 && c_.image_blocks_apply(G.sliding);
     if (n >= kAttnMmMinRows && !c_.attention_sinks) {
-      if (G.head_dim == 64 || G.head_dim == 128 || G.head_dim == 256) {
+      if (flash_ && (G.head_dim == 64 || G.head_dim == 128 || G.head_dim == 256)) {
         encode_attention_flash(enc, G, n, start, window, blocks);
         return;
       }
@@ -1524,6 +1531,34 @@ class DecoderMetal final : public Model {
     bind(enc, G.sinks, 4);
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(c_.num_heads), static_cast<NSUInteger>(n), 1)
         threadsPerThreadgroup:MTLSizeMake(static_cast<NSUInteger>(G.head_dim), 1, 1)];
+  }
+
+  // Whether this GPU's simdgroup matrices hold the elements attn_flash
+  // assumes: lane l, two adjacent elements of row (l / 4 & 4) + (l / 2 % 4)
+  // from column (l / 4 & 2) * 2 + (l % 2) * 2, for loaded matrices and for
+  // products alike. Checked once at load (one dispatch) so a GPU that lays
+  // them out otherwise keeps the unfused kernels instead of wrong attention.
+  bool fragment_layout_matches() {
+    id<MTLBuffer> out = [device_ newBufferWithLength:128 * sizeof(float) options:MTLResourceStorageModeShared];
+    id<MTLCommandBuffer> cb = [queue_ commandBuffer];
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:pipeline("simdgroup_layout_probe")];
+    [enc setBuffer:out offset:0 atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+    [enc endEncoding];
+    [cb commit];
+    [cb waitUntilCompleted];
+    if (cb.status != MTLCommandBufferStatusCompleted) return false;
+    const float* got = static_cast<const float*>(out.contents);
+    for (int lane = 0; lane < 32; ++lane) {
+      const int row = (lane / 4 & 4) + lane / 2 % 4;
+      const int col = (lane / 4 & 2) * 2 + lane % 2 * 2;
+      for (int j = 0; j < 2; ++j) {
+        const float want = static_cast<float>(row * 8 + col + j);
+        if (got[lane * 4 + j] != want || got[lane * 4 + 2 + j] != want) return false;
+      }
+    }
+    return true;
   }
 
   // A long pass's attention in one fused kernel (attn_flash), 32 query rows
@@ -2225,6 +2260,7 @@ class DecoderMetal final : public Model {
   id<MTLDevice> device_ = nil;
   id<MTLCommandQueue> queue_ = nil;
   id<MTLLibrary> library_ = nil;
+  bool flash_ = false;  // fragment_layout_matches(): attn_flash may run
   std::map<std::string, id<MTLComputePipelineState>> pipelines_;
 
   GpuLinear embed_, lm_head_, embed_per_layer_, per_layer_model_proj_;
