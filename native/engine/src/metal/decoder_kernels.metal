@@ -2146,6 +2146,172 @@ template LOKAHI_INSTANCE_ATTRS("attn_qk_h") decltype(attn_qk<half>) attn_qk<half
 template LOKAHI_INSTANCE_ATTRS("attn_pv") decltype(attn_pv<float>) attn_pv<float>;
 template LOKAHI_INSTANCE_ATTRS("attn_pv_h") decltype(attn_pv<half>) attn_pv<half>;
 
+// ---------------------------------------------------------------------------
+// Fused prefill attention (flash attention). A threadgroup takes 32 query rows
+// of one head, 8 per simdgroup, and streams the keys those rows can see in
+// blocks of BK, keeping S = Q K^T, the online softmax and O = P V in
+// registers: no scores in memory, and the key blocks past the tile's causal
+// edge or before its window are never read, so a causal pass does about half
+// of attn_qk + attn_pv's arithmetic. Each thread of a simdgroup_matrix<T, 8, 8>
+// holds two adjacent elements of one row: row (lane / 4 & 4) + (lane / 2 % 4),
+// columns (lane / 4 & 2) * 2 + (lane % 2) * 2 + {0, 1} (checked on M1, and
+// MLX's steel attention relies on the same layout). Every fragment a thread
+// holds is therefore in the same row, the row's four threads differ in lane
+// bits 0 and 3, and the per-row max, sum and rescale take two shuffles each.
+// Takes AttnMmParams with row0 = 0 and rows = the pass.
+// ---------------------------------------------------------------------------
+
+constant constexpr int ATT_FL_Q = 32;  // query rows per threadgroup
+
+#define ATT_FL_ELEMS(m) reinterpret_cast<thread float2&>((m).thread_elements())
+
+inline float att_fl_row_max(float v) {
+  v = max(v, simd_shuffle_xor(v, ushort(1)));
+  return max(v, simd_shuffle_xor(v, ushort(8)));
+}
+
+inline float att_fl_row_sum(float v) {
+  v += simd_shuffle_xor(v, ushort(1));
+  return v + simd_shuffle_xor(v, ushort(8));
+}
+
+// Grid (ceil(rows / 32), heads), 128 threads. KV blocks of BK keys are staged
+// as stored (half or float), BK * (D + pad) elements each for K and V.
+template <typename KV, int D, int BK>
+[[kernel]] void attn_flash(const device float* q [[buffer(0)]],
+                           const device KV* k_cache [[buffer(1)]],
+                           const device KV* v_cache [[buffer(2)]],
+                           device float* out [[buffer(3)]],
+                           constant AttnMmParams& p [[buffer(4)]],
+                           const device int* last_key [[buffer(5)]],
+                           uint2 tg [[threadgroup_position_in_grid]],
+                           uint tid [[thread_index_in_threadgroup]],
+                           uint sg [[simdgroup_index_in_threadgroup]],
+                           uint lane [[thread_index_in_simdgroup]]) {
+  constexpr int LD = D + 16 / int(sizeof(KV));  // 16 bytes of padding per staged key
+  threadgroup KV ks[BK * LD];
+  threadgroup KV vs[BK * LD];
+  const int h = int(tg.y);
+  const int kvh = h / (p.heads / p.kv_heads);
+  const int t0 = int(tg.x) * ATT_FL_Q;
+  const int t_last = min(t0 + ATT_FL_Q, p.rows) - 1;
+  // This thread's row and first column within every 8x8 fragment.
+  const int fm = int((lane / 4) & 4) + int((lane / 2) % 4);
+  const int fn = int((lane / 4) & 2) * 2 + int(lane % 2) * 2;
+  const int t = t0 + int(sg) * 8 + fm;  // query row within the pass
+  const bool row_ok = t < p.rows;
+  const int qpos = p.start_pos + t;
+  const int lo = qpos - p.window + 1;  // first key the row may see
+  const int hi = p.has_last_key != 0 && row_ok ? max(qpos, last_key[t]) : qpos;
+
+  // The tile's key range: from its first row's window start to its furthest key.
+  int tile_hi = p.start_pos + t_last;
+  if (p.has_last_key != 0) tile_hi = max(tile_hi, simd_max(t0 + int(lane) <= t_last ? last_key[t0 + int(lane)] : 0));
+  tile_hi = min(tile_hi, p.key_base + p.keys - 1);
+  const int tile_lo = max(p.key_base, p.start_pos + t0 - p.window + 1);
+
+  // Q, prescaled so the scores come out in log2 units (softcap applies the
+  // log2 factor after its tanh instead).
+  const float q_scale = p.softcap > 0.0f ? p.scale : p.scale * M_LOG2E_F;
+  simdgroup_float8x8 qf[D / 8];
+  simdgroup_float8x8 o[D / 8];
+  const device float* qrow = q + (size_t(row_ok ? t : 0) * size_t(p.heads) + size_t(h)) * D + fn;
+  ATT_MM_UNROLL for (int d = 0; d < D / 8; ++d) {
+    const float2 v = row_ok ? *reinterpret_cast<const device float2*>(qrow + 8 * d) : float2(0.0f);
+    ATT_FL_ELEMS(qf[d]) = v * q_scale;
+    o[d] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+  }
+  float m = -INFINITY;  // running max (log2 units) and sum of this thread's row
+  float l = 0.0f;
+
+  for (int kb = tile_lo; kb <= tile_hi; kb += BK) {
+    // Stage keys kb ... kb + BK - 1 from their ring slots; zeros past tile_hi.
+    const int slot0 = kb % p.capacity;
+    ATT_MM_UNROLL for (int i = int(tid); i < BK * D / 4; i += 128) {
+      const int r = i / (D / 4);
+      const int c = (i % (D / 4)) * 4;
+      vec<KV, 4> kv4 = vec<KV, 4>(KV(0));
+      vec<KV, 4> vv4 = vec<KV, 4>(KV(0));
+      if (kb + r <= tile_hi) {
+        int slot = slot0 + r;
+        if (slot >= p.capacity) slot -= p.capacity;
+        const size_t at = (size_t(kvh) * size_t(p.capacity) + size_t(slot)) * D + c;
+        kv4 = *reinterpret_cast<const device vec<KV, 4>*>(k_cache + at);
+        vv4 = *reinterpret_cast<const device vec<KV, 4>*>(v_cache + at);
+      }
+      *reinterpret_cast<threadgroup vec<KV, 4>*>(ks + r * LD + c) = kv4;
+      *reinterpret_cast<threadgroup vec<KV, 4>*>(vs + r * LD + c) = vv4;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    simdgroup_float8x8 s[BK / 8];
+    ATT_MM_UNROLL for (int j = 0; j < BK / 8; ++j) s[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    ATT_MM_UNROLL for (int d = 0; d < D / 8; ++d) {
+      ATT_MM_UNROLL for (int j = 0; j < BK / 8; ++j) {
+        simdgroup_matrix<KV, 8, 8> kf;
+        simdgroup_load(kf, ks + 8 * j * LD + 8 * d, LD, ulong2(0, 0), true);
+        simdgroup_multiply_accumulate(s[j], qf[d], kf, s[j]);
+      }
+    }
+
+    // Soft-cap and mask, then the online softmax update of this row.
+    // A block every row of the tile sees in full needs no mask.
+    const bool full = kb + BK - 1 <= min(p.start_pos + t0, tile_hi) && kb >= p.start_pos + t_last - p.window + 1;
+    float block_max = -INFINITY;
+    ATT_MM_UNROLL for (int j = 0; j < BK / 8; ++j) {
+      thread float2& e = ATT_FL_ELEMS(s[j]);
+      if (p.softcap > 0.0f) {
+        e.x = precise::tanh(e.x / p.softcap) * p.softcap * M_LOG2E_F;
+        e.y = precise::tanh(e.y / p.softcap) * p.softcap * M_LOG2E_F;
+      }
+      if (!full) {
+        const int key = kb + 8 * j + fn;
+        e.x = key >= lo && key <= hi ? e.x : -INFINITY;
+        e.y = key + 1 >= lo && key + 1 <= hi ? e.y : -INFINITY;
+      }
+      block_max = max(block_max, max(e.x, e.y));
+    }
+    const float m_new = max(m, att_fl_row_max(block_max));
+    const float m_ref = m_new == -INFINITY ? 0.0f : m_new;  // a row with no key yet keeps zeros
+    const float factor = fast::exp2(m - m_ref);
+    float block_sum = 0.0f;
+    ATT_MM_UNROLL for (int j = 0; j < BK / 8; ++j) {
+      thread float2& e = ATT_FL_ELEMS(s[j]);
+      e.x = fast::exp2(e.x - m_ref);
+      e.y = fast::exp2(e.y - m_ref);
+      block_sum += e.x + e.y;
+    }
+    l = l * factor + att_fl_row_sum(block_sum);
+    m = m_new;
+    ATT_MM_UNROLL for (int d = 0; d < D / 8; ++d) ATT_FL_ELEMS(o[d]) *= factor;
+    ATT_MM_UNROLL for (int j = 0; j < BK / 8; ++j) {
+      ATT_MM_UNROLL for (int d = 0; d < D / 8; ++d) {
+        simdgroup_matrix<KV, 8, 8> vf;
+        simdgroup_load(vf, vs + 8 * j * LD + 8 * d, LD);
+        simdgroup_multiply_accumulate(o[d], s[j], vf, o[d]);
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  if (!row_ok) return;
+  const float inv = l > 0.0f ? 1.0f / l : 0.0f;
+  device float* orow = out + (size_t(t) * size_t(p.heads) + size_t(h)) * D + fn;
+  ATT_MM_UNROLL for (int d = 0; d < D / 8; ++d)
+    *reinterpret_cast<device float2*>(orow + 8 * d) = ATT_FL_ELEMS(o[d]) * inv;
+}
+
+#define LOKAHI_ATTN_FLASH(D, BK_H, BK_F)                                                           \
+  template LOKAHI_INSTANCE_ATTRS("attn_flash_d" #D "_h")                                          \
+  decltype(attn_flash<half, D, BK_H>) attn_flash<half, D, BK_H>;                                    \
+  template LOKAHI_INSTANCE_ATTRS("attn_flash_d" #D) decltype(attn_flash<float, D, BK_F>) attn_flash<float, D, BK_F>;
+// Key blocks keep K and V staging within 32 KB of threadgroup memory; on M1,
+// 16 keys beat 32 at 128-wide heads and 8 beat 16 at 256-wide heads, where
+// Q and O already fill the registers.
+LOKAHI_ATTN_FLASH(64, 32, 32)
+LOKAHI_ATTN_FLASH(128, 16, 16)
+LOKAHI_ATTN_FLASH(256, 8, 8)
+
 struct ReduceParams {
   int heads;
   int head_dim;

@@ -1487,9 +1487,12 @@ class DecoderMetal final : public Model {
     const int window = G.sliding ? c_.sliding_window : (1 << 30);
     // Image blocks let a query also see up to plan_.reach later keys.
     const bool blocks = !plan_.empty() && plan_.reach > 0 && c_.image_blocks_apply(G.sliding);
-    if (n >= kAttnMmMinRows && G.head_dim % 64 == 0 && !c_.attention_sinks &&
-        encode_attention_mm(enc, G, n, start, window, blocks)) {
-      return;
+    if (n >= kAttnMmMinRows && !c_.attention_sinks) {
+      if (G.head_dim == 64 || G.head_dim == 128 || G.head_dim == 256) {
+        encode_attention_flash(enc, G, n, start, window, blocks);
+        return;
+      }
+      if (G.head_dim % 64 == 0 && encode_attention_mm(enc, G, n, start, window, blocks)) return;
     }
     const int keys_max = std::min(window + (blocks ? plan_.reach : 0), start + n);  // the most keys a query sees
     const int max_blocks = n == 1 ? kDecodeMaxBlocks : kPrefillMaxBlocks;
@@ -1521,6 +1524,25 @@ class DecoderMetal final : public Model {
     bind(enc, G.sinks, 4);
     [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>(c_.num_heads), static_cast<NSUInteger>(n), 1)
         threadsPerThreadgroup:MTLSizeMake(static_cast<NSUInteger>(G.head_dim), 1, 1)];
+  }
+
+  // A long pass's attention in one fused kernel (attn_flash), 32 query rows
+  // of one head per threadgroup, for head_dim 64, 128 and 256.
+  void encode_attention_flash(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n, int start, int window,
+                              bool blocks) {
+    const int key_base = std::max(0, start - window + 1);  // the earliest key any row of the pass sees
+    const AttnMmParams params{c_.num_heads, G.kv_heads, G.head_dim, start, 0, n, key_base, start + n - key_base,
+                              window, G.capacity, c_.attn_scale, c_.attn_logit_softcapping, blocks ? 1 : 0};
+    [enc setComputePipelineState:pipeline("attn_flash_d" + std::to_string(G.head_dim) + (kv_f16_ ? "_h" : ""))];
+    bind(enc, q_, 0, 0);
+    bind(enc, G.k_cache, 0, 1);
+    bind(enc, G.v_cache, 0, 2);
+    bind(enc, attn_, 0, 3);
+    bytes(enc, params, 4);
+    bind(enc, last_key_, blocks ? sizeof(int32_t) * static_cast<size_t>(start - plan_.base) : 0, 5);
+    [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((n + 31) / 32), static_cast<NSUInteger>(c_.num_heads),
+                                          1)
+        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
   }
 
   // A long pass's attention as S = Q K^T, softmax, P V on simdgroup matrices,
