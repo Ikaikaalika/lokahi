@@ -2236,6 +2236,14 @@ class DecoderMetal final : public Model {
 
   // Layer l over the pass's n rows (h_ holds their norm), at positions
   // [start, start + n); its residual leaves norm `next` of x_ in h_.
+  // After a layer's cache write, the last of n rows' query (q_width wide in
+  // q) and residual go on alone, as row 0.
+  void carry_last_row(id<MTLComputeCommandEncoder> enc, id<MTLBuffer> q, int q_width, int n) {
+    const size_t last = static_cast<size_t>(n - 1);
+    encode_copy(enc, q, q, q_width, last * static_cast<size_t>(q_width) * sizeof(float), 0);
+    encode_copy(enc, x_, x_, c_.hidden_size, last * static_cast<size_t>(c_.hidden_size) * sizeof(float), 0);
+  }
+
   // Which rows of a pass a layer carries past its keys and values: all of
   // them, only the last (the final layer of a pass whose logits are wanted
   // for its last row alone), or none (the final layer of an earlier chunk).
@@ -2279,6 +2287,12 @@ class DecoderMetal final : public Model {
       section(enc, "qkv", profiling ? traffic::latent_qkv(c_, L, n) : 0.0);
       encode_latent_rope(enc, G, n, start);
       section(enc, "rope_kv", profiling ? traffic::rows(c_.latent_width(), n, 2 * c_.num_heads + 3) : 0.0);
+      if (rows == Rows::None) return;
+      if (rows == Rows::Last && n > 1) {
+        carry_last_row(enc, latent_q_, c_.num_heads * c_.latent_width(), n);
+        start += n - 1;
+        n = 1;
+      }
       encode_latent_attention(enc, G, n, start);
       section(enc, "attention", profiling ? traffic::attention(c_, layer, start, n) : 0.0);
       encode_latent_out(enc, G, n);
@@ -2297,15 +2311,9 @@ class DecoderMetal final : public Model {
                         : 0.0);
       if (rows == Rows::None) return;
       if (rows == Rows::Last && n > 1) {
-        // The cache holds every row's keys and values; the last row's query,
-        // residual and output gate go on alone, as row 0.
-        const size_t q_width = static_cast<size_t>(c_.num_heads) * static_cast<size_t>(G.head_dim);
-        const size_t last = static_cast<size_t>(n - 1);
-        encode_copy(enc, q_, q_, static_cast<int>(q_width), last * q_width * sizeof(float), 0);
-        encode_copy(enc, x_, x_, c_.hidden_size, last * static_cast<size_t>(hidden) * sizeof(float), 0);
-        if (c_.attn_output_gate) {
-          encode_copy(enc, out_gate_, out_gate_, static_cast<int>(q_width), last * q_width * sizeof(float), 0);
-        }
+        const int q_width = c_.num_heads * G.head_dim;
+        carry_last_row(enc, q_, q_width, n);
+        if (c_.attn_output_gate) encode_copy(enc, out_gate_, out_gate_, q_width, (n - 1) * q_width * sizeof(float), 0);
         start += n - 1;
         n = 1;
       }
@@ -2432,10 +2440,11 @@ class DecoderMetal final : public Model {
     const size_t full = verifying_ || mtp_on_ ? decoder_layers : static_cast<size_t>(c_.shared_suffix());
     // A plain pass wants its final layer's keys and values for every row but
     // its output for the last row only, and only in the last chunk (as MLX's
-    // lazy graph computes it); attention layers that own their cache.
+    // lazy graph computes it); attention layers (standard or latent) that own
+    // their cache.
     const GpuLayer& final_layer = layers_[decoder_layers - 1];
     const bool tail = full == decoder_layers && !verifying_ && !mtp_on_ && n > 1 && plan_.empty() &&
-                      c_.per_layer_input == 0 && !c_.mla() && !final_layer.linear && final_layer.own_kv;
+                      c_.per_layer_input == 0 && !final_layer.linear && (c_.mla() || final_layer.own_kv);
     for (size_t l = 0; l < full; ++l) {
       if (tail && l + 1 == full) {
         encode_layer(enc, l, n, start, next_norm(l), last ? Rows::Last : Rows::None);
