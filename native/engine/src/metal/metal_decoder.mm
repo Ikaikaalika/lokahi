@@ -1110,7 +1110,13 @@ class DecoderMetal final : public Model {
       [enc dispatchThreadgroups:MTLSizeMake(qmv_groups(l.rows), 1, 1) threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
       return;
     }
-    [enc setComputePipelineState:quant_pipeline("qmm", l)];
+    // 4-bit weights take the pipelined kernel, staged in half for a norm's
+    // output (h_, whose values half holds) and in float for anything else.
+    // Mixture-of-experts models stage in float throughout: half's rounding
+    // reaches later layers' routers and flips their top-k near a tie.
+    const bool four_bit = l.bits == 4 && !l.mxfp4;
+    const bool half_staging = x == h_ && c_.num_experts == 0;
+    [enc setComputePipelineState:quant_pipeline(!four_bit ? "qmm" : half_staging ? "qmm4_h" : "qmm4_f", l)];
     bind_weights(enc, l, 0);
     bind(enc, x, 0, 3);
     bind(enc, y, 0, 4);

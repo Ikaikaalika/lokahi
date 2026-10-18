@@ -6,6 +6,7 @@ template <typename T, int C, int R> simdgroup_matrix<T, C, R> make_filled_simdgr
 template <typename T, int C, int R>
 void simdgroup_load(simdgroup_matrix<T, C, R>&, const T*, unsigned long = C, ulong2 = ulong2(0, 0), bool = false) {}
 template <typename T, int C, int R> void simdgroup_store(const simdgroup_matrix<T, C, R>&, T*, unsigned long = C) {}
-template <typename T, int C, int R>
-void simdgroup_multiply_accumulate(simdgroup_matrix<T, C, R>&, const simdgroup_matrix<T, C, R>&,
-                                   const simdgroup_matrix<T, C, R>&, const simdgroup_matrix<T, C, R>&) {}
+// As in MSL, the operands may differ in type (half inputs, float accumulator).
+template <typename TD, typename TA, typename TB, typename TC, int C, int R>
+void simdgroup_multiply_accumulate(simdgroup_matrix<TD, C, R>&, const simdgroup_matrix<TA, C, R>&,
+                                   const simdgroup_matrix<TB, C, R>&, const simdgroup_matrix<TC, C, R>&) {}
