@@ -65,6 +65,7 @@ struct LoadedModel {
   Tokenizer tokenizer;
   ChatTemplateContext context;  // filled by load_chat_template, so declared before it
   ChatTemplate chat_template;
+  std::vector<bool> busy;  // the batched worker's sequences in use (worker thread only)
 };
 
 struct Request {
@@ -113,9 +114,11 @@ ServiceOptions ServiceOptions::from_json(const Json& config) {
   options.max_context = static_cast<int>(config.int_or("max_context", options.max_context));
   options.kv_cache = config.string_or("kv_cache", options.kv_cache);
   options.queue_limit = static_cast<int>(config.int_or("queue_limit", options.queue_limit));
+  options.max_sequences = static_cast<int>(config.int_or("max_sequences", options.max_sequences));
   options.text_flush_ms = config.number_or("text_flush_ms", options.text_flush_ms);
   options.runtime_revision = config.string_or("runtime_revision", "");
   LK_CHECK(options.queue_limit >= 0 && options.text_flush_ms >= 0.0, "service config has a negative limit");
+  LK_CHECK(options.max_sequences >= 1, "service config max_sequences must be at least 1");
   return options;
 }
 
@@ -125,8 +128,12 @@ struct Service::Impl {
     load.backend = options.backend;
     load.max_context = options.max_context;
     load.kv_cache = options.kv_cache;
-    for (const ServiceModel& m : options.models) models.push_back(std::make_unique<LoadedModel>(m, load));
-    worker = std::thread([this] { work(); });
+    load.max_sequences = options.max_sequences;
+    for (const ServiceModel& m : options.models) {
+      models.push_back(std::make_unique<LoadedModel>(m, load));
+      models.back()->busy.assign(static_cast<size_t>(options.max_sequences), false);
+    }
+    worker = std::thread([this] { options.max_sequences > 1 ? work_batched() : work(); });
   }
 
   ~Impl() {
@@ -134,7 +141,7 @@ struct Service::Impl {
     {
       std::lock_guard<std::mutex> lock(mutex);
       stopping = true;
-      if (running) running->cancelled = true;
+      for (auto& r : running) r->cancelled = true;
       queued.swap(queue);
     }
     cv.notify_all();
@@ -169,8 +176,10 @@ struct Service::Impl {
     send(*r, std::move(accepted));
     int64_t ahead = 0;
     {
+      // Requests ahead of this one for a sequence: none while one is free.
       std::lock_guard<std::mutex> lock(mutex);
-      ahead = static_cast<int64_t>(queue.size()) + (running ? 1 : 0);
+      const int64_t waiting = static_cast<int64_t>(queue.size());
+      ahead = waiting >= free_sequences() ? waiting - free_sequences() + 1 : 0;
     }
     if (ahead > 0) {
       wire::Event state;
@@ -194,7 +203,7 @@ struct Service::Impl {
       if (draining || stopping) {
         return failure("service-draining", "not_started", true, "the runtime is draining and admits no new requests");
       }
-      if (static_cast<int>(queue.size()) >= options.queue_limit + (running ? 0 : 1)) {
+      if (static_cast<int64_t>(queue.size()) >= options.queue_limit + free_sequences()) {
         return failure("overloaded", "not_started", true, "the request queue is full");
       }
     }
@@ -271,7 +280,13 @@ struct Service::Impl {
 
   void wait_idle() {
     std::unique_lock<std::mutex> lock(mutex);
-    idle_cv.wait(lock, [&] { return queue.empty() && !running && active.empty(); });
+    idle_cv.wait(lock, [&] { return queue.empty() && running.empty() && active.empty(); });
+  }
+
+  // Sequences no running request holds (with mutex held): requests beyond
+  // them wait in the queue.
+  int64_t free_sequences() const {
+    return std::max<int64_t>(0, options.max_sequences - static_cast<int64_t>(running.size()));
   }
 
   // ---- execution ------------------------------------------------------------
@@ -285,95 +300,276 @@ struct Service::Impl {
         if (queue.empty()) return;
         r = queue.front();
         queue.pop_front();
-        running = r;
+        running.push_back(r);
       }
       finish(*r, run(*r));
-      {
-        std::lock_guard<std::mutex> lock(mutex);
-        running.reset();
-      }
-      forget(*r);
+      release(r);
     }
   }
 
-  Outcome run(Request& r) {
-    const wire::Start& s = r.start;
-    const double started = now_seconds();
-    const double queue_ms = (started - r.admitted) * 1000.0;
-    if (r.cancelled) return cancelled_outcome(r, "not_started", "cancelled before it started", queue_ms);
-    if (unix_ms() >= s.deadline_unix_ms) {
-      return failed_outcome(r, failure("deadline-exceeded", "not_started", false, "the deadline passed in the queue"),
-                            queue_ms, 0, {});
+  // Leaves the running set and the requests in flight.
+  void release(const std::shared_ptr<Request>& r) {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      running.erase(std::remove(running.begin(), running.end(), r), running.end());
     }
-    Model& model = *r.model->model;
-    SamplingParams sampling;
-    sampling.temperature = static_cast<float>(s.sampling.temperature);
-    sampling.top_p = static_cast<float>(s.sampling.top_p);
-    sampling.seed = s.sampling.seed ? static_cast<uint64_t>(*s.sampling.seed)
-                                    : (uint64_t{std::random_device{}()} << 32) ^ std::random_device{}();
-    TextStream text(r.model->tokenizer, s.sampling.stop);
-    std::string pending;
-    int64_t pending_tokens = 0;
-    double last_flush = started;
-    bool deadline_hit = false;
-    auto flush = [&] {
+    forget(*r);
+  }
+
+  // One request's generation as its tokens arrive: text through its stop
+  // strings into coalesced text_delta events, cancellation and the deadline,
+  // and its outcome at the end. Model::generate feeds it (one request at a
+  // time) or the batched worker does.
+  struct Generation {
+    Generation(Impl& service, Request& request, double started)
+        : self(service),
+          r(request),
+          queue_ms((started - request.admitted) * 1000.0),
+          text(request.model->tokenizer, request.start.sampling.stop),
+          last_flush(started) {
+      const wire::Start& s = r.start;
+      sampling.temperature = static_cast<float>(s.sampling.temperature);
+      sampling.top_p = static_cast<float>(s.sampling.top_p);
+      sampling.seed = s.sampling.seed ? static_cast<uint64_t>(*s.sampling.seed)
+                                      : (uint64_t{std::random_device{}()} << 32) ^ std::random_device{}();
+    }
+
+    void flush() {
       if (pending.empty()) return;
       wire::Event delta;
       delta.kind = "text_delta";
       delta.text_delta = pending;
       delta.generated_tokens_delta = pending_tokens;
-      send(r, std::move(delta));
+      self.send(r, std::move(delta));
       r.sent_text += pending;
       pending.clear();
       pending_tokens = 0;
       last_flush = now_seconds();
-    };
-    auto on_token = [&](int32_t token) {
+    }
+
+    // Takes a generated token; false once generation must stop after it.
+    bool on_token(int32_t token) {
       pending += text.push(token);
       ++pending_tokens;
       if (r.cancelled) return false;
-      if (unix_ms() >= s.deadline_unix_ms) {
+      if (unix_ms() >= r.start.deadline_unix_ms) {
         deadline_hit = true;
         return false;
       }
       if (text.stopped()) return false;
-      if ((now_seconds() - last_flush) * 1000.0 >= options.text_flush_ms || pending.size() >= kMaxDeltaBytes) flush();
+      if ((now_seconds() - last_flush) * 1000.0 >= self.options.text_flush_ms || pending.size() >= kMaxDeltaBytes) {
+        flush();
+      }
       return true;
-    };
+    }
+
+    // The outcome once generation has ended with `tokens`.
+    Outcome complete(const std::vector<int32_t>& tokens, const GenerationTiming& timing) {
+      const int64_t generated = static_cast<int64_t>(tokens.size());
+      if (r.cancelled) {
+        Outcome out = self.cancelled_outcome(r, r.sent_text.empty() ? "running" : "partial_output",
+                                             "cancelled while running", queue_ms);
+        out.completion_tokens = generated;
+        out.metrics = self.metrics(r, queue_ms, timing);
+        return out;
+      }
+      if (deadline_hit) {
+        const char* stage = r.sent_text.empty() ? "running" : "partial_output";
+        return self.failed_outcome(r, failure("deadline-exceeded", stage, false, "the deadline passed while generating"),
+                                   queue_ms, generated, timing);
+      }
+      pending += text.finish();
+      flush();
+      const auto& eos = r.model->model->eos_token_ids();
+      const bool at_eos = !tokens.empty() && std::find(eos.begin(), eos.end(), tokens.back()) != eos.end();
+      Outcome out = self.base_outcome(r);
+      out.status = "completed";
+      out.finish_reason =
+          text.stopped() || at_eos || generated < r.start.objective.max_output_tokens ? "stop" : "length";
+      out.output_text = text.text();
+      out.completion_tokens = generated;
+      out.metrics = self.metrics(r, queue_ms, timing);
+      return out;
+    }
+
+    Impl& self;
+    Request& r;
+    double queue_ms;
+    SamplingParams sampling;
+    TextStream text;
+    std::string pending;
+    int64_t pending_tokens = 0;
+    double last_flush;
+    bool deadline_hit = false;
+  };
+
+  // A request that cannot start: cancelled or out of time in the queue.
+  std::optional<Outcome> refused_at_start(Request& r, double started) {
+    const double queue_ms = (started - r.admitted) * 1000.0;
+    if (r.cancelled) return cancelled_outcome(r, "not_started", "cancelled before it started", queue_ms);
+    if (unix_ms() >= r.start.deadline_unix_ms) {
+      return failed_outcome(r, failure("deadline-exceeded", "not_started", false, "the deadline passed in the queue"),
+                            queue_ms, 0, {});
+    }
+    return std::nullopt;
+  }
+
+  Outcome run(Request& r) {
+    const double started = now_seconds();
+    if (std::optional<Outcome> refused = refused_at_start(r, started)) return std::move(*refused);
+    Model& model = *r.model->model;
+    Generation g(*this, r, started);
     GenerationTiming timing;
     std::vector<int32_t> tokens;
     try {
       model.reset();
-      tokens = model.generate(r.prompt, static_cast<int>(s.objective.max_output_tokens), sampling, true, &timing,
-                              on_token);
+      tokens = model.generate(r.prompt, static_cast<int>(r.start.objective.max_output_tokens), g.sampling, true,
+                              &timing, [&](int32_t token) { return g.on_token(token); });
     } catch (const std::exception& error) {
       const char* stage = r.sent_text.empty() ? "running" : "partial_output";
-      return failed_outcome(r, failure("engine-error", stage, false, error.what()), queue_ms, 0, timing);
+      return failed_outcome(r, failure("engine-error", stage, false, error.what()), g.queue_ms, 0, timing);
     }
-    const int64_t generated = static_cast<int64_t>(tokens.size());
-    if (r.cancelled) {
-      Outcome out = cancelled_outcome(r, r.sent_text.empty() ? "running" : "partial_output", "cancelled while running",
-                                      queue_ms);
-      out.completion_tokens = generated;
-      out.metrics = metrics(r, queue_ms, timing);
-      return out;
+    return g.complete(tokens, timing);
+  }
+
+  // ---- batched execution --------------------------------------------------------
+
+  // A running request of the batched worker: its model's sequence, the tokens
+  // so far and when each arrived.
+  struct Slot {
+    std::shared_ptr<Request> r;
+    std::unique_ptr<Generation> g;
+    int sequence = -1;
+    std::vector<int32_t> tokens;
+    GenerationTiming timing;
+    int64_t largest_batch = 1;  // the most requests a pass of it decoded at once
+  };
+
+  // Continuous batching: queued requests start in their model's free
+  // sequences (prefilled one after another), then every step decodes each
+  // model's running requests in one batched pass; a request that ends frees
+  // its sequence for the next.
+  void work_batched() {
+    std::vector<std::unique_ptr<Slot>> slots;
+    for (;;) {
+      std::vector<std::shared_ptr<Request>> starting;
+      {
+        std::unique_lock<std::mutex> lock(mutex);
+        cv.wait(lock, [&] { return stopping || !queue.empty() || !slots.empty(); });
+        if (stopping && queue.empty() && slots.empty()) return;
+        // In admission order, while the front request's model has a free
+        // sequence (a full model holds back the queue behind it).
+        while (!queue.empty()) {
+          LoadedModel* m = queue.front()->model;
+          const auto holding = [&](const std::shared_ptr<Request>& other) { return other->model == m; };
+          const int64_t held = std::count_if(running.begin(), running.end(), holding);
+          if (held >= options.max_sequences) break;
+          running.push_back(queue.front());
+          starting.push_back(queue.front());
+          queue.pop_front();
+        }
+      }
+      for (const auto& r : starting) begin(slots, r);
+      step(slots);
     }
-    if (deadline_hit) {
-      const char* stage = r.sent_text.empty() ? "running" : "partial_output";
-      return failed_outcome(r, failure("deadline-exceeded", stage, false, "the deadline passed while generating"),
-                            queue_ms, generated, timing);
+  }
+
+  // Prefills a starting request into a free sequence and takes its first
+  // token; it joins `slots` unless it already ended.
+  void begin(std::vector<std::unique_ptr<Slot>>& slots, const std::shared_ptr<Request>& r) {
+    const double started = now_seconds();
+    if (std::optional<Outcome> refused = refused_at_start(*r, started)) {
+      finish(*r, std::move(*refused));
+      release(r);
+      return;
     }
-    pending += text.finish();
-    flush();
-    const auto& eos = model.eos_token_ids();
-    const bool at_eos = !tokens.empty() && std::find(eos.begin(), eos.end(), tokens.back()) != eos.end();
-    Outcome out = base_outcome(r);
-    out.status = "completed";
-    out.finish_reason = text.stopped() || at_eos || generated < s.objective.max_output_tokens ? "stop" : "length";
-    out.output_text = text.text();
-    out.completion_tokens = generated;
-    out.metrics = metrics(r, queue_ms, timing);
-    return out;
+    LoadedModel& m = *r->model;
+    auto slot = std::make_unique<Slot>();
+    slot->r = r;
+    slot->g = std::make_unique<Generation>(*this, *r, started);
+    slot->sequence = static_cast<int>(std::find(m.busy.begin(), m.busy.end(), false) - m.busy.begin());
+    LK_CHECK(slot->sequence < options.max_sequences, "service: no free sequence for a starting request");
+    m.busy[static_cast<size_t>(slot->sequence)] = true;
+    int32_t token = 0;
+    try {
+      m.model->select_sequence(slot->sequence);
+      m.model->reset();
+      const float* logits = m.model->prefill(r->prompt.data(), static_cast<int>(r->prompt.size()));
+      token = sample_token(logits, m.model->vocab_size(), slot->g->sampling, 0);
+    } catch (const std::exception& error) {
+      end(*slot, failed_outcome(*r, failure("engine-error", "running", false, error.what()), slot->g->queue_ms, 0,
+                                slot->timing));
+      return;
+    }
+    const double first = now_seconds();
+    slot->timing.prefill_seconds = first - started;
+    slot->timing.token_times = {first};
+    if (take(*slot, token)) {
+      slots.push_back(std::move(slot));
+    } else {
+      end(*slot, slot->g->complete(slot->tokens, slot->timing));
+    }
+  }
+
+  // One batched pass per model over its running requests; those that end
+  // leave `slots`.
+  void step(std::vector<std::unique_ptr<Slot>>& slots) {
+    std::vector<LoadedModel*> stepped;
+    for (const auto& slot : slots) {
+      LoadedModel* m = slot->r->model;
+      if (std::find(stepped.begin(), stepped.end(), m) != stepped.end()) continue;
+      stepped.push_back(m);
+      std::vector<Slot*> rows;
+      std::vector<BatchStep> steps;
+      for (const auto& other : slots) {
+        if (other->r->model != m) continue;
+        rows.push_back(other.get());
+        steps.push_back(BatchStep{other->sequence, other->tokens.back(), other->g->sampling,
+                                  static_cast<int>(other->tokens.size())});
+      }
+      std::vector<int32_t> next;
+      try {
+        next = m->model->decode_batch(steps);
+      } catch (const std::exception& error) {
+        for (Slot* row : rows) {
+          const char* stage = row->r->sent_text.empty() ? "running" : "partial_output";
+          end(*row, failed_outcome(*row->r, failure("engine-error", stage, false, error.what()), row->g->queue_ms,
+                                   static_cast<int64_t>(row->tokens.size()), row->timing));
+        }
+        continue;
+      }
+      const double now = now_seconds();
+      for (size_t i = 0; i < rows.size(); ++i) {
+        Slot& row = *rows[i];
+        row.largest_batch = std::max(row.largest_batch, static_cast<int64_t>(rows.size()));
+        row.timing.token_times.push_back(now);
+        if (!take(row, next[i])) end(row, row.g->complete(row.tokens, row.timing));
+      }
+    }
+    slots.erase(std::remove_if(slots.begin(), slots.end(), [](const auto& slot) { return slot->sequence < 0; }),
+                slots.end());
+  }
+
+  // Records a generated token; false once the request must stop after it
+  // (its callback, an EOS token, or its output limit), as Model::generate
+  // stops.
+  static bool take(Slot& slot, int32_t token) {
+    slot.tokens.push_back(token);
+    const auto& times = slot.timing.token_times;
+    slot.timing.decode_seconds = times.back() - times.front();
+    const bool more = slot.g->on_token(token);
+    const auto& eos = slot.r->model->model->eos_token_ids();
+    const bool at_eos = std::find(eos.begin(), eos.end(), token) != eos.end();
+    return more && !at_eos && static_cast<int64_t>(slot.tokens.size()) < slot.r->start.objective.max_output_tokens;
+  }
+
+  // Delivers a slot's receipt and frees its sequence.
+  void end(Slot& slot, Outcome out) {
+    out.metrics.maximum_batch_size = slot.largest_batch;
+    finish(*slot.r, std::move(out));
+    slot.r->model->busy[static_cast<size_t>(slot.sequence)] = false;
+    slot.sequence = -1;
+    release(slot.r);
   }
 
   // ---- receipts ---------------------------------------------------------------
@@ -467,7 +663,8 @@ struct Service::Impl {
     const int64_t prompt = static_cast<int64_t>(r.prompt.size());
     receipt.usage = wire::Usage{prompt, out.completion_tokens, prompt + out.completion_tokens};
     receipt.metrics = out.metrics;
-    receipt.execution = wire::Execution{out.backend, "direct_single_sequence", out.plan_id, {}, false, std::nullopt};
+    const char* route = options.max_sequences > 1 ? "batch_generator" : "direct_single_sequence";
+    receipt.execution = wire::Execution{out.backend, route, out.plan_id, {}, false, std::nullopt};
     receipt.failure = out.failure;
     std::string document;
     try {
@@ -499,7 +696,7 @@ struct Service::Impl {
   std::mutex mutex;
   std::condition_variable cv, idle_cv;
   std::deque<std::shared_ptr<Request>> queue;
-  std::shared_ptr<Request> running;
+  std::vector<std::shared_ptr<Request>> running;  // started and not yet terminal
   std::map<std::string, std::shared_ptr<Request>> active;  // admitted and not yet terminal, by request_id
   bool draining = false;
   bool stopping = false;

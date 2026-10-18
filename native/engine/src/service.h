@@ -7,8 +7,11 @@
 // are: accepted first at sequence 0, sequences increasing, and exactly one
 // terminal receipt.
 //
-// Requests run one at a time (v1 batch size 1) on a worker thread, in
-// admission order, behind a bounded queue. Prompts are rendered with the
+// Requests run on a worker thread, in admission order, behind a bounded
+// queue: one at a time (max_sequences 1, v1's batch size 1), or up to
+// max_sequences at once per model, each in its own sequence of the model's
+// KV caches, prefilled as it starts and then decoded with the others in one
+// batched pass per step (continuous batching). Prompts are rendered with the
 // model's chat template and tokenized at admission, so oversized requests are
 // rejected before they are accepted. Text is streamed through TextStream
 // (stop strings, no rewrites) and coalesced into one event per
@@ -40,12 +43,14 @@ struct ServiceOptions {
   std::string backend = "auto";
   int max_context = 4096;
   std::string kv_cache = "auto";  // LoadOptions::kv_cache
-  int queue_limit = 8;           // requests that may wait behind the running one
+  int queue_limit = 8;           // requests that may wait behind the running ones
+  int max_sequences = 1;         // requests each model runs at once (LoadOptions::max_sequences)
   double text_flush_ms = 50.0;   // coalescing interval for text_delta events
   std::string runtime_revision;  // 64 hex; when set, requests for another revision are rejected
 
   // {"models": [{"id", "revision", "artifact_digest", "adapter_id"?, "directory"}],
-  //  "backend"?, "max_context"?, "kv_cache"?, "queue_limit"?, "text_flush_ms"?, "runtime_revision"?}
+  //  "backend"?, "max_context"?, "kv_cache"?, "queue_limit"?, "max_sequences"?, "text_flush_ms"?,
+  //  "runtime_revision"?}
   static ServiceOptions from_json(const Json& config);
 };
 

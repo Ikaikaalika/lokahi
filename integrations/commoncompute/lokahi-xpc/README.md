@@ -52,6 +52,7 @@ is given; verifying the artifact against it is still the host's job.
 | Deadline already passed, prompt plus output over the context, chat template error | `rejected` receipt, `deadline-exceeded` / `context-exceeded` / `template-error`, not retryable |
 | Weights over the request's memory ceiling; queue full; draining | `rejected` receipt, `memory-limit` / `overloaded` / `service-draining`, retryable |
 | Admitted | `accepted` (sequence 0), then `queue_state` if waiting, then coalesced `text_delta` events (one per `text_flush_ms`), then one receipt |
+| Several admitted at once, with `"max_sequences": N` in the config | Up to N run together per model, each in its own KV cache, decoded in one batched pass per step; later ones wait (`queue_state`) and start as sequences free up. Each streams what it would alone; receipts carry route `batch_generator` and the largest batch it ran in (`maximum_batch_size`) |
 | Stop string or EOS / `max_output_tokens` reached | `completed`, `stop` / `length` |
 | Cancel while queued / while running | `cancelled`, stage `not_started` / `running` or `partial_output`. Running requests stop at the next token |
 | Deadline passes while queued or running | `failed`, `deadline-exceeded` |
