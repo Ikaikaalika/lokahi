@@ -197,6 +197,9 @@ struct QkvParams { int q_rows; int kv_rows; int cols; };
 struct QmmParams { int n; int rows; int cols; };
 struct QmvNParams { int rows; int cols; int n; };
 constexpr int kQmvNMax = 8;  // QMV_N_MAX in decoder_kernels.metal
+// From this many tokens, 4-bit short passes run qmv_mma (simdgroup matrices)
+// instead of qmv_n; at 2 tokens qmv_n is as fast on M1.
+constexpr int kQmvMmaMinRows = 3;
 struct ElementwiseParams { int count; };
 struct GluMulParams { int count; int silu; };
 struct RopeParams {
@@ -275,10 +278,12 @@ class DecoderMetal final : public Model {
       upload();
       allocate_state();
       zero_states();
-      flash_ = fragment_layout_matches();
-      if (!flash_) {
-        std::fprintf(stderr, "metal: %s holds simdgroup matrix elements in another layout; "
-                             "prefill attention stays unfused\n", [[device_ name] UTF8String]);
+      fragments_ = fragment_layout_matches();
+      if (!fragments_) {
+        std::fprintf(stderr,
+                     "metal: %s holds simdgroup matrix elements in another layout; "
+                     "attention and short passes keep their unfused kernels\n",
+                     [[device_ name] UTF8String]);
       }
     }
   }
@@ -1109,6 +1114,19 @@ class DecoderMetal final : public Model {
       return;
     }
     if (n <= kQmvNMax && !l.mxfp4) {  // a short pass: read the weights once for all n tokens
+      // 4-bit weights on simdgroup matrices: one dequantization for all n
+      // (its 32-code steps need groups of a multiple of 32).
+      if (fragments_ && l.bits == 4 && l.group % 32 == 0 && n >= kQmvMmaMinRows) {
+        [enc setComputePipelineState:quant_pipeline("qmv_mma", l)];
+        bind_weights(enc, l, 0);
+        bind(enc, x, 0, 3);
+        bind(enc, y, 0, 4);
+        bytes(enc, QmvNParams{l.rows, l.cols, n}, 5);
+        // QMV_MMA_ROWS rows per threadgroup of QMV_MMA_SG simdgroups.
+        [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((l.rows + 15) / 16), 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        return;
+      }
       [enc setComputePipelineState:quant_pipeline("qmv_n", l)];
       bind_weights(enc, l, 0);
       bind(enc, x, 0, 3);
@@ -1495,7 +1513,7 @@ class DecoderMetal final : public Model {
     // Image blocks let a query also see up to plan_.reach later keys.
     const bool blocks = !plan_.empty() && plan_.reach > 0 && c_.image_blocks_apply(G.sliding);
     if (n >= kAttnMmMinRows && !c_.attention_sinks) {
-      if (flash_ && (G.head_dim == 64 || G.head_dim == 128 || G.head_dim == 256)) {
+      if (fragments_ && (G.head_dim == 64 || G.head_dim == 128 || G.head_dim == 256)) {
         encode_attention_flash(enc, G, n, start, window, blocks);
         return;
       }
@@ -1533,11 +1551,12 @@ class DecoderMetal final : public Model {
         threadsPerThreadgroup:MTLSizeMake(static_cast<NSUInteger>(G.head_dim), 1, 1)];
   }
 
-  // Whether this GPU's simdgroup matrices hold the elements attn_flash
-  // assumes: lane l, two adjacent elements of row (l / 4 & 4) + (l / 2 % 4)
-  // from column (l / 4 & 2) * 2 + (l % 2) * 2, for loaded matrices and for
-  // products alike. Checked once at load (one dispatch) so a GPU that lays
-  // them out otherwise keeps the unfused kernels instead of wrong attention.
+  // Whether this GPU's simdgroup matrices hold the elements attn_flash and
+  // qmv_mma assume: lane l, two adjacent elements of row (l / 4 & 4) +
+  // (l / 2 % 4) from column (l / 4 & 2) * 2 + (l % 2) * 2, for loaded
+  // matrices and for products alike. Checked once at load (one dispatch) so
+  // a GPU that lays them out otherwise keeps the other kernels instead of
+  // computing wrong results.
   bool fragment_layout_matches() {
     id<MTLBuffer> out = [device_ newBufferWithLength:128 * sizeof(float) options:MTLResourceStorageModeShared];
     id<MTLCommandBuffer> cb = [queue_ commandBuffer];
@@ -2260,7 +2279,7 @@ class DecoderMetal final : public Model {
   id<MTLDevice> device_ = nil;
   id<MTLCommandQueue> queue_ = nil;
   id<MTLLibrary> library_ = nil;
-  bool flash_ = false;  // fragment_layout_matches(): attn_flash may run
+  bool fragments_ = false;  // fragment_layout_matches(): attn_flash and qmv_mma may run
   std::map<std::string, id<MTLComputePipelineState>> pipelines_;
 
   GpuLinear embed_, lm_head_, embed_per_layer_, per_layer_model_proj_;
