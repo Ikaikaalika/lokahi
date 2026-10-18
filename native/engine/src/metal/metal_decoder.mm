@@ -270,7 +270,7 @@ struct AttnParams {
 };
 struct AttnMmParams {
   int heads; int kv_heads; int head_dim; int start_pos; int row0; int rows; int key_base; int keys; int window;
-  int capacity; float scale; float softcap; int has_last_key; int head_rows = 0; int block_keys = 0;
+  int capacity; float scale; float softcap; int has_last_key; int head_rows = 0; int block_keys = 0; int has_bounds = 0;
 };
 struct ReplaceParams { int cols; int n; };
 struct ReduceParams { int heads; int head_dim; int n_blocks; int has_sinks; };

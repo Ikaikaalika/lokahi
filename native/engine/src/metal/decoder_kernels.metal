@@ -2517,6 +2517,8 @@ struct AttnMmParams {
   int head_rows;     // attn_flash: rows are one token's heads (all at start_pos) over kv head 0
   int block_keys;    // attn_flash with head_rows: threadgroup y takes keys [y, y + 1) * block_keys
                      // and leaves its rows' partial output for attn_reduce
+  int has_bounds;    // attn_flash: row t sees keys [bounds[2t], bounds[2t + 1]) only (buffer 5;
+                     // Qwen2.5-VL's windows), whatever its position
 };
 
 #define ATT_MM_UNROLL _Pragma("clang loop unroll(full)")
@@ -2757,12 +2759,27 @@ template <typename KV, int D, int DV, int BK, int SPLIT, bool VK>
   if (p.has_last_key != 0) tile_hi = max(tile_hi, simd_max(t0 + int(lane) <= t_last ? last_key[t0 + int(lane)] : 0));
   tile_hi = min(tile_hi, p.key_base + p.keys - 1);
   int tile_lo = max(p.key_base, pos_first - p.window + 1);
+  // The keys every row of the tile sees (a block among them needs no mask).
+  int shared_lo = pos_last - p.window + 1, shared_hi = min(pos_first, tile_hi);
+  if (p.has_bounds != 0) {  // each row's own range: the tile's span and overlap over its rows
+    const int r = t0 + int(lane);
+    const bool r_ok = r <= t_last;
+    const int r_lo = r_ok ? last_key[2 * r] : 0x7fffffff, r_hi = r_ok ? last_key[2 * r + 1] - 1 : -1;
+    tile_lo = max(p.key_base, simd_min(r_lo));
+    tile_hi = min(simd_max(r_hi), p.key_base + p.keys - 1);
+    shared_lo = simd_max(r_ok ? r_lo : -0x7fffffff);
+    shared_hi = simd_min(r_ok ? r_hi : 0x7fffffff);
+    if (row_ok) {
+      lo = last_key[2 * t];
+      hi = last_key[2 * t + 1] - 1;
+    }
+  }
   if (p.block_keys > 0) {  // this threadgroup's block of keys; rows see no others
     tile_lo = max(tile_lo, int(tg.y) * p.block_keys);
     tile_hi = min(tile_hi, (int(tg.y) + 1) * p.block_keys - 1);
     lo = max(lo, tile_lo);
-    hi = min(hi, tile_hi);
   }
+  hi = min(hi, tile_hi);  // the staging's zeros past the keys stay masked
 
   // Q, prescaled so the scores come out in log2 units (softcap applies the
   // log2 factor after its tanh instead).
@@ -2829,7 +2846,7 @@ template <typename KV, int D, int DV, int BK, int SPLIT, bool VK>
 
     // Soft-cap and mask, then the online softmax update of this row.
     // A block every row of the tile sees in full needs no mask.
-    const bool full = kb + BK - 1 <= min(pos_first, tile_hi) && kb >= pos_last - p.window + 1;
+    const bool full = kb + BK - 1 <= min(shared_hi, tile_hi) && kb >= shared_lo;
     float block_max = -INFINITY;
     ATT_MM_UNROLL for (int j = 0; j < BK / 8; ++j) {
       thread float2& e = FRAG_ELEMS(s[j]);
@@ -2903,6 +2920,14 @@ LOKAHI_ATTN_FLASH(256, 8, 8)
 // float keys of 512 would not fit.
 template LOKAHI_INSTANCE_ATTRS("attn_flash_d512_h")
 decltype(attn_flash<half, 512, 512, 8, 2, false>) attn_flash<half, 512, 512, 8, 2, false>;
+// Vision towers' heads (Qwen2/2.5-VL's 80, Qwen3-VL 8B's and Qwen3.5's 72;
+// the test fixtures' 32), float: attention over an image's patches.
+template LOKAHI_INSTANCE_ATTRS("attn_flash_d32")
+decltype(attn_flash<float, 32, 32, 32, 1, false>) attn_flash<float, 32, 32, 32, 1, false>;
+template LOKAHI_INSTANCE_ATTRS("attn_flash_d72")
+decltype(attn_flash<float, 72, 72, 32, 1, false>) attn_flash<float, 72, 72, 32, 1, false>;
+template LOKAHI_INSTANCE_ATTRS("attn_flash_d80")
+decltype(attn_flash<float, 80, 80, 32, 1, false>) attn_flash<float, 80, 80, 32, 1, false>;
 // Multi-head latent attention (one float cache of latent plus rope
 // dimensions, values its first kv_lora_rank): DeepSeek's, Kimi K2's and
 // GLM-4.7-Flash's 512 + 64, and the test fixtures' 64 + 32.
@@ -3232,10 +3257,10 @@ inline float load_value(const device Bf16* p, int i) { return as_type<float>(uin
 // thread. GUARD checks rows, columns and K against the matrices' edges (edge
 // tiles and the last, partial K step); interior steps run unguarded, as
 // qmm's do.
-template <typename TB, bool TRANS_B, bool GUARD>
+template <typename TB, bool TRANS_B, bool GUARD, typename TS>
 inline void dense_mm_stage(const device float* a, const device TB* b, constant MmParams& p, threadgroup float* as,
-                           threadgroup float* bs, int m0, int n0, int k0, short tid) {
-  constexpr short LD = 36;
+                           threadgroup TS* bs, int m0, int n0, int k0, short tid) {
+  constexpr short LD = 36, LDB = 32 + 16 / short(sizeof(TS));
   const short r = tid / 4, c0 = (tid % 4) * 8;
   {
     const int row = m0 + r;
@@ -3246,13 +3271,13 @@ inline void dense_mm_stage(const device float* a, const device TB* b, constant M
   if (TRANS_B) {  // B[n][k]: row n0 + r, K columns c0 ...
     const int row = n0 + r;
     QMM_UNROLL for (short j = 0; j < 8; ++j)
-      bs[r * LD + c0 + j] =
-          !GUARD || (row < p.n && k0 + c0 + j < p.k) ? load_value(b, row * p.ldb + k0 + c0 + j) : 0.0f;
+      bs[r * LDB + c0 + j] =
+          TS(!GUARD || (row < p.n && k0 + c0 + j < p.k) ? load_value(b, row * p.ldb + k0 + c0 + j) : 0.0f);
   } else {  // B[k][n]: K row k0 + r, columns n0 + c0 ..., staged transposed
     const int kr = k0 + r;
     QMM_UNROLL for (short j = 0; j < 8; ++j)
-      bs[(c0 + j) * LD + r] =
-          !GUARD || (kr < p.k && n0 + c0 + j < p.n) ? load_value(b, kr * p.ldb + n0 + c0 + j) : 0.0f;
+      bs[(c0 + j) * LDB + r] =
+          TS(!GUARD || (kr < p.k && n0 + c0 + j < p.n) ? load_value(b, kr * p.ldb + n0 + c0 + j) : 0.0f);
   }
 }
 
@@ -3260,8 +3285,11 @@ inline void dense_mm_stage(const device float* a, const device TB* b, constant M
 // onto C, for any m, n and k (vision towers' dense matrices and attention):
 // qmm's 32x32 tiles, interleaved simdgroup fragments loaded per lane as
 // float through offsets computed once, and unguarded staging for interior
-// steps. Grid (ceil(n / 32), ceil(m / 32)), 128 threads.
-template <typename TB, bool TRANS_B>
+// steps. A 16-bit B (weights) stages in half, A in float: the weights'
+// staging sets the rate, as qmm_fh found (bfloat16 weights hold their bits
+// in half down to its normal range). Grid (ceil(n / 32), ceil(m / 32)), 128
+// threads.
+template <typename TB, bool TRANS_B, typename TS>
 [[kernel]] void dense_mm(const device float* a [[buffer(0)]],
                          const device TB* b [[buffer(1)]],
                          device float* c [[buffer(2)]],
@@ -3271,31 +3299,31 @@ template <typename TB, bool TRANS_B>
                          uint tid [[thread_index_in_threadgroup]],
                          uint sg [[simdgroup_index_in_threadgroup]],
                          uint lane [[thread_index_in_simdgroup]]) {
-  constexpr short LD = 36;
+  constexpr short LD = 36, LDB = 32 + 16 / short(sizeof(TS));
   threadgroup float as[32 * LD];
-  threadgroup float bs[32 * LD];
+  threadgroup TS bs[32 * LDB];
   const int m0 = int(tg.y) * 32, n0 = int(tg.x) * 32;
   const short fm = short((lane / 4) & 4) + short((lane / 2) % 4);
   const short fn = short((lane / 4) & 2) * 2 + short(lane % 2) * 2;
   const short tm = 8 * short(sg / 2), tn = 8 * short(sg % 2);
-  const short a_off = (tm + fm) * LD + fn, b_off = (tn + fn) * LD + fm;
+  const short a_off = (tm + fm) * LD + fn, b_off = (tn + fn) * LDB + fm;
   const bool interior = m0 + 32 <= p.m && n0 + 32 <= p.n;
   const int k_full = interior ? p.k / 32 * 32 : 0;
   float2 acc[2][2] = {{float2(0.0f), float2(0.0f)}, {float2(0.0f), float2(0.0f)}};
   for (int k0 = 0; k0 < p.k; k0 += 32) {
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (k0 < k_full) {
-      dense_mm_stage<TB, TRANS_B, false>(a, b, p, as, bs, m0, n0, k0, short(tid));
+      dense_mm_stage<TB, TRANS_B, false, TS>(a, b, p, as, bs, m0, n0, k0, short(tid));
     } else {
-      dense_mm_stage<TB, TRANS_B, true>(a, b, p, as, bs, m0, n0, k0, short(tid));
+      dense_mm_stage<TB, TRANS_B, true, TS>(a, b, p, as, bs, m0, n0, k0, short(tid));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const threadgroup float* ap = as + a_off;
-    const threadgroup float* bp = bs + b_off;
+    const threadgroup TS* bp = bs + b_off;
     QMM_UNROLL for (short kk = 0; kk < 32; kk += 8) {
       float2 x[2], y[2];
       QMM_UNROLL for (short i = 0; i < 2; ++i) x[i] = float2(ap[i * 16 * LD], ap[i * 16 * LD + 1]);
-      QMM_UNROLL for (short j = 0; j < 2; ++j) y[j] = float2(bp[j * 16 * LD], bp[j * 16 * LD + LD]);
+      QMM_UNROLL for (short j = 0; j < 2; ++j) y[j] = float2(float(bp[j * 16 * LDB]), float(bp[j * 16 * LDB + LDB]));
       QMM_UNROLL for (short i = 0; i < 2; ++i)
         QMM_UNROLL for (short j = 0; j < 2; ++j) {
           simdgroup_float8x8 xm, ym, cm;
@@ -3325,14 +3353,14 @@ template <typename TB, bool TRANS_B>
   }
 }
 
-#define LOKAHI_MM(NAME, TB, TRANS_B) \
-  template LOKAHI_INSTANCE_ATTRS(NAME) decltype(dense_mm<TB, TRANS_B>) dense_mm<TB, TRANS_B>;
-LOKAHI_MM("dense_mm_f32_nt", float, true)
-LOKAHI_MM("dense_mm_f16_nt", half, true)
-LOKAHI_MM("dense_mm_bf16_nt", Bf16, true)
-LOKAHI_MM("dense_mm_f32_nn", float, false)
-LOKAHI_MM("dense_mm_f16_nn", half, false)
-LOKAHI_MM("dense_mm_bf16_nn", Bf16, false)
+#define LOKAHI_MM(NAME, TB, TRANS_B, TS) \
+  template LOKAHI_INSTANCE_ATTRS(NAME) decltype(dense_mm<TB, TRANS_B, TS>) dense_mm<TB, TRANS_B, TS>;
+LOKAHI_MM("dense_mm_f32_nt", float, true, float)
+LOKAHI_MM("dense_mm_f16_nt", half, true, half)
+LOKAHI_MM("dense_mm_bf16_nt", Bf16, true, half)
+LOKAHI_MM("dense_mm_f32_nn", float, false, float)
+LOKAHI_MM("dense_mm_f16_nn", half, false, half)
+LOKAHI_MM("dense_mm_bf16_nn", Bf16, false, half)
 
 // Threadgroup-wide maximum. `scratch` holds one float per simdgroup.
 inline float threadgroup_max(float value, threadgroup float* scratch, uint sg, uint lane, uint simdgroups) {
@@ -3593,6 +3621,31 @@ struct WindowAttentionParams {
 };
 
 constant constexpr int kMaxWindowKeys = 1024;
+
+struct SplitHeadsParams {
+  int heads;
+  int dim;
+  int stride;  // floats per row of the fused projection
+  int rows;
+};
+
+// A fused [rows, stride] projection [q | k | v] (each heads * dim wide) as
+// attn_flash reads it: q [rows, heads, dim], k and v [heads, rows, dim].
+// Grid: (heads * dim, rows) threads.
+kernel void split_qkv_heads(const device float* qkv [[buffer(0)]],
+                            device float* q [[buffer(1)]],
+                            device float* k [[buffer(2)]],
+                            device float* v [[buffer(3)]],
+                            constant SplitHeadsParams& p [[buffer(4)]],
+                            uint2 gid [[thread_position_in_grid]]) {
+  const int width = p.heads * p.dim, c = int(gid.x), t = int(gid.y);
+  if (c >= width || t >= p.rows) return;
+  const device float* row = qkv + size_t(t) * size_t(p.stride);
+  q[size_t(t) * size_t(width) + size_t(c)] = row[c];
+  const size_t at = (size_t(c / p.dim) * size_t(p.rows) + size_t(t)) * size_t(p.dim) + size_t(c % p.dim);
+  k[at] = row[width + c];
+  v[at] = row[2 * width + c];
+}
 
 kernel void window_attention(const device float* qkv [[buffer(0)]],
                              const device int* window [[buffer(1)]],
