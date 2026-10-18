@@ -347,6 +347,9 @@ def _write_named(directory: Path, name: str):
     if name in DEEPSEEK_VARIANTS:
         write_tiny_deepseek(directory, DEEPSEEK_VARIANTS[name])
         return DeepseekReference.load(directory)
+    if name in QWEN35_VARIANTS:
+        write_tiny_qwen35(directory, QWEN35_VARIANTS[name])
+        return Qwen35Reference.load(directory)
     write_tiny_dense(directory, DENSE_VARIANTS[name])
     return LlamaFamilyReference.load(directory)
 
@@ -358,7 +361,9 @@ def _write_named(directory: Path, name: str):
 # run grouped by expert (moe_sort, moe_qmm): affine and MXFP4 experts and
 # Gemma 4's beside its MLP; and multi-head latent attention (attn_flash over
 # the latent cache, at the fixtures' 64 + 32 and the released models' 512 +
-# 64). The 2% tolerance above misses a 1% error in
+# 64); and Gated DeltaNet, whose passes of 16 tokens or more run the delta
+# rule in chunks of 8 (gdn_chunk), a partial last chunk, and passes that
+# start from the previous pass's state. The 2% tolerance above misses a 1% error in
 # attention's output (it moved these logits by 0.6% of their scale); the
 # paths measured 2e-5 to 6.5e-4 of it (correctness evidence).
 @pytest.mark.parametrize("backend", _backends())
@@ -366,7 +371,8 @@ def _write_named(directory: Path, name: str):
 @pytest.mark.parametrize("name", ["llama3-tied-rope-llama3", "qwen3-qk-norm-hd128", "gemma3-tied-hd256-rope-scaled",
                                   "mistral-sliding-untied", "gemma4-e2b-shape", "gemma4-wide-heads",
                                   "qwen3-moe-top2-of-8", "gpt-oss-mxfp4-yarn", "gemma4-26b-a4b-moe",
-                                  "deepseek-v3-absorbed-grouped", "deepseek-v2-lite-geometry", "llama3-f16-scales"])
+                                  "deepseek-v3-absorbed-grouped", "deepseek-v2-lite-geometry", "llama3-f16-scales",
+                                  "qwen3-next-mlx"])
 def test_long_prefill_matches_oracle_closely(native_cli, name, backend, chunk, tmp_path):
     oracle = _write_named(tmp_path / "model", name)
     tokens = (TOKENS * 4)[:80]
@@ -379,6 +385,28 @@ def test_long_prefill_matches_oracle_closely(native_cli, name, backend, chunk, t
     tolerance = 2e-4 if backend == "cpu" else 2e-3
     np.testing.assert_allclose(got, expected, atol=tolerance * np.abs(expected).max(), rtol=0)
     np.testing.assert_array_equal(got.argmax(axis=1), expected.argmax(axis=1))
+
+
+# Gated DeltaNet's chunked rule (gdn_chunk) against the oracle at a quarter of
+# the tolerance above: Qwen3-Next's mixture of experts stages in float, so
+# the fixture lands at 2.2e-4 to 2.7e-4 of the logits' scale, where a 1% error
+# in the rule's output moved it to 7.8e-4 (with 512-token chunks). (The dense
+# Qwen3.5 fixture stages its norm outputs in half and lands at 2.4e-3 either
+# way, too noisy for this; the released Qwen3.5 4B measured 2.4e-4 against
+# the CPU backend.)
+@pytest.mark.parametrize("chunk", [512, 33])
+def test_gated_deltanet_chunks_match_oracle_tightly(native_cli, chunk, tmp_path):
+    if "metal" not in _backends():
+        pytest.skip("Metal only")
+    oracle = _write_named(tmp_path / "model", "qwen3-next-mlx")
+    tokens = (TOKENS * 4)[:80]
+    out = tmp_path / "logits.bin"
+    report = _run(native_cli, "logits", "--model", str(tmp_path / "model"), "--backend", "metal",
+                  "--tokens", ",".join(map(str, tokens)), "--prefill", str(len(tokens) - 2),
+                  "--prefill-chunk", str(chunk), "--out", str(out))
+    got = np.fromfile(out, dtype=np.float32).reshape(report["rows"], oracle.config.vocab_size)
+    expected = oracle.logits(tokens)[len(tokens) - 3 :]
+    np.testing.assert_allclose(got, expected, atol=5e-4 * np.abs(expected).max(), rtol=0)
 
 
 def _latent(directory: Path) -> bool:
