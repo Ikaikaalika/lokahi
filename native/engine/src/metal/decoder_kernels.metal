@@ -1306,8 +1306,9 @@ template <typename T, typename XT>
 
 template LOKAHI_INSTANCE_ATTRS("qmm_h") decltype(qmm<half, float>) qmm<half, float>;
 template LOKAHI_INSTANCE_ATTRS("qmm_f") decltype(qmm<float, float>) qmm<float, float>;
-// Half X (qmm_glu's half output for float16 checkpoints' down projections):
-// 2.05 TFLOPS against 1.89 for float X on M1, and more at long K.
+// Half X (a dense model's norm output in prefill, and qmm_glu's half output
+// for float16 checkpoints' down projections): 2.05 TFLOPS against 1.89 for
+// float X on M1, and more at long K.
 template LOKAHI_INSTANCE_ATTRS("qmm_hx") decltype(qmm<half, half>) qmm<half, half>;
 
 struct QmmGluParams {
@@ -1321,14 +1322,14 @@ struct QmmGluParams {
 // y[t, r] = act(gate(x_t)[r]) * up(x_t)[r], as qmm then glu_mul compute it,
 // without writing the two products out. Same tiles, staging and grid as qmm.
 // y is float, or half (YT) for a down projection that stages in half anyway.
-template <typename T, typename YT>
+template <typename T, typename XT, typename YT>
 [[kernel]] void qmm_glu(const device uint* wg [[buffer(0)]],
                         const device ushort* sg_scales [[buffer(1)]],
                         const device ushort* bg [[buffer(2)]],
                         const device uint* wu [[buffer(3)]],
                         const device ushort* su [[buffer(4)]],
                         const device ushort* bu [[buffer(5)]],
-                        const device float* x [[buffer(6)]],
+                        const device XT* x [[buffer(6)]],
                         device YT* y [[buffer(7)]],
                         constant QmmGluParams& g [[buffer(8)]],
                         uint2 tg [[threadgroup_position_in_grid]],
@@ -1348,11 +1349,11 @@ template <typename T, typename YT>
   float2 c[2][2] = {{float2(0.0f), float2(0.0f)}, {float2(0.0f), float2(0.0f)}};
   float2 cu[2][2] = {{float2(0.0f), float2(0.0f)}, {float2(0.0f), float2(0.0f)}};
   if (m0 + TILE <= p.n && n0 + TILE <= p.rows) {
-    qmm_tile<T, float, false, true>(wg, sg_scales, bg, wu, su, bu, x, p, xs, ws, wus, m0, n0, short(tid), a_off, b_off,
-                                    c, cu);
+    qmm_tile<T, XT, false, true>(wg, sg_scales, bg, wu, su, bu, x, p, xs, ws, wus, m0, n0, short(tid), a_off, b_off, c,
+                                 cu);
   } else {
-    qmm_tile<T, float, true, true>(wg, sg_scales, bg, wu, su, bu, x, p, xs, ws, wus, m0, n0, short(tid), a_off, b_off,
-                                   c, cu);
+    qmm_tile<T, XT, true, true>(wg, sg_scales, bg, wu, su, bu, x, p, xs, ws, wus, m0, n0, short(tid), a_off, b_off, c,
+                                cu);
   }
   QMM_UNROLL for (short i = 0; i < 2; ++i) {
     const int token = m0 + tm + 16 * i + fm;
@@ -1366,9 +1367,11 @@ template <typename T, typename YT>
   }
 }
 
-template LOKAHI_INSTANCE_ATTRS("qmm_glu_h") decltype(qmm_glu<half, float>) qmm_glu<half, float>;
-template LOKAHI_INSTANCE_ATTRS("qmm_glu_f") decltype(qmm_glu<float, float>) qmm_glu<float, float>;
-template LOKAHI_INSTANCE_ATTRS("qmm_glu_hh") decltype(qmm_glu<half, half>) qmm_glu<half, half>;
+// A dense model's X arrives in half (floats_to_half); mixture-of-experts
+// models stage in float.
+template LOKAHI_INSTANCE_ATTRS("qmm_glu_f") decltype(qmm_glu<float, float, float>) qmm_glu<float, float, float>;
+template LOKAHI_INSTANCE_ATTRS("qmm_glu_hx") decltype(qmm_glu<half, half, float>) qmm_glu<half, half, float>;
+template LOKAHI_INSTANCE_ATTRS("qmm_glu_hxh") decltype(qmm_glu<half, half, half>) qmm_glu<half, half, half>;
 
 // ---------------------------------------------------------------------------
 // Mixture-of-experts prefill grouped by expert. qmv_gather(_glu) runs one
@@ -3214,6 +3217,16 @@ kernel void gelu_inplace(device float* x [[buffer(0)]],
                          constant ElementwiseParams& p [[buffer(1)]],
                          uint gid [[thread_position_in_grid]]) {
   if (int(gid) < p.count) x[gid] = gelu_tanh(x[gid]);
+}
+
+// A norm's output rows in half for a dense model's prefill projections
+// (qmm_hx, qmm_glu_hx*), which would round them to half while staging them
+// anyway: converted once for the projections that share them.
+kernel void floats_to_half(const device float* src [[buffer(0)]],
+                           device half* dst [[buffer(1)]],
+                           constant ElementwiseParams& p [[buffer(2)]],
+                           uint gid [[thread_position_in_grid]]) {
+  if (int(gid) < p.count) dst[gid] = half(src[gid]);
 }
 
 kernel void copy_floats(const device float* src [[buffer(0)]],

@@ -973,6 +973,7 @@ class DecoderMetal final : public Model {
     gate_ = private_buffer(chunk * widest * f);
     // qmm_glu's half output, which a float16 checkpoint's down projection reads.
     gate16_ = private_buffer(chunk * widest * sizeof(uint16_t));
+    if (c_.num_experts == 0) h16_ = private_buffer(chunk * hidden * sizeof(uint16_t));
     up_ = private_buffer(chunk * widest * f);
     if (c_.shared_intermediate > 0) shared_out_ = private_buffer(chunk * hidden * f);
     if (c_.experts_beside_mlp) {
@@ -1169,7 +1170,7 @@ class DecoderMetal final : public Model {
     // otherwise. Mixture-of-experts models stage in float throughout: half's
     // rounding reaches later layers' routers and flips their top-k near a tie.
     const bool half_staging = (x == h_ || !l.bf16) && c_.num_experts == 0;
-    [enc setComputePipelineState:quant_pipeline(half_staging ? "qmm_h" : "qmm_f", l)];
+    [enc setComputePipelineState:quant_pipeline(x == h16_ ? "qmm_hx" : half_staging ? "qmm_h" : "qmm_f", l)];
     bind_weights(enc, l, 0);
     bind(enc, x, 0, 3);
     bind(enc, y, 0, 4);
@@ -1182,6 +1183,21 @@ class DecoderMetal final : public Model {
   void encode_elementwise(id<MTLComputeCommandEncoder> enc, int count) {
     [enc dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(count), 1, 1)
         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+  }
+
+  // The norm output h_ as the projections reading it in an n-token pass take
+  // it: a dense model's prefill reads it in half (h16_, converted once per
+  // group of projections), which qmm would round it to while staging anyway
+  // -- the same products, at 2.05 TFLOPS against 1.89 reading float on M1.
+  id<MTLBuffer> prefill_input(id<MTLComputeCommandEncoder> enc, int n) {
+    if (n <= kQmvNMax || h16_ == nil) return h_;
+    [enc setComputePipelineState:pipeline("floats_to_half")];
+    bind(enc, h_, 0, 0);
+    bind(enc, h16_, 0, 1);
+    const int count = n * c_.hidden_size;
+    bytes(enc, ElementwiseParams{count}, 2);
+    encode_elementwise(enc, count);
+    return h16_;
   }
 
   NSUInteger norm_threads(id<MTLComputePipelineState> pso) const {
@@ -1254,8 +1270,9 @@ class DecoderMetal final : public Model {
 
   void encode_qkv_into(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n, id<MTLBuffer> q_out) {
     if (!G.own_kv || G.k_eq_v) {  // queries only, or queries and the keys that double as values
-      encode_qmm(enc, G.q, h_, n, q_out);
-      if (G.own_kv) encode_qmm(enc, G.k, h_, n, kt_);
+      const id<MTLBuffer> x = prefill_input(enc, n);
+      encode_qmm(enc, G.q, x, n, q_out);
+      if (G.own_kv) encode_qmm(enc, G.k, x, n, kt_);
       return;
     }
     if (n == 1 && G.q.same_format(G.k) && G.q.same_format(G.v)) {
@@ -1272,9 +1289,10 @@ class DecoderMetal final : public Model {
           threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
       return;
     }
-    encode_qmm(enc, G.q, h_, n, q_out);
-    encode_qmm(enc, G.k, h_, n, kt_);
-    encode_qmm(enc, G.v, h_, n, vt_);
+    const id<MTLBuffer> x = prefill_input(enc, n);
+    encode_qmm(enc, G.q, x, n, q_out);
+    encode_qmm(enc, G.k, x, n, kt_);
+    encode_qmm(enc, G.v, x, n, vt_);
   }
 
   // x[i] *= sigmoid(scales[i / cols]) over `count` values.
@@ -1291,15 +1309,16 @@ class DecoderMetal final : public Model {
   // The input projections into mixed_ ([q | k | v] channels), lin_z_, and the
   // raw b and a in lin_b_ and lin_a_; Qwen3-Next's grouped rows are split.
   void encode_gdn_projections(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n) {
+    const id<MTLBuffer> x = prefill_input(enc, n);
     if (!G.grouped) {
-      encode_qmm(enc, G.in_qkv, h_, n, mixed_);
-      encode_qmm(enc, G.in_z, h_, n, lin_z_);
-      encode_qmm(enc, G.in_b, h_, n, lin_b_);
-      encode_qmm(enc, G.in_a, h_, n, lin_a_);
+      encode_qmm(enc, G.in_qkv, x, n, mixed_);
+      encode_qmm(enc, G.in_z, x, n, lin_z_);
+      encode_qmm(enc, G.in_b, x, n, lin_b_);
+      encode_qmm(enc, G.in_a, x, n, lin_a_);
       return;
     }
-    encode_qmm(enc, G.in_qkvz, h_, n, grouped_);
-    encode_qmm(enc, G.in_ba, h_, n, grouped_ba_);
+    encode_qmm(enc, G.in_qkvz, x, n, grouped_);
+    encode_qmm(enc, G.in_ba, x, n, grouped_ba_);
     const int hk = c_.linear_k_heads, ratio = c_.linear_v_heads / hk;
     const int per_head = 2 * c_.linear_k_dim + 2 * ratio * c_.linear_v_dim + 2 * ratio;
     [enc setComputePipelineState:pipeline("gdn_split")];
@@ -1691,14 +1710,15 @@ class DecoderMetal final : public Model {
   // latent_q_[t, h, :rank]: through the stacked embed_q, or straight from
   // kv_b_proj's key rows.
   void encode_latent_qkv(id<MTLComputeCommandEncoder> enc, const GpuLayer& G, int n) {
+    const id<MTLBuffer> x = prefill_input(enc, n);
     if (c_.q_lora_rank > 0) {
-      encode_qmm(enc, G.q_a, h_, n, q_latent_);
+      encode_qmm(enc, G.q_a, x, n, q_latent_);
       encode_rms_norm(enc, q_latent_, G.q_a_norm, q_latent_, n, NormParams{c_.q_lora_rank, c_.latent_norm_eps, 0.0f});
       encode_qmm(enc, G.q, q_latent_, n, q_);
     } else {
-      encode_qmm(enc, G.q, h_, n, q_);
+      encode_qmm(enc, G.q, x, n, q_);
     }
-    encode_qmm(enc, G.kv_a, h_, n, kt_);
+    encode_qmm(enc, G.kv_a, x, n, kt_);
     const int H = c_.num_heads, nope = c_.qk_nope_dim, rank = c_.kv_lora_rank, width = c_.latent_width();
     const NSUInteger pairs = static_cast<NSUInteger>(n * H);
     if (G.absorbed) {
@@ -2106,15 +2126,17 @@ class DecoderMetal final : public Model {
       [enc dispatchThreadgroups:MTLSizeMake(qmv_groups(G.gate.rows), 1, 1)
           threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
     } else if (n > kQmvNMax && G.gate.same_format(G.up) && !G.gate.mxfp4) {
-      // Gate and up in one pass over the staged input (qmm_glu), staged as
-      // encode_qmm would stage h_. A float16 checkpoint's down projection
-      // stages its input in half anyway, so the product goes to it in half.
-      const bool dense = c_.num_experts == 0;
-      const bool half_down = dense && !G.down.bf16 && !G.down.mxfp4;
-      [enc setComputePipelineState:quant_pipeline(half_down ? "qmm_glu_hh" : dense ? "qmm_glu_h" : "qmm_glu_f", G.gate)];
+      // Gate and up in one pass over the staged input (qmm_glu), which is
+      // half for a dense model (prefill_input) and float otherwise. A
+      // float16 checkpoint's down projection stages its input in half
+      // anyway, so the product goes to it in half.
+      const id<MTLBuffer> x = prefill_input(enc, n);
+      const bool half_x = x == h16_;
+      const bool half_down = half_x && !G.down.bf16 && !G.down.mxfp4;
+      [enc setComputePipelineState:quant_pipeline(half_down ? "qmm_glu_hxh" : half_x ? "qmm_glu_hx" : "qmm_glu_f", G.gate)];
       bind_weights(enc, G.gate, 0);
       bind_weights(enc, G.up, 3);
-      bind(enc, h_, 0, 6);
+      bind(enc, x, 0, 6);
       bind(enc, half_down ? gate16_ : gate_, 0, 7);
       bytes(enc, QmmGluParams{n, G.gate.rows, G.gate.cols, silu}, 8);
       [enc dispatchThreadgroups:MTLSizeMake(static_cast<NSUInteger>((G.gate.rows + 31) / 32),
@@ -2132,8 +2154,9 @@ class DecoderMetal final : public Model {
         return;
       }
     } else {
-      encode_qmm(enc, G.gate, h_, n, gate_);
-      encode_qmm(enc, G.up, h_, n, up_);
+      const id<MTLBuffer> x = prefill_input(enc, n);
+      encode_qmm(enc, G.gate, x, n, gate_);
+      encode_qmm(enc, G.up, x, n, up_);
       [enc setComputePipelineState:pipeline("glu_mul")];
       bind(enc, gate_, 0, 0);
       bind(enc, up_, 0, 1);
@@ -2475,7 +2498,8 @@ class DecoderMetal final : public Model {
   size_t device_weight_bytes_ = 0;
 
   id<MTLBuffer> x_ = nil, h_ = nil, r_ = nil, q_ = nil, kt_ = nil, vt_ = nil, attn_ = nil, gate_ = nil, up_ = nil;
-  id<MTLBuffer> gate16_ = nil;  // qmm_glu_hh's output [chunk, widest] in half
+  id<MTLBuffer> gate16_ = nil;  // qmm_glu_hxh's output [chunk, widest] in half
+  id<MTLBuffer> h16_ = nil;     // h_ in half for a dense model's prefill projections (prefill_input)
   id<MTLBuffer> part_o_ = nil, part_ml_ = nil;
   id<MTLBuffer> attn_scores_ = nil;  // [heads, rows, keys] for encode_attention_mm, grown on demand
   size_t attn_scores_bytes_ = 0;
