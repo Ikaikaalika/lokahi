@@ -219,6 +219,15 @@ struct DecoderConfig {
   }
   int kv_source(int layer) const { return layer_kv_source.empty() ? layer : layer_kv_source[static_cast<size_t>(layer)]; }
   bool shares_kv(int layer) const { return kv_source(layer) != layer; }
+  // The first of the last layers that all attend over an earlier layer's
+  // keys and values and write none (num_layers when the last layer writes).
+  // A pass's other rows feed nothing past it, so a plain pass runs those
+  // layers on its last row only, or not at all without logits.
+  int shared_suffix() const {
+    int first = num_layers;
+    while (first > 0 && shares_kv(first - 1)) --first;
+    return first;
+  }
   bool k_eq_v(int layer) const { return !layer_k_eq_v.empty() && layer_k_eq_v[static_cast<size_t>(layer)]; }
   bool is_moe(int layer) const { return !layer_moe.empty() && layer_moe[static_cast<size_t>(layer)]; }
 };

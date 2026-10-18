@@ -1920,8 +1920,23 @@ class DecoderCpu final : public Model {
     if (c_.per_layer_input > 0) per_layer_inputs(tokens, n);
 
     const int start = position_;
-    for (int l = 0; l < c_.num_layers; ++l) run_layer(w_->layers[static_cast<size_t>(l)], l, start, n);
-    position_ += n;
+    // KV-shared trailing layers write no cache: a plain pass skips them
+    // without logits and runs them on its last row with (shared_suffix()).
+    const int full = verifying_ || mtp_on_ ? c_.num_layers : c_.shared_suffix();
+    for (int l = 0; l < full; ++l) run_layer(w_->layers[static_cast<size_t>(l)], l, start, n);
+    const int pass = n;
+    if (full < c_.num_layers && want_logits) {
+      if (n > 1) {
+        std::copy_n(x_.data() + static_cast<size_t>(n - 1) * hidden, hidden, x_.data());
+        if (c_.per_layer_input > 0) {
+          const size_t width = static_cast<size_t>(c_.num_layers) * c_.per_layer_input;
+          std::copy_n(pl_.data() + static_cast<size_t>(n - 1) * width, width, pl_.data());
+        }
+      }
+      for (int l = full; l < c_.num_layers; ++l) run_layer(w_->layers[static_cast<size_t>(l)], l, start + n - 1, 1);
+      n = 1;
+    }
+    position_ += pass;
     const bool profiling = profiler_ != nullptr;
     // Every row's final-normed hidden state, when the pass verifies drafts or
     // the MTP head follows the model.

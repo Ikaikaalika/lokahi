@@ -2064,8 +2064,24 @@ class DecoderMetal final : public Model {
     section(enc, "norm", profiling ? traffic::rows(hidden, n, 2) + 4.0 * hidden : 0.0);
 
     const size_t decoder_layers = static_cast<size_t>(c_.num_layers);
-    for (size_t l = 0; l < decoder_layers; ++l) {
-      encode_layer(enc, l, n, start, l + 1 < decoder_layers ? &layers_[l + 1].attn_norm : &final_norm_);
+    auto next_norm = [&](size_t l) { return l + 1 < decoder_layers ? &layers_[l + 1].attn_norm : &final_norm_; };
+    // KV-shared trailing layers write no cache: a plain pass skips them
+    // without logits and runs them on its last row with (shared_suffix()).
+    const size_t full = verifying_ || mtp_on_ ? decoder_layers : static_cast<size_t>(c_.shared_suffix());
+    for (size_t l = 0; l < full; ++l) encode_layer(enc, l, n, start, next_norm(l));
+    if (full < decoder_layers) {
+      if (!last) return;
+      if (n > 1) {  // the last row of x, of its normed copy and of the per-layer inputs into row 0
+        const size_t row = static_cast<size_t>(n - 1) * c_.hidden_size * sizeof(float);
+        encode_copy(enc, x_, x_, c_.hidden_size, row, 0);
+        encode_copy(enc, h_, h_, c_.hidden_size, row, 0);
+        if (c_.per_layer_input > 0) {
+          const int width = c_.num_layers * c_.per_layer_input;
+          encode_copy(enc, per_layer_, per_layer_, width, static_cast<size_t>(n - 1) * width * sizeof(float), 0);
+        }
+      }
+      for (size_t l = full; l < decoder_layers; ++l) encode_layer(enc, l, 1, start + n - 1, next_norm(l));
+      n = 1;
     }
     if (mtp_on_) encode_mtp_follow(enc, tokens, tokens_offset, n, start);
     if (!last) return;
