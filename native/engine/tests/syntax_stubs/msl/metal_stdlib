@@ -41,6 +41,7 @@ template <typename T, int N> struct vec {
   vec() = default;
   explicit vec(T) {}
   explicit vec(float4) {}  // MSL converts between vector element types
+  template <typename U> explicit vec(const vec<U, N>&) {}
 };
 #define M_LOG2E_F 1.4426950408889634f
 struct uint2 {
