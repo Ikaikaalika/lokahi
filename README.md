@@ -265,4 +265,9 @@ technical design and teaching context.
 
 ## License
 
-See [LICENSE](LICENSE).
+Lōkahi is owned by Common Compute LLC and source-available under the
+[PolyForm Noncommercial License 1.0.0](LICENSE): free for personal, research,
+hobby, educational, and other noncommercial use. Commercial use is reserved to
+Common Compute LLC; see [COMMERCIAL.md](COMMERCIAL.md). Third-party portions and
+their MIT notices are listed in [NOTICE](NOTICE). Contributions require the
+[contributor agreement](CONTRIBUTING.md).

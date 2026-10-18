@@ -1,0 +1,58 @@
+Lokahi
+Copyright (c) 2025-2026 Common Compute LLC
+
+Lokahi as a whole is licensed under the PolyForm Noncommercial License 1.0.0
+(see LICENSE). The third-party portions listed below remain available under
+their original licenses, and those licenses' notices must be kept.
+
+-------------------------------------------------------------------------------
+oLLM
+https://github.com/Mega4alik/ollm
+
+This repository began as a fork of oLLM. The following files contain code
+derived from oLLM and are also available under its MIT license:
+
+  src/ollm/__init__.py
+  src/ollm/gds_loader.py
+  src/ollm/inference.py
+  src/ollm/utils.py
+  example.py
+  example_multimodality.py
+  run_example.bash
+  samples/
+
+MIT License
+
+Copyright (c) 2025 AILabs
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+-------------------------------------------------------------------------------
+maderix/ANE and skyfallsin/ane.cpp
+
+The private Apple Neural Engine probe in native/ane/ is informed by portions
+of these MIT-licensed projects. Their full notices are in
+native/ane/THIRD_PARTY_NOTICES.md.
+
+-------------------------------------------------------------------------------
+Runtime dependencies
+
+MLX, mlx-lm, NumPy, safetensors, Hugging Face transformers, and
+huggingface-hub are installed separately and keep their own licenses. Model
+weights are not part of Lokahi; each model is governed by its own license.
